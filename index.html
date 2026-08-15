@@ -658,10 +658,21 @@ let USING_LOCAL_FALLBACK = false;
 let USING_BACKEND_API = false;
 const HAS_CLAUDE_STORAGE = (typeof window.storage !== 'undefined' && typeof window.storage.get === 'function');
 const BACKEND_API_URL = '/api/data';
+// If you set TNA_API_SECRET as an environment variable in Vercel, put the exact same
+// value here too — both sides have to match. Leave this as '' if you haven't set that
+// env var (the API endpoint is then open to anyone who finds the URL, which is fine
+// for getting started, just not "real" security).
+const BACKEND_API_SECRET = 'KpCVji1WYRdj2LaUAgiOWo04cqTN8CGK';
+
+function backendHeaders(extra){
+  const h = Object.assign({}, extra || {});
+  if(BACKEND_API_SECRET) h['x-api-key'] = BACKEND_API_SECRET;
+  return h;
+}
 
 async function detectBackendApi(){
   try{
-    const res = await fetch(BACKEND_API_URL + '?key=__ping__', {method:'GET'});
+    const res = await fetch(BACKEND_API_URL + '?key=__ping__', {method:'GET', headers: backendHeaders()});
     USING_BACKEND_API = res.ok;
   }catch(e){
     USING_BACKEND_API = false;
@@ -670,7 +681,7 @@ async function detectBackendApi(){
 }
 
 async function backendGet(key){
-  const res = await fetch(BACKEND_API_URL + '?key=' + encodeURIComponent(key));
+  const res = await fetch(BACKEND_API_URL + '?key=' + encodeURIComponent(key), {headers: backendHeaders()});
   if(!res.ok) throw new Error('Backend GET failed');
   const data = await res.json();
   return data.value || null;
@@ -678,7 +689,7 @@ async function backendGet(key){
 async function backendSet(key, value){
   const res = await fetch(BACKEND_API_URL, {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
+    headers: backendHeaders({'Content-Type': 'application/json'}),
     body: JSON.stringify({key, value})
   });
   if(!res.ok) throw new Error('Backend POST failed');
