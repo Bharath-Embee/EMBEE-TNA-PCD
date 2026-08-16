@@ -1,8 +1,0 @@
-{
-  "name": "tna-system-backend",
-  "version": "1.0.0",
-  "private": true,
-  "dependencies": {
-    "@neondatabase/serverless": "^0.9.5"
-  }
-}
