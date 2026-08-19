@@ -3,6 +3,9 @@
 // tasks due in 3 days / 1 day / today for their assigned user only, and sends a
 // push notification through Firebase Cloud Messaging.
 //
+// Also sends a daily reminder for OVERDUE open tasks (past their due date and
+// not yet resolved) — one per day, every day, until the task is closed out.
+//
 // Security: only Vercel's own cron trigger can call this — it sends an
 // Authorization header matching CRON_SECRET automatically. Nobody else can
 // trigger reminder sends by hitting this URL.
@@ -12,6 +15,9 @@
 // if that fails (already exists), the reminder was already sent/attempted and
 // is skipped. This works correctly even if the cron somehow runs twice, because
 // the database itself — not memory — enforces the "only once" guarantee.
+// For overdue tasks, reminder_type includes today's date (e.g. "overdue_2026-08-19"),
+// so each calendar day counts as a distinct reminder and the task keeps getting
+// a fresh one every day it remains open and overdue.
 
 import { neon } from '@neondatabase/serverless';
 import admin from 'firebase-admin';
@@ -62,22 +68,30 @@ function classifyReminder(task, today) {
   if (due === today) return 'due';
   if (due === addDays(today, 3)) return '3day';
   if (due === addDays(today, 1)) return '1day';
+  // Overdue and still open: tag the reminder with today's date so the
+  // idempotency check treats each day as a new reminder — this is what makes
+  // overdue tasks nag daily instead of just once.
+  if (due < today) return `overdue_${today}`;
   return null;
 }
-const REMINDER_LABEL = { due: 'due today', '1day': 'due tomorrow', '3day': 'due in 3 days' };
-const REMINDER_SUBJECT = { due: 'due today', '1day': 'due in 1 day', '3day': 'due in 3 days' };
+const REMINDER_LABEL = { due: 'due today', '1day': 'due tomorrow', '3day': 'due in 3 days', overdue: 'overdue' };
+const REMINDER_SUBJECT = { due: 'due today', '1day': 'due in 1 day', '3day': 'due in 3 days', overdue: 'overdue' };
+// reminderType for overdue tasks is dynamic (e.g. "overdue_2026-08-19"), so these
+// helpers normalize it back to the plain 'overdue' key before looking up labels/subjects.
+function labelFor(t) { return REMINDER_LABEL[t.startsWith('overdue') ? 'overdue' : t]; }
+function subjectFor(t) { return REMINDER_SUBJECT[t.startsWith('overdue') ? 'overdue' : t]; }
 
 function buildEmail(task, order, reminderType) {
   const due = opDate(task);
   const appUrl = process.env.APP_URL || 'https://embee-tna-pcd.vercel.app';
   const link = `${appUrl}/#order=${encodeURIComponent(order.id)}`;
-  const subject = `TNA Task Reminder — ${task.name} ${REMINDER_SUBJECT[reminderType]}`;
+  const subject = `TNA Task Reminder — ${task.name} ${subjectFor(reminderType)}`;
   const html = `<div style="font-family:sans-serif;max-width:480px;color:#17233A;">
     <h2 style="margin-bottom:4px;">TNA Task Reminder</h2>
     <p><strong>Task:</strong> ${task.name}</p>
     <p><strong>Style:</strong> ${order.styleNo || ''} — ${order.item || ''}</p>
     <p><strong>Due Date:</strong> ${fmtDate(due)}</p>
-    <p><strong>Reminder:</strong> ${REMINDER_LABEL[reminderType]}</p>
+    <p><strong>Reminder:</strong> ${labelFor(reminderType)}</p>
     <p><a href="${link}" style="display:inline-block;background:#17233A;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none;">Open Task</a></p>
   </div>`;
   return { subject, html };
@@ -132,22 +146,24 @@ export default async function handler(req, res) {
 
   // Egypt observes DST (EET/UTC+2 in winter, EEST/UTC+3 in summer, switching late
   // April / late October), and Vercel Cron is UTC-only with no per-cron timezone
-  // option. Rather than hardcode one UTC time that would drift an hour off target
-  // for half the year, vercel.json schedules TWO daily triggers (4:30 and 5:30 UTC)
-  // bracketing both possible offsets. Whichever one actually lands at ~7am Cairo
-  // time (checked properly via Intl, which knows Egypt's real DST calendar — not a
-  // hardcoded date) does the real work; the other one safely no-ops here.
+  // option. vercel.json schedules three daily triggers (4:30, 5:30, and 10:00 UTC)
+  // — the first two bracket both possible DST offsets for the 7am Cairo run, and
+  // 10:00 UTC covers the 1pm Cairo run added for same-day testing. Whichever
+  // trigger actually lands at 7am or 1pm Cairo time (checked properly via Intl,
+  // which knows Egypt's real DST calendar — not a hardcoded date) does the real
+  // work; any other trigger safely no-ops here.
   const cairoHour = parseInt(
     new Intl.DateTimeFormat('en-US', { timeZone: 'Africa/Cairo', hour: '2-digit', hour12: false }).format(new Date()),
     10
   );
   // ?test=1 skips the time-of-day gate for manual testing — still requires the
   // correct CRON_SECRET above, so this doesn't weaken security, it just lets you
-  // trigger a real run on demand instead of only at 7:30am. The real scheduled
-  // cron never includes this query param, so production behavior is unaffected.
+  // trigger a real run on demand instead of only at the scheduled hours. The real
+  // scheduled cron never includes this query param, so production behavior is
+  // unaffected.
   const isTestRun = req.query && req.query.test === '1';
-  if (cairoHour !== 7 && !isTestRun) {
-    return res.status(200).json({ ok: true, skipped: true, reason: `Not the scheduled Cairo hour (currently ${cairoHour}:00 Cairo time). Add ?test=1 to the URL to bypass this for manual testing.` });
+  if (cairoHour !== 7 && cairoHour !== 13 && !isTestRun) {
+    return res.status(200).json({ ok: true, skipped: true, reason: `Not a scheduled Cairo hour (currently ${cairoHour}:00 Cairo time). Add ?test=1 to the URL to bypass this for manual testing.` });
   }
 
   if (!sql) return res.status(500).json({ error: 'Database not connected' });
@@ -201,7 +217,7 @@ export default async function handler(req, res) {
                   token,
                   notification: {
                     title: 'TNA Task Reminder',
-                    body: `${task.name} — ${REMINDER_LABEL[reminderType]} (${fmtDate(opDate(task))})`,
+                    body: `${task.name} — ${labelFor(reminderType)} (${fmtDate(opDate(task))})`,
                   },
                   webpush: { fcmOptions: { link: process.env.APP_URL || '/' } },
                   data: { taskId: String(task.id), orderId: String(order.id) },
