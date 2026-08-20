@@ -21,6 +21,7 @@
 
 import { neon } from '@neondatabase/serverless';
 import admin from 'firebase-admin';
+import nodemailer from 'nodemailer';
 
 const connectionString =
   process.env.DATABASE_URL ||
@@ -97,30 +98,37 @@ function buildEmail(task, order, reminderType) {
   return { subject, html };
 }
 
-// Sends via Resend's plain REST API (no extra npm package needed — one fetch call).
-// Uses Resend's free onboarding@resend.dev sender until embeegroup.com is verified
-// as a domain; once it is, just set RESEND_FROM in Vercel and this picks it up
-// automatically, no code change required.
-async function sendEmail(to, task, order, reminderType) {
-  if (!process.env.RESEND_API_KEY) throw new Error('RESEND_API_KEY not set');
-  const { subject, html } = buildEmail(task, order, reminderType);
-  const res = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      from: process.env.RESEND_FROM || 'TNA Reminders <onboarding@resend.dev>',
-      to: [to],
-      subject,
-      html,
-    }),
-  });
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Resend ${res.status}: ${errText}`);
+// Sends via Gmail's SMTP relay, using a Google Workspace account's App Password.
+// This was switched from Resend because Resend's free onboarding@resend.dev sender
+// can only deliver to the Resend account owner's own inbox — real domain
+// verification would need DNS access this project doesn't have. Gmail SMTP has no
+// such restriction: any embeegroup.com Workspace account can send to any address
+// once 2-Step Verification is on and an App Password is generated (Google Account
+// → Security → App Passwords) — no admin/DNS involvement needed.
+let gmailTransport = null;
+function getGmailTransport() {
+  if (!gmailTransport) {
+    gmailTransport = nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: process.env.GMAIL_USER,
+        pass: process.env.GMAIL_APP_PASSWORD,
+      },
+    });
   }
+  return gmailTransport;
+}
+async function sendEmail(to, task, order, reminderType) {
+  if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
+    throw new Error('GMAIL_USER / GMAIL_APP_PASSWORD not set');
+  }
+  const { subject, html } = buildEmail(task, order, reminderType);
+  await getGmailTransport().sendMail({
+    from: `"TNA Reminders" <${process.env.GMAIL_USER}>`,
+    to,
+    subject,
+    html,
+  });
 }
 
 async function ensureTables() {
