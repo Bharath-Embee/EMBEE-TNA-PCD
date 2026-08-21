@@ -295,6 +295,7 @@ let templatePastePreview = null; // {setId: string|null, name?: string, rows:[{n
 let editingAccessUserId = null;
 let editingTasksUserId = null;
 let editingPasswordUserId = null;
+let performanceFilters = { buyerId:'all', memberId:'all', dept:'all' };
 let pendingNewUserPhoto = '';
 let teamSearchTerm = '';
 let orderSearchTerm = '';
@@ -533,11 +534,15 @@ async function exportDashboardPdf(){
 
 async function exportPerformancePdf(){
   showToast('Preparing PDF…');
-  const doc = await pdfNewDoc('Performance Report', isAdmin() ? 'All buyers' : 'Your buyers');
+  const f = performanceFilters;
+  const isFiltered = performanceFiltersActive();
+  const doc = await pdfNewDoc('Performance Report', isFiltered ? 'Filtered view' : (isAdmin() ? 'All buyers' : 'Your buyers'));
   if(!doc) return;
   let y = 72;
-  const buyerStats = scopedBuyers().map(buyerPerformance);
-  const memberStats = scopedUsers().filter(u=>u.role==='member').map(memberPerformance).sort((a,b)=>b.score-a.score);
+  const buyerStats = scopedBuyers().filter(b => f.buyerId==='all' || b.id===f.buyerId).map(buyerPerformance);
+  const memberStats = scopedUsers().filter(u=>u.role==='member')
+    .filter(u => (f.buyerId==='all'||u.buyerId===f.buyerId) && (f.memberId==='all'||u.id===f.memberId) && (f.dept==='all'||u.dept===f.dept))
+    .map(memberPerformance).sort((a,b)=>b.score-a.score);
 
   y = pdfSectionTitle(doc, y, 'By buyer');
   y = pdfTable(doc, y,
@@ -554,7 +559,48 @@ async function exportPerformancePdf(){
     memberStats.map(m => [m.user.name, m.user.dept, buyerName(m.user.buyerId), m.total, m.done, m.onTimeRate===null?'—':m.onTimeRate+'%', m.late, m.avgDelay>0?m.avgDelay+'d':'—', m.overdueOpen, m.score]),
     [130,90,130,70,80,80,60,80,90,60]
   );
+
+  if(isFiltered && (buyerStats.length || memberStats.length)){
+    y += 8;
+    if(y > doc.internal.pageSize.getHeight()-100){ doc.addPage(); y = 40; }
+    y = pdfSectionTitle(doc, y, 'Gap analysis — strengths and weaknesses');
+    const gapRows = [
+      ...buyerStats.map(b => { const gi = buyerGapInsights(b); return [b.buyer.name, 'Buyer', gi.strength||'—', gi.weakness||'—']; }),
+      ...memberStats.map(m => { const gi = memberGapInsights(m); return [m.user.name, 'Team member', gi.strength||'—', gi.weakness||'—']; }),
+    ];
+    y = pdfTable(doc, y, ['Name','Type','Strength','Weakness'], gapRows, [140,90,260,260]);
+  }
   doc.save('tna_performance.pdf');
+}
+
+// Same data as the CSV export, but as a real .xlsx workbook with two sheets —
+// Buyers and Team members, both including the strength/weakness gap columns.
+async function exportPerformanceExcel(){
+  const ok = await loadXlsxLib();
+  if(!ok || !window.XLSX){ showToast('Could not load the Excel library — check your internet connection and try again'); return; }
+  const f = performanceFilters;
+  const buyerStats = scopedBuyers().filter(b => f.buyerId==='all' || b.id===f.buyerId).map(buyerPerformance);
+  const memberStats = scopedUsers().filter(u=>u.role==='member')
+    .filter(u => (f.buyerId==='all'||u.buyerId===f.buyerId) && (f.memberId==='all'||u.id===f.memberId) && (f.dept==='all'||u.dept===f.dept))
+    .map(memberPerformance).sort((a,b)=>b.score-a.score);
+
+  const buyerRows = [
+    ['Buyer','Orders','Total tasks','Completed','On-time %','Overdue now','Strength','Weakness'],
+    ...buyerStats.map(b => { const gi = buyerGapInsights(b); return [b.buyer.name, b.orders, b.totalTasks, b.done, b.onTimeRate===null?'—':b.onTimeRate, b.overdueOpen, gi.strength||'', gi.weakness||'']; })
+  ];
+  const memberRows = [
+    ['Name','Department','Buyer','Assigned','Completed','On-time %','Late completions','Avg delay (days)','Currently overdue','Score','Strength','Weakness'],
+    ...memberStats.map(m => { const gi = memberGapInsights(m); return [m.user.name, m.user.dept, buyerName(m.user.buyerId), m.total, m.done, m.onTimeRate===null?'—':m.onTimeRate, m.late, m.avgDelay, m.overdueOpen, m.score, gi.strength||'', gi.weakness||'']; })
+  ];
+
+  const wb = window.XLSX.utils.book_new();
+  const wsB = window.XLSX.utils.aoa_to_sheet(buyerRows);
+  wsB['!cols'] = buyerRows[0].map(()=>({wch:22}));
+  window.XLSX.utils.book_append_sheet(wb, wsB, 'By buyer');
+  const wsM = window.XLSX.utils.aoa_to_sheet(memberRows);
+  wsM['!cols'] = memberRows[0].map(()=>({wch:22}));
+  window.XLSX.utils.book_append_sheet(wb, wsM, 'By team member');
+  window.XLSX.writeFile(wb, 'tna_performance.xlsx');
 }
 
 async function exportTeamPdf(){
@@ -2250,14 +2296,23 @@ function renderTeam(){
               <div style="padding:8px 4px;">
                 <label style="display:block;margin-bottom:6px;">Task restrictions for ${u.name}</label>
                 <div class="checkbox-list" style="max-height:200px;margin-bottom:10px;">
-                  ${allTaskNamesGrouped().map(([dept, names]) => `
-                    <div style="font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:0.3px;margin:8px 0 2px;">${dept}</div>
+                  ${allTaskNamesGrouped().map(([dept, names]) => {
+                    const deptId = 'eatdeptall_'+u.id+'_'+dept.replace(/[^a-z0-9]/gi,'_');
+                    const allChecked = names.length>0 && names.every(n => (u.allowedTaskNames||[]).includes(n));
+                    return `
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin:8px 0 2px;">
+                      <div style="font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:0.3px;">${dept}</div>
+                      <div class="checkbox-row" style="margin:0;">
+                        <input type="checkbox" class="editTaskDeptAllCheck" data-dept="${dept.replace(/"/g,'&quot;')}" data-userid="${u.id}" id="${deptId}" ${allChecked?'checked':''}>
+                        <label for="${deptId}" style="margin:0;font-weight:400;font-size:11px;">Select all</label>
+                      </div>
+                    </div>
                     ${names.map(n => {
                       const checked = (u.allowedTaskNames||[]).includes(n);
                       const eid = 'eat_'+u.id+'_'+n.replace(/[^a-z0-9]/gi,'_');
-                      return `<div class="checkbox-row"><input type="checkbox" class="editTaskCheck" value="${n.replace(/"/g,'&quot;')}" id="${eid}" ${checked?'checked':''}><label for="${eid}" style="margin:0;font-weight:400;">${n}</label></div>`;
+                      return `<div class="checkbox-row"><input type="checkbox" class="editTaskCheck" data-dept="${dept.replace(/"/g,'&quot;')}" value="${n.replace(/"/g,'&quot;')}" id="${eid}" ${checked?'checked':''}><label for="${eid}" style="margin:0;font-weight:400;">${n}</label></div>`;
                     }).join('')}
-                  `).join('')}
+                  `;}).join('')}
                 </div>
                 <div class="hint" style="margin-bottom:10px;">Leave everything unchecked to allow any task in their department.</div>
                 <div class="row-actions">
@@ -2496,6 +2551,69 @@ function buyerPerformance(buyer){
   return {buyer, orders: orders.length, totalTasks: all.length, done: done.length, overdueOpen: overdueOpen.length, onTimeRate, ragCounts};
 }
 
+function performanceFiltersActive(){
+  return performanceFilters.buyerId!=='all' || performanceFilters.memberId!=='all' || performanceFilters.dept!=='all';
+}
+// Picks the single most notable strength and weakness out of a candidate list —
+// keeps each card to one clear headline of each rather than a wall of bullets.
+function memberGapInsights(m){
+  if(m.total===0) return {strength:null, weakness:null};
+  const strengths = [];
+  const weaknesses = [];
+  if(m.onTimeRate!==null && m.onTimeRate>=90) strengths.push(`${m.onTimeRate}% on-time completion, well above target`);
+  if(m.completionRate>=90) strengths.push(`High completion rate, ${m.done} of ${m.total} tasks done`);
+  if(m.overdueOpen===0) strengths.push('No tasks currently overdue');
+  if(m.overdueOpen>0) weaknesses.push(`${m.overdueOpen} task${m.overdueOpen>1?'s':''} currently overdue${m.avgDelay>0?`, averaging ${m.avgDelay}d late`:''}`);
+  if(m.onTimeRate!==null && m.onTimeRate<60) weaknesses.push(`Only ${m.onTimeRate}% on-time completion`);
+  if(m.completionRate<50) weaknesses.push(`Low completion rate (${m.completionRate}%)`);
+  if(m.avgDelay>5) weaknesses.push(`Averaging ${m.avgDelay}d delay on late tasks`);
+  return { strength: strengths[0]||null, weakness: weaknesses[0]||null };
+}
+function buyerGapInsights(b){
+  if(b.totalTasks===0) return {strength:null, weakness:null};
+  const strengths = [];
+  const weaknesses = [];
+  if(b.onTimeRate!==null && b.onTimeRate>=90) strengths.push(`${b.onTimeRate}% on-time completion across all orders`);
+  if(b.ragCounts.green > (b.ragCounts.red+b.ragCounts.amber)) strengths.push(`Most orders on track (${b.ragCounts.green} of ${b.orders} green)`);
+  if(b.overdueOpen===0) strengths.push('No tasks currently overdue');
+  if(b.overdueOpen>0) weaknesses.push(`${b.overdueOpen} task${b.overdueOpen>1?'s':''} currently overdue across orders`);
+  if(b.ragCounts.red>0) weaknesses.push(`${b.ragCounts.red} order${b.ragCounts.red>1?'s':''} at risk`);
+  if(b.onTimeRate!==null && b.onTimeRate<60) weaknesses.push(`Only ${b.onTimeRate}% on-time completion`);
+  return { strength: strengths[0]||null, weakness: weaknesses[0]||null };
+}
+// Renders one gap-analysis card — score bar against the 80-point target, plus
+// the standout strength/weakness text from *GapInsights() above.
+function gapCardHtml(name, sub, score, insights){
+  const pct = Math.max(0, Math.min(100, score));
+  const barColor = score>=80 ? 'var(--green)' : score>=50 ? 'var(--brass)' : 'var(--thread-red)';
+  const badgeClass = score>=80?'done':score>=50?'progress':'overdue';
+  const gapText = score>=80 ? 'At or above target' : `${80-score} point${80-score===1?'':'s'} below target`;
+  return `<div class="panel" style="margin-bottom:12px;">
+    <div class="flex-between" style="margin-bottom:10px;">
+      <div>
+        <div style="font-weight:600;font-family:'Space Grotesk',sans-serif;">${name}</div>
+        <div style="font-size:13px;color:var(--muted);">${sub}</div>
+      </div>
+      <span class="badge ${badgeClass}">Score ${score}</span>
+    </div>
+    <div style="position:relative;height:8px;background:var(--canvas);border-radius:4px;margin-bottom:4px;">
+      <div style="position:absolute;left:0;top:0;height:8px;width:${pct}%;background:${barColor};border-radius:4px;"></div>
+      <div style="position:absolute;left:80%;top:-3px;width:2px;height:14px;background:var(--muted);"></div>
+    </div>
+    <div class="hint" style="margin:0 0 12px;">Target 80 · ${gapText}</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+      <div>
+        <div style="font-size:12px;font-weight:600;color:var(--green);margin-bottom:4px;">Strength</div>
+        <div style="font-size:13px;color:var(--muted);">${insights.strength || 'Not enough data yet'}</div>
+      </div>
+      <div>
+        <div style="font-size:12px;font-weight:600;color:${insights.weakness?'var(--thread-red)':'var(--muted)'};margin-bottom:4px;">${insights.weakness?'Weakness':'—'}</div>
+        <div style="font-size:13px;color:var(--muted);">${insights.weakness || 'No major issues found'}</div>
+      </div>
+    </div>
+  </div>`;
+}
+
 // Performance for a single style/order, "till date" — same scoring approach as
 // member/buyer performance, just scoped to this one order's tasks.
 function orderPerformance(order){
@@ -2542,15 +2660,35 @@ function csvDownloadHref(rows){
 }
 
 function renderPerformance(){
-  const members = scopedUsers().filter(u=>u.role==='member');
-  const memberStats = members.map(memberPerformance).sort((a,b)=> b.score - a.score);
-  const buyers = scopedBuyers();
-  const buyerStats = buyers.map(buyerPerformance);
+  const allMembers = scopedUsers().filter(u=>u.role==='member');
+  const allBuyers = scopedBuyers();
+  const f = performanceFilters;
+  const isFiltered = performanceFiltersActive();
+
+  const memberStats = allMembers
+    .filter(u => (f.buyerId==='all'||u.buyerId===f.buyerId) && (f.memberId==='all'||u.id===f.memberId) && (f.dept==='all'||u.dept===f.dept))
+    .map(memberPerformance).sort((a,b)=> b.score - a.score);
+  const buyerStats = allBuyers
+    .filter(b => f.buyerId==='all' || b.id===f.buyerId)
+    .map(buyerPerformance);
+
+  const buyerOptions = `<option value="all">All buyers</option>` + allBuyers.map(b=>`<option value="${b.id}" ${f.buyerId===b.id?'selected':''}>${b.name}</option>`).join('');
+  const memberOptions = `<option value="all">All team members</option>` + groupedUserOptionsHtml(allMembers, f.memberId==='all'?null:f.memberId);
+  const deptOptions = `<option value="all">All departments</option>` + DEPARTMENTS.map(d=>`<option value="${d}" ${f.dept===d?'selected':''}>${d}</option>`).join('');
 
   const memberCsvRows = [
-    ['Name','Department','Buyer','Assigned','Completed','On-time %','Late completions','Avg delay (days)','Currently overdue','Score'],
-    ...memberStats.map(m => [m.user.name, m.user.dept, buyerName(m.user.buyerId), m.total, m.done, m.onTimeRate===null?'—':m.onTimeRate, m.late, m.avgDelay, m.overdueOpen, m.score])
+    ['Name','Department','Buyer','Assigned','Completed','On-time %','Late completions','Avg delay (days)','Currently overdue','Score','Strength','Weakness'],
+    ...memberStats.map(m => { const gi = memberGapInsights(m); return [m.user.name, m.user.dept, buyerName(m.user.buyerId), m.total, m.done, m.onTimeRate===null?'—':m.onTimeRate, m.late, m.avgDelay, m.overdueOpen, m.score, gi.strength||'', gi.weakness||'']; })
   ];
+
+  const gapCardsHtml = isFiltered ? `
+  <div class="panel">
+    <h2>Gap analysis</h2>
+    <p class="desc">Where each buyer or person in this filtered view stands against the 80-point target score, with the standout strength and weakness behind that number.</p>
+    ${(buyerStats.length===0 && memberStats.length===0) ? emptyState('chart', 'Nothing matches this filter.') : ''}
+    ${buyerStats.map(b => gapCardHtml(b.buyer.name, `${b.orders} order${b.orders!==1?'s':''}`, Math.max(0,Math.round(((b.onTimeRate??100)*0.6)+((b.totalTasks?(b.done/b.totalTasks)*100:0)*0.4)-(b.overdueOpen*3))), buyerGapInsights(b))).join('')}
+    ${memberStats.map(m => gapCardHtml(m.user.name, `${m.user.dept} · ${buyerName(m.user.buyerId)}`, m.score, memberGapInsights(m))).join('')}
+  </div>` : '';
 
   return `
   <div class="panel">
@@ -2560,9 +2698,24 @@ function renderPerformance(){
 
   <div class="panel">
     <div class="flex-between">
+      <h2 style="margin:0;">Filter</h2>
+      ${isFiltered ? `<button class="btn ghost small" id="clearPerformanceFiltersBtn">Clear filters</button>` : ''}
+    </div>
+    <p class="desc">Narrow both tables below to a specific buyer, person, or department — filtering to any of these also reveals a gap analysis with strengths and weaknesses.</p>
+    <div class="grid-cols" style="grid-template-columns:repeat(3,1fr);">
+      <div class="field"><label>Buyer</label><select id="perfBuyerFilter">${buyerOptions}</select></div>
+      <div class="field"><label>Team member</label><select id="perfMemberFilter">${memberOptions}</select></div>
+      <div class="field"><label>Department</label><select id="perfDeptFilter">${deptOptions}</select></div>
+    </div>
+  </div>
+
+  ${gapCardsHtml}
+
+  <div class="panel">
+    <div class="flex-between">
       <h2 style="margin:0;">By buyer</h2>
     </div>
-    ${buyerStats.length===0 ? emptyState('chart', 'No buyers in scope yet.') : `
+    ${buyerStats.length===0 ? emptyState('chart', 'No buyers match this filter.') : `
     <table>
       <thead><tr><th>Buyer</th><th>Orders</th><th>Total tasks</th><th>Completed</th><th>On-time %</th><th>Overdue now</th><th>Order health</th></tr></thead>
       <tbody>
@@ -2588,11 +2741,12 @@ function renderPerformance(){
       <h2 style="margin:0;">By team member</h2>
       <div style="display:flex;gap:8px;">
         <a class="btn ghost small" href="${csvDownloadHref(memberCsvRows)}" download="tna-performance.csv">Export CSV</a>
+        <button class="btn ghost small" id="exportPerformanceExcelBtn">Export Excel</button>
         <button class="btn ghost small" id="exportPerformancePdfBtn">Export PDF</button>
       </div>
     </div>
     <p class="desc">Sorted by score (on-time rate weighted highest, penalised for tasks currently overdue). Score is a starting formula — treat it as a conversation starter, not a verdict.</p>
-    ${memberStats.length===0 ? emptyState('people', 'No team members in scope yet.') : `
+    ${memberStats.length===0 ? emptyState('people', 'No team members match this filter.') : `
     <table>
       <thead><tr><th>Name</th><th>Dept</th><th>Buyer</th><th>Assigned</th><th>Completed</th><th>On-time %</th><th>Late</th><th>Avg delay</th><th>Overdue now</th><th>Score</th></tr></thead>
       <tbody>
@@ -2803,6 +2957,16 @@ function attachTabEvents(){
   if(exDashPdf) exDashPdf.addEventListener('click', exportDashboardPdf);
   const exPerfPdf = document.getElementById('exportPerformancePdfBtn');
   if(exPerfPdf) exPerfPdf.addEventListener('click', exportPerformancePdf);
+  const exPerfExcel = document.getElementById('exportPerformanceExcelBtn');
+  if(exPerfExcel) exPerfExcel.addEventListener('click', exportPerformanceExcel);
+  const perfBuyerFilter = document.getElementById('perfBuyerFilter');
+  if(perfBuyerFilter) perfBuyerFilter.addEventListener('change', e => { performanceFilters.buyerId = e.target.value; renderTabContent(); });
+  const perfMemberFilter = document.getElementById('perfMemberFilter');
+  if(perfMemberFilter) perfMemberFilter.addEventListener('change', e => { performanceFilters.memberId = e.target.value; renderTabContent(); });
+  const perfDeptFilter = document.getElementById('perfDeptFilter');
+  if(perfDeptFilter) perfDeptFilter.addEventListener('change', e => { performanceFilters.dept = e.target.value; renderTabContent(); });
+  const clearPerfBtn = document.getElementById('clearPerformanceFiltersBtn');
+  if(clearPerfBtn) clearPerfBtn.addEventListener('click', () => { performanceFilters = { buyerId:'all', memberId:'all', dept:'all' }; renderTabContent(); });
   const exTeamPdf = document.getElementById('exportTeamPdfBtn');
   if(exTeamPdf) exTeamPdf.addEventListener('click', exportTeamPdf);
 
@@ -3063,6 +3227,13 @@ function attachTabEvents(){
       u.allowedTaskNames = Array.from(row.querySelectorAll('.editTaskCheck:checked')).map(c=>c.value);
       editingTasksUserId = null;
       renderTabContent(); showToast('Task restrictions updated'); saveData();
+    });
+  });
+  document.querySelectorAll('.editTaskDeptAllCheck').forEach(cb => {
+    cb.addEventListener('change', () => {
+      const dept = cb.dataset.dept;
+      const row = cb.closest('tr');
+      row.querySelectorAll(`.editTaskCheck[data-dept="${CSS.escape(dept)}"]`).forEach(t => { t.checked = cb.checked; });
     });
   });
   document.querySelectorAll('[data-edit-password]').forEach(btn => {
