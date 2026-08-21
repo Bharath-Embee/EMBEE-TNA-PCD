@@ -118,17 +118,19 @@ function getGmailTransport() {
   }
   return gmailTransport;
 }
-async function sendEmail(to, task, order, reminderType) {
+async function sendEmail(to, cc, task, order, reminderType) {
   if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
     throw new Error('GMAIL_USER / GMAIL_APP_PASSWORD not set');
   }
   const { subject, html } = buildEmail(task, order, reminderType);
-  await getGmailTransport().sendMail({
+  const mail = {
     from: `"TNA Reminders" <${process.env.GMAIL_USER}>`,
     to,
     subject,
     html,
-  });
+  };
+  if (cc && cc.length) mail.cc = cc;
+  await getGmailTransport().sendMail(mail);
 }
 
 async function ensureTables() {
@@ -242,7 +244,12 @@ export default async function handler(req, res) {
               continue;
             }
             try {
-              await sendEmail(user.email, task, order, reminderType);
+              // CC every manager assigned to this user's buyer — mirrors
+              // managersForBuyer() in index.html, kept in sync deliberately.
+              const managerEmails = (DATA.users || [])
+                .filter(m => m.role === 'manager' && (m.managedBuyerIds || []).includes(user.buyerId) && m.email)
+                .map(m => m.email);
+              await sendEmail(user.email, managerEmails, task, order, reminderType);
               await sql`UPDATE notification_log SET status = 'sent'
                          WHERE task_id = ${task.id} AND user_id = ${user.id} AND reminder_type = ${reminderType} AND channel = 'email'`;
               results.email.sent++;
