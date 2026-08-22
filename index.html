@@ -472,7 +472,7 @@ function pdfTable(doc, y, headers, rows, colWidths, marginLeft){
 
 async function exportOrderPdf(order){
   showToast('Preparing PDF…');
-  const doc = await pdfNewDoc(`${order.styleNo}${order.season?' ('+order.season+')':''} — ${order.item}`, `${buyerName(order.buyerId)} · PCD ${fmtDate(order.pcd)}${order.templateSetName?' · '+order.templateSetName:''}`);
+  const doc = await pdfNewDoc(`${order.styleNo}${order.season?' ('+order.season+')':''} — ${order.item}`, `${buyerName(order.buyerId)}${order.poNumber?' · PO '+order.poNumber:''} · PCD ${fmtDate(order.pcd)}${order.templateSetName?' · '+order.templateSetName:''}`);
   if(!doc) return;
   let y = 72;
   const tnaTasks = order.tasks.filter(t=>!t.materialType);
@@ -710,6 +710,7 @@ function migrateData(d){
     if(o.trimRequiredQty !== undefined) delete o.trimRequiredQty;
     if(o.season === undefined) o.season = '';
     if(o.qty === undefined) o.qty = '';
+    if(o.poNumber === undefined) o.poNumber = '';
     if(o.templateSetName === undefined) o.templateSetName = '';
     if(!Array.isArray(o.tasks)) o.tasks = [];
     // Backfill offsetDays on older TNA tasks (from before PCD editing existed) so
@@ -718,6 +719,7 @@ function migrateData(d){
     o.tasks.forEach(t => {
       if(t.status === undefined) t.status = 'Pending';
       if(t.remarks === undefined) t.remarks = '';
+      if(!Array.isArray(t.history)) t.history = [];
       if(t.actualDate === undefined) t.actualDate = null;
       if(t.assignedTo === undefined) t.assignedTo = null;
       if(t.materialType === undefined) t.materialType = null;
@@ -1503,6 +1505,23 @@ function checkAndNotify(){
   }
 }
 
+// Every time Remarks is changed and saved, the previous text is kept here instead of
+// just being overwritten — this is how buyer/approval comment cycles (submit → buyer
+// feedback → revise → resubmit) actually get a record, instead of only ever showing
+// whatever the last person typed. Rendered as a native <details> so it costs nothing
+// when collapsed and needs no extra toggle-state plumbing.
+function taskHistoryHtml(task){
+  if(!task.history || task.history.length===0) return '';
+  return `<details style="margin-top:4px;">
+    <summary style="cursor:pointer;font-size:11px;color:var(--muted);">History (${task.history.length})</summary>
+    <div style="margin-top:4px;max-height:130px;overflow-y:auto;">
+      ${task.history.slice().reverse().map(h => `<div style="font-size:11.5px;color:var(--muted);padding:4px 0;border-top:1px solid var(--line);">
+        <span class="mono">${fmtDate(h.date)}</span> — <strong>${(h.author||'').replace(/</g,'&lt;')}</strong>: ${(h.text||'').replace(/</g,'&lt;')}
+      </div>`).join('')}
+    </div>
+  </details>`;
+}
+
 /* ---- My Tasks (Member role) ---- */
 function renderMyTasks(){
   const u = getActiveUser();
@@ -1546,7 +1565,7 @@ function renderMyTasks(){
             <input type="number" class="receivedqty-input" style="min-width:100px;" placeholder="Qty received" data-order="${x.order.id}" data-task="${x.task.id}" value="${x.task.receivedQty!==null && x.task.receivedQty!==undefined ? x.task.receivedQty : ''}">
             ${x.task.requiredQty ? `<div class="hint" style="margin-top:3px;">of ${x.task.requiredQty}${x.task.unit?' '+x.task.unit:''} required${pct!==null ? ` — <span class="badge ${qtyReadyClass(pct)}">${pct}%</span>` : ''}</div>` : '<div class="hint" style="margin-top:3px;">Set required qty on the order first</div>'}
           ` : '<span style="color:var(--muted);">—</span>'}</td>
-          <td><input type="text" class="remarks-input" placeholder="Add a note…" data-order="${x.order.id}" data-task="${x.task.id}" value="${x.task.remarks ? x.task.remarks.replace(/"/g,'&quot;') : ''}"></td>
+          <td><input type="text" class="remarks-input" placeholder="Add a note…" data-order="${x.order.id}" data-task="${x.task.id}" value="${x.task.remarks ? x.task.remarks.replace(/"/g,'&quot;') : ''}">${taskHistoryHtml(x.task)}</td>
           <td><button class="btn small" data-save-task-row="${x.task.id}" data-order="${x.order.id}">Save</button></td>
         </tr>`; }).join('')}
       </tbody>
@@ -1846,6 +1865,7 @@ function renderOrders(){
         <select id="newOrderBuyer">${buyers.map(b=>`<option value="${b.id}">${b.name}</option>`).join('')}</select>
       </div>
       <div class="field"><label>Style No.</label><input id="newOrderStyle" placeholder="e.g. ST-2201"></div>
+      <div class="field"><label>Buyer PO No.</label><input id="newOrderPo" placeholder="e.g. PO-88213"></div>
       <div class="field"><label>Season</label><input id="newOrderSeason" placeholder="e.g. AW26, SS27"></div>
       <div class="field"><label>Item</label><input id="newOrderItem" placeholder="e.g. Men's Woven Shirt"></div>
       <div class="field"><label>Order qty (pcs)</label><input id="newOrderQty" type="number" placeholder="e.g. 12000"></div>
@@ -1862,7 +1882,7 @@ function renderOrders(){
     <div class="flex-between">
       <h2 style="margin:0;">Orders (${scopedOrders().length})</h2>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <input id="orderSearchInput" placeholder="Search style, item, buyer…" style="max-width:220px;" value="${orderSearchTerm}">
+        <input id="orderSearchInput" placeholder="Search style, PO#, item, buyer…" style="max-width:220px;" value="${orderSearchTerm}">
         <select id="orderRagFilter" style="max-width:150px;">
           <option value="all" ${orderRagFilter==='all'?'selected':''}>All statuses</option>
           <option value="red" ${orderRagFilter==='red'?'selected':''}>At risk</option>
@@ -1875,7 +1895,7 @@ function renderOrders(){
       let list = scopedOrders().slice();
       if(orderSearchTerm){
         const s = orderSearchTerm.toLowerCase();
-        list = list.filter(o => o.styleNo.toLowerCase().includes(s) || o.item.toLowerCase().includes(s) || buyerName(o.buyerId).toLowerCase().includes(s) || (o.season||'').toLowerCase().includes(s));
+        list = list.filter(o => o.styleNo.toLowerCase().includes(s) || (o.poNumber||'').toLowerCase().includes(s) || o.item.toLowerCase().includes(s) || buyerName(o.buyerId).toLowerCase().includes(s) || (o.season||'').toLowerCase().includes(s));
       }
       if(orderRagFilter!=='all') list = list.filter(o => orderRAG(o)===orderRagFilter);
       if(list.length===0) return emptyState('shirt', 'No orders match.');
@@ -1914,7 +1934,7 @@ function renderOrderCard(order){
     <div class="order-card-head">
       <div>
         <div class="order-title"><span class="rag-dot ${rag}" title="${ragLabel(rag)}"></span> ${order.styleNo}${order.season?` <span class="dept-tag" style="background:var(--brass-soft);color:#7A5A16;">${order.season}</span>`:''} — ${order.item}</div>
-        <div class="order-meta">${buyerName(order.buyerId)}${order.templateSetName?' · '+order.templateSetName:''} · Qty ${order.qty || '—'} · ${done}/${total} tasks done${overdue?` · <span style="color:var(--thread-red);">${overdue} overdue</span>`:''}</div>
+        <div class="order-meta">${buyerName(order.buyerId)}${order.poNumber?' · PO '+order.poNumber:''}${order.templateSetName?' · '+order.templateSetName:''} · Qty ${order.qty || '—'} · ${done}/${total} tasks done${overdue?` · <span style="color:var(--thread-red);">${overdue} overdue</span>`:''}</div>
       </div>
       <div style="text-align:right;">
         ${editingPcd ? `
@@ -1982,7 +2002,7 @@ function renderOrderTasks(order){
         <div class="hint" style="margin-top:3px;"><span class="badge ${taskBadgeClass(t)}">${statusDisplayText(t)}</span></div>
       </td>
       <td class="mono" style="color:${delay>0?'var(--thread-red)':delay<0?'var(--green)':'var(--muted)'};">${delay>0?'+':''}${delay || '—'}</td>
-      <td><input type="text" class="remarks-input" placeholder="Add a note…" data-order="${order.id}" data-task="${t.id}" value="${t.remarks ? t.remarks.replace(/"/g,'&quot;') : ''}"></td>
+      <td><input type="text" class="remarks-input" placeholder="Add a note…" data-order="${order.id}" data-task="${t.id}" value="${t.remarks ? t.remarks.replace(/"/g,'&quot;') : ''}">${taskHistoryHtml(t)}</td>
       <td><button class="btn small" data-save-task-row="${t.id}" data-order="${order.id}">Save</button></td>
     </tr>`;
   }).join('');
@@ -3307,7 +3327,18 @@ function attachTabEvents(){
       }
       if(actualInp) task.actualDate = actualInp.value || null;
       if(receivedInp) task.receivedQty = receivedInp.value===''?null:parseFloat(receivedInp.value);
-      if(remarksInp) task.remarks = remarksInp.value;
+      if(remarksInp){
+        const newRemarks = remarksInp.value;
+        // Log the change as a history entry (not every keystroke — only what actually
+        // gets saved) so a buyer-comment / revision cycle stays visible after it's
+        // overwritten, instead of only ever showing the latest note.
+        if(newRemarks.trim() && newRemarks !== task.remarks){
+          if(!Array.isArray(task.history)) task.history = [];
+          const activeUser = getActiveUser();
+          task.history.push({ date: today(), text: newRemarks.trim(), author: activeUser ? activeUser.name : 'Unknown' });
+        }
+        task.remarks = newRemarks;
+      }
       if(RESOLVED_STATUSES.includes(task.status) && task.status!=='N/A' && !task.actualDate) task.actualDate = today();
       renderTabContent(); showToast('Saved'); saveData();
     });
@@ -3317,6 +3348,7 @@ function attachTabEvents(){
   if(createBtn) createBtn.addEventListener('click', async () => {
     const buyerId = document.getElementById('newOrderBuyer').value;
     const styleNo = document.getElementById('newOrderStyle').value.trim();
+    const poNumber = document.getElementById('newOrderPo').value.trim();
     const season = document.getElementById('newOrderSeason').value.trim();
     const item = document.getElementById('newOrderItem').value.trim();
     const qty = document.getElementById('newOrderQty').value.trim();
@@ -3334,12 +3366,12 @@ function attachTabEvents(){
         plannedDate: systemDate, expectedDate: systemDate, expectedDateManuallySet: false,
         offsetDays: t.offset, status: 'Pending',
         assignedTo: pickDefaultAssignee(buyerId, t.dept, t.name),
-        actualDate: null, remarks: '',
+        actualDate: null, remarks: '', history: [],
         materialType: null, requiredQty: null, receivedQty: null,
       };
     });
 
-    const order = {id: uid('ord'), buyerId, styleNo, season, item, qty, pcd, templateSetName: set.name, tasks};
+    const order = {id: uid('ord'), buyerId, styleNo, poNumber, season, item, qty, pcd, templateSetName: set.name, tasks};
     DATA.orders.push(order);
     currentOrderExpanded[order.id] = true;
     renderTabContent(); showToast('TNA generated for ' + styleNo); saveData();
