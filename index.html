@@ -309,6 +309,7 @@ let editingAccessUserId = null;
 let editingTasksUserId = null;
 let editingPasswordUserId = null;
 let performanceFilters = { buyerId:'all', memberId:'all', dept:'all' };
+let editingBuyersUserId = null;
 let pendingNewUserPhoto = '';
 let teamSearchTerm = '';
 let orderSearchTerm = '';
@@ -554,7 +555,7 @@ async function exportPerformancePdf(){
   let y = 72;
   const buyerStats = scopedBuyers().filter(b => f.buyerId==='all' || b.id===f.buyerId).map(buyerPerformance);
   const memberStats = scopedUsers().filter(u=>u.role==='member')
-    .filter(u => (f.buyerId==='all'||u.buyerId===f.buyerId) && (f.memberId==='all'||u.id===f.memberId) && (f.dept==='all'||u.dept===f.dept))
+    .filter(u => (f.buyerId==='all'||userBuyerIds(u).includes(f.buyerId)) && (f.memberId==='all'||u.id===f.memberId) && (f.dept==='all'||u.dept===f.dept))
     .map(memberPerformance).sort((a,b)=>b.score-a.score);
 
   y = pdfSectionTitle(doc, y, 'By buyer');
@@ -569,7 +570,7 @@ async function exportPerformancePdf(){
   y = pdfSectionTitle(doc, y, 'By team member');
   y = pdfTable(doc, y,
     ['Name','Dept','Buyer','Assigned','Completed','On-time %','Late','Avg delay','Overdue now','Score'],
-    memberStats.map(m => [m.user.name, m.user.dept, buyerName(m.user.buyerId), m.total, m.done, m.onTimeRate===null?'—':m.onTimeRate+'%', m.late, m.avgDelay>0?m.avgDelay+'d':'—', m.overdueOpen, m.score]),
+    memberStats.map(m => [m.user.name, m.user.dept, buyerNamesDisplay(m.user), m.total, m.done, m.onTimeRate===null?'—':m.onTimeRate+'%', m.late, m.avgDelay>0?m.avgDelay+'d':'—', m.overdueOpen, m.score]),
     [130,90,130,70,80,80,60,80,90,60]
   );
 
@@ -594,7 +595,7 @@ async function exportPerformanceExcel(){
   const f = performanceFilters;
   const buyerStats = scopedBuyers().filter(b => f.buyerId==='all' || b.id===f.buyerId).map(buyerPerformance);
   const memberStats = scopedUsers().filter(u=>u.role==='member')
-    .filter(u => (f.buyerId==='all'||u.buyerId===f.buyerId) && (f.memberId==='all'||u.id===f.memberId) && (f.dept==='all'||u.dept===f.dept))
+    .filter(u => (f.buyerId==='all'||userBuyerIds(u).includes(f.buyerId)) && (f.memberId==='all'||u.id===f.memberId) && (f.dept==='all'||u.dept===f.dept))
     .map(memberPerformance).sort((a,b)=>b.score-a.score);
 
   const buyerRows = [
@@ -603,7 +604,7 @@ async function exportPerformanceExcel(){
   ];
   const memberRows = [
     ['Name','Department','Buyer','Assigned','Completed','On-time %','Late completions','Avg delay (days)','Currently overdue','Score','Strength','Weakness'],
-    ...memberStats.map(m => { const gi = memberGapInsights(m); return [m.user.name, m.user.dept, buyerName(m.user.buyerId), m.total, m.done, m.onTimeRate===null?'—':m.onTimeRate, m.late, m.avgDelay, m.overdueOpen, m.score, gi.strength||'', gi.weakness||'']; })
+    ...memberStats.map(m => { const gi = memberGapInsights(m); return [m.user.name, m.user.dept, buyerNamesDisplay(m.user), m.total, m.done, m.onTimeRate===null?'—':m.onTimeRate, m.late, m.avgDelay, m.overdueOpen, m.score, gi.strength||'', gi.weakness||'']; })
   ];
 
   const wb = window.XLSX.utils.book_new();
@@ -623,7 +624,7 @@ async function exportTeamPdf(){
   let y = 72;
   y = pdfTable(doc, y,
     ['Name','Username','Role','Scope','Email','WhatsApp'],
-    scopedUsers().map(u => [u.name, u.username, u.role, u.role==='admin'?'All buyers':u.role==='manager'?(u.managedBuyerIds||[]).map(buyerName).join(', '):`${u.dept} · ${buyerName(u.buyerId)}`, u.email||'—', u.phone||'—']),
+    scopedUsers().map(u => [u.name, u.username, u.role, u.role==='admin'?'All buyers':u.role==='manager'?(u.managedBuyerIds||[]).map(buyerName).join(', '):`${u.dept} · ${buyerNamesDisplay(u)}`, u.email||'—', u.phone||'—']),
     [140,120,80,220,180,120]
   );
   doc.save('tna_team.pdf');
@@ -664,6 +665,15 @@ function migrateData(d){
     if(u.photo === undefined) u.photo = '';
     if(u.dept === undefined) u.dept = null;
     if(u.buyerId === undefined) u.buyerId = null;
+    // buyerIds (a list) replaces buyerId (one) so a member can be assigned to
+    // several buyers on one account instead of needing a separate login per
+    // buyer. Existing single-buyer assignments convert straight across —
+    // nobody's current access changes. allBuyers is for roles like Purchase,
+    // Store, Shipping, PPC that work across every buyer, current and future —
+    // it defaults to false for everyone already in the system, so nothing
+    // changes automatically; an admin turns it on per person afterward.
+    if(u.buyerIds === undefined) u.buyerIds = u.buyerId ? [u.buyerId] : [];
+    if(u.allBuyers === undefined) u.allBuyers = false;
     if(u.email === undefined) u.email = '';
     if(u.phone === undefined) u.phone = '';
   });
@@ -1013,13 +1023,28 @@ function getActiveUser(){
 function isAdmin(){ const u=getActiveUser(); return u && u.role==='admin'; }
 function isManagerOrAdmin(){ const u=getActiveUser(); return u && (u.role==='admin' || u.role==='manager'); }
 
-// Buyer IDs the current user is allowed to see
-function allowedBuyerIds(){
-  const u = getActiveUser();
+// Which buyer IDs a given user is scoped to. allBuyers means every buyer,
+// including ones added later — not a snapshot of today's buyer list — which is
+// what makes it right for roles like Purchase/Store/Shipping/PPC that work
+// across every buyer rather than being tied to specific ones.
+function userBuyerIds(u){
   if(!u) return [];
   if(u.role==='admin') return DATA.buyers.map(b=>b.id);
   if(u.role==='manager') return u.managedBuyerIds || [];
-  return u.buyerId ? [u.buyerId] : [];
+  if(u.allBuyers) return DATA.buyers.map(b=>b.id);
+  return u.buyerIds || [];
+}
+// Human-readable buyer scope for display — table rows, exports, notification
+// previews. Mirrors userBuyerIds()'s logic but as text instead of IDs.
+function buyerNamesDisplay(u){
+  if(u.role==='admin') return 'All buyers';
+  if(u.role==='manager') return (u.managedBuyerIds||[]).map(buyerName).join(', ') || '—';
+  if(u.allBuyers) return 'All buyers';
+  return (u.buyerIds||[]).map(buyerName).join(', ') || '—';
+}
+// Buyer IDs the current user is allowed to see
+function allowedBuyerIds(){
+  return userBuyerIds(getActiveUser());
 }
 function scopedOrders(){
   const allowed = allowedBuyerIds();
@@ -1029,7 +1054,7 @@ function scopedUsers(){
   const u = getActiveUser();
   if(u && u.role==='admin') return DATA.users;
   const allowed = allowedBuyerIds();
-  return DATA.users.filter(x => (x.buyerId && allowed.includes(x.buyerId)) || (x.managedBuyerIds && x.managedBuyerIds.some(b=>allowed.includes(b))));
+  return DATA.users.filter(x => userBuyerIds(x).some(b=>allowed.includes(b)));
 }
 function scopedBuyers(){
   const u = getActiveUser();
@@ -1287,7 +1312,7 @@ function renderHeader(){
   let ticks = '';
   for(let i=0;i<30;i++){ ticks += `<div class="tick ${i%5===0?'major':''}"></div>`; }
 
-  const roleLabel = u.role==='admin' ? 'Admin — all buyers' : u.role==='manager' ? 'Manager — ' + (u.managedBuyerIds||[]).map(buyerName).join(', ') : `${u.dept} — ${buyerName(u.buyerId)}`;
+  const roleLabel = u.role==='admin' ? 'Admin — all buyers' : u.role==='manager' ? 'Manager — ' + (u.managedBuyerIds||[]).map(buyerName).join(', ') : `${u.dept} — ${buyerNamesDisplay(u)}`;
 
   return `
   <div class="header">
@@ -1483,7 +1508,7 @@ function allTaskNamesGrouped(){
 // Picks who a task should auto-assign to: prefers a member whose permissions specifically
 // include this task name; falls back to any unrestricted member in the right dept/buyer.
 function pickDefaultAssignee(buyerId, dept, taskName){
-  const candidates = DATA.users.filter(u=>u.role==='member' && u.buyerId===buyerId && u.dept===dept);
+  const candidates = DATA.users.filter(u=>u.role==='member' && userBuyerIds(u).includes(buyerId) && u.dept===dept);
   const restricted = candidates.find(u => (u.allowedTaskNames||[]).includes(taskName));
   if(restricted) return restricted.id;
   const unrestricted = candidates.find(u => !u.allowedTaskNames || u.allowedTaskNames.length===0);
@@ -1495,7 +1520,7 @@ function groupedUserOptionsHtml(users, selectedId){
     const group = users.filter(u=>u.dept===dept);
     if(group.length===0) return '';
     return `<optgroup label="${dept}">
-      ${group.map(u=>`<option value="${u.id}" ${u.id===selectedId?'selected':''}>${u.name} (${buyerName(u.buyerId)})</option>`).join('')}
+      ${group.map(u=>`<option value="${u.id}" ${u.id===selectedId?'selected':''}>${u.name} (${buyerNamesDisplay(u)})</option>`).join('')}
     </optgroup>`;
   }).join('');
 }
@@ -1768,7 +1793,7 @@ function renderOrderCard(order){
 }
 
 function renderOrderTasks(order){
-  const buyerUsers = DATA.users.filter(u=>u.role==='member' && u.buyerId===order.buyerId);
+  const buyerUsers = DATA.users.filter(u=>u.role==='member' && userBuyerIds(u).includes(order.buyerId));
   const tnaOnly = order.tasks.filter(t=>!t.materialType);
   const rows = tnaOnly.slice().sort((a,b)=> opDate(a)<opDate(b)?-1:1).map(t => {
     // Show everyone on this buyer's team, grouped by department — except members whose
@@ -2226,13 +2251,19 @@ function renderTeam(){
       <div class="field"><label>WhatsApp number</label><input id="newUserPhone" placeholder="e.g. 91XXXXXXXXXX" type="tel"></div>
     </div>
 
-    <div id="memberFields" class="grid-cols">
-      <div class="field"><label>Department</label>
+    <div id="memberFields">
+      <div class="field" style="margin-bottom:12px;"><label>Department</label>
         <select id="newUserDept">${DEPARTMENTS.map(d=>`<option value="${d}">${d}</option>`).join('')}</select>
       </div>
-      <div class="field"><label>Buyer</label>
-        <select id="newUserBuyer">${allBuyersForForm.map(b=>`<option value="${b.id}">${b.name}</option>`).join('')}</select>
+      <label>Buyer(s)</label>
+      <div class="checkbox-row" style="margin-bottom:8px;">
+        <input type="checkbox" id="newUserAllBuyers">
+        <label for="newUserAllBuyers" style="margin:0;font-weight:400;">All buyers (current and future) — for roles like Purchase, Store, Shipping, PPC that work across every buyer</label>
       </div>
+      <div id="newUserBuyerListWrap" class="checkbox-list" style="margin-bottom:12px;">
+        ${allBuyersForForm.map(b=>`<div class="checkbox-row"><input type="checkbox" class="newUserBuyerCheck" value="${b.id}" id="nub_${b.id}"><label for="nub_${b.id}" style="margin:0;font-weight:400;">${b.name}</label></div>`).join('')}
+      </div>
+      <div class="hint" style="margin-bottom:12px;">One person can be checked for several buyers — e.g. a merchandiser handling both H&amp;M and another buyer needs just one account, not two.</div>
     </div>
     ${isAdmin() ? `
     <div id="memberTaskPermissions" style="margin-top:10px;">
@@ -2294,7 +2325,7 @@ function renderTeam(){
         ${scopedUsers().filter(u => {
           if(!teamSearchTerm) return true;
           const s = teamSearchTerm.toLowerCase();
-          const scopeText = u.role==='manager' ? (u.managedBuyerIds||[]).map(buyerName).join(' ') : buyerName(u.buyerId);
+          const scopeText = u.role==='manager' ? (u.managedBuyerIds||[]).map(buyerName).join(' ') : buyerNamesDisplay(u);
           return u.name.toLowerCase().includes(s) || u.role.includes(s) || scopeText.toLowerCase().includes(s);
         }).map(u=>{
           const accessRow = (isAdmin() && u.role==='manager' && editingAccessUserId===u.id) ? `<tr>
@@ -2359,6 +2390,24 @@ function renderTeam(){
               </div>
             </td>
           </tr>` : '';
+          const buyersRow = (isAdmin() && u.role==='member' && editingBuyersUserId===u.id) ? `<tr>
+            <td colspan="7" style="background:#F7F5EE;">
+              <div style="padding:8px 4px;">
+                <label style="display:block;margin-bottom:6px;">Buyer(s) for ${u.name}</label>
+                <div class="checkbox-row" style="margin-bottom:8px;">
+                  <input type="checkbox" class="editAllBuyersCheck" id="eab_${u.id}" ${u.allBuyers?'checked':''}>
+                  <label for="eab_${u.id}" style="margin:0;font-weight:400;">All buyers (current and future)</label>
+                </div>
+                <div class="checkbox-list editBuyerListWrap" id="ebl_${u.id}" style="margin-bottom:10px;${u.allBuyers?'opacity:.4;':''}">
+                  ${DATA.buyers.map(b=>`<div class="checkbox-row"><input type="checkbox" class="editBuyerCheck" value="${b.id}" id="eb_${u.id}_${b.id}" ${(u.buyerIds||[]).includes(b.id)?'checked':''}><label for="eb_${u.id}_${b.id}" style="margin:0;font-weight:400;">${b.name}</label></div>`).join('')}
+                </div>
+                <div class="row-actions">
+                  <button class="btn small" data-save-buyers="${u.id}">Save buyers</button>
+                  <button class="btn ghost small" data-cancel-buyers="1">Cancel</button>
+                </div>
+              </div>
+            </td>
+          </tr>` : '';
           return `<tr>
           <td>
             <div style="display:flex;align-items:center;gap:8px;">
@@ -2373,16 +2422,17 @@ function renderTeam(){
           </td>
           <td class="mono">${u.username}</td>
           <td><span class="role-tag role-${u.role}">${u.role}</span></td>
-          <td style="font-size:12.5px;color:var(--muted);">${u.role==='admin' ? 'All buyers' : u.role==='manager' ? (u.managedBuyerIds||[]).map(buyerName).join(', ') || '—' : `${u.dept} · ${buyerName(u.buyerId)}${(u.allowedTaskNames&&u.allowedTaskNames.length) ? `<div style="margin-top:2px;">Restricted to: ${u.allowedTaskNames.join(', ')}</div>` : ''}`}</td>
+          <td style="font-size:12.5px;color:var(--muted);">${u.role==='admin' ? 'All buyers' : u.role==='manager' ? (u.managedBuyerIds||[]).map(buyerName).join(', ') || '—' : `${u.dept} · ${buyerNamesDisplay(u)}${(u.allowedTaskNames&&u.allowedTaskNames.length) ? `<div style="margin-top:2px;">Restricted to: ${u.allowedTaskNames.join(', ')}</div>` : ''}`}</td>
           <td class="mono">${u.email || '—'}</td>
           <td class="mono">${u.phone || '—'}</td>
           <td style="text-align:right;white-space:nowrap;">
             ${(isAdmin() && u.role==='manager') ? `<button class="btn ghost small" data-edit-access="${u.id}">Edit access</button>` : ''}
+            ${(isAdmin() && u.role==='member') ? `<button class="btn ghost small" data-edit-buyers="${u.id}">Edit buyers</button>` : ''}
             ${(isAdmin() && u.role==='member') ? `<button class="btn ghost small" data-edit-tasks="${u.id}">Edit tasks</button>` : ''}
             ${isAdmin() ? `<button class="btn ghost small" data-edit-password="${u.id}">Change password</button>` : ''}
             ${u.id===ACTIVE_USER_ID ? '' : `<button class="btn danger small" data-delete-user="${u.id}">Remove</button>`}
           </td>
-        </tr>${accessRow}${taskRow}${passwordRow}`;
+        </tr>${accessRow}${taskRow}${passwordRow}${buyersRow}`;
         }).join('')}
       </tbody>
     </table>
@@ -2689,7 +2739,7 @@ function renderPerformance(){
   const isFiltered = performanceFiltersActive();
 
   const memberStats = allMembers
-    .filter(u => (f.buyerId==='all'||u.buyerId===f.buyerId) && (f.memberId==='all'||u.id===f.memberId) && (f.dept==='all'||u.dept===f.dept))
+    .filter(u => (f.buyerId==='all'||userBuyerIds(u).includes(f.buyerId)) && (f.memberId==='all'||u.id===f.memberId) && (f.dept==='all'||u.dept===f.dept))
     .map(memberPerformance).sort((a,b)=> b.score - a.score);
   const buyerStats = allBuyers
     .filter(b => f.buyerId==='all' || b.id===f.buyerId)
@@ -2701,7 +2751,7 @@ function renderPerformance(){
 
   const memberCsvRows = [
     ['Name','Department','Buyer','Assigned','Completed','On-time %','Late completions','Avg delay (days)','Currently overdue','Score','Strength','Weakness'],
-    ...memberStats.map(m => { const gi = memberGapInsights(m); return [m.user.name, m.user.dept, buyerName(m.user.buyerId), m.total, m.done, m.onTimeRate===null?'—':m.onTimeRate, m.late, m.avgDelay, m.overdueOpen, m.score, gi.strength||'', gi.weakness||'']; })
+    ...memberStats.map(m => { const gi = memberGapInsights(m); return [m.user.name, m.user.dept, buyerNamesDisplay(m.user), m.total, m.done, m.onTimeRate===null?'—':m.onTimeRate, m.late, m.avgDelay, m.overdueOpen, m.score, gi.strength||'', gi.weakness||'']; })
   ];
 
   const gapCardsHtml = isFiltered ? `
@@ -2710,7 +2760,7 @@ function renderPerformance(){
     <p class="desc">Where each buyer or person in this filtered view stands against the 80-point target score, with the standout strength and weakness behind that number.</p>
     ${(buyerStats.length===0 && memberStats.length===0) ? emptyState('chart', 'Nothing matches this filter.') : ''}
     ${buyerStats.map(b => gapCardHtml(b.buyer.name, `${b.orders} order${b.orders!==1?'s':''}`, Math.max(0,Math.round(((b.onTimeRate??100)*0.6)+((b.totalTasks?(b.done/b.totalTasks)*100:0)*0.4)-(b.overdueOpen*3))), buyerGapInsights(b))).join('')}
-    ${memberStats.map(m => gapCardHtml(m.user.name, `${m.user.dept} · ${buyerName(m.user.buyerId)}`, m.score, memberGapInsights(m))).join('')}
+    ${memberStats.map(m => gapCardHtml(m.user.name, `${m.user.dept} · ${buyerNamesDisplay(m.user)}`, m.score, memberGapInsights(m))).join('')}
   </div>` : '';
 
   return `
@@ -2776,7 +2826,7 @@ function renderPerformance(){
         ${memberStats.map(m => `<tr>
           <td>${m.user.name}</td>
           <td><span class="dept-tag dept-${m.user.dept}">${m.user.dept}</span></td>
-          <td>${buyerName(m.user.buyerId)}</td>
+          <td>${buyerNamesDisplay(m.user)}</td>
           <td class="mono">${m.total}</td>
           <td class="mono">${m.done}</td>
           <td class="mono">${m.onTimeRate===null?'—':m.onTimeRate+'%'}</td>
@@ -2819,7 +2869,8 @@ function renderNotify(){
 
   const merchAlertHtml = merchAlerts.map(({u,tasks}) => {
     const overdue = tasks.filter(x=>taskStatusComputed(x.task)==='Overdue');
-    const managers = managersForBuyer(u.buyerId);
+    const taskBuyerIds = [...new Set(tasks.map(x=>x.order.buyerId))];
+    const managers = [...new Map(taskBuyerIds.flatMap(bid=>managersForBuyer(bid)).map(m=>[m.id,m])).values()];
     const managerEmails = managers.map(m=>m.email).filter(Boolean);
     const subject = `⚠ 3-day alert — ${tasks.length} task${tasks.length!==1?'s':''} due soon (${u.name})`;
     const lines = tasks.map(x => `${fmtDate(opDate(x.task))} — ${x.task.name} (${x.order.styleNo}, ${buyerName(x.order.buyerId)})${taskStatusComputed(x.task)==='Overdue' ? ' [OVERDUE]' : ''}`);
@@ -2828,7 +2879,7 @@ function renderNotify(){
     if(managerEmails.length) mailtoHref += `&cc=${encodeURIComponent(managerEmails.join(','))}`;
 
     return `<div class="email-preview" style="border-color:var(--thread-red-dim);">
-      <div class="to">To: ${u.email || '(no email on file)'} — ${u.name} (${buyerName(u.buyerId)})${managerEmails.length ? ` · CC: ${managers.map(m=>m.name).join(', ')}` : ' · <span style="color:var(--thread-red);">no manager on file for this buyer to CC</span>'}</div>
+      <div class="to">To: ${u.email || '(no email on file)'} — ${u.name} (${buyerNamesDisplay(u)})${managerEmails.length ? ` · CC: ${managers.map(m=>m.name).join(', ')}` : ' · <span style="color:var(--thread-red);">no manager on file for this buyer to CC</span>'}</div>
       <div class="subj">${subject}</div>
       <ul>
         ${tasks.map(x => `<li><strong>${fmtDate(opDate(x.task))}</strong> — ${x.task.name} (${x.order.styleNo}, ${buyerName(x.order.buyerId)})${taskStatusComputed(x.task)==='Overdue' ? ' <span style="color:var(--thread-red);">· overdue</span>' : ''}</li>`).join('')}
@@ -2849,7 +2900,7 @@ function renderNotify(){
     const waHref = u.phone ? `https://wa.me/${u.phone}?text=${encodeURIComponent(subject+'\n\n'+body)}` : null;
 
     return `<div class="email-preview">
-      <div class="to">To: ${u.email || '(no email on file)'} · ${u.phone ? '+'+u.phone : '(no WhatsApp number)'} — ${u.name} (${buyerName(u.buyerId)})</div>
+      <div class="to">To: ${u.email || '(no email on file)'} · ${u.phone ? '+'+u.phone : '(no WhatsApp number)'} — ${u.name} (${buyerNamesDisplay(u)})</div>
       <div class="subj">${subject}</div>
       <ul>
         ${tasks.slice(0,8).map(x => `<li><strong>${fmtDate(opDate(x.task))}</strong> — ${x.task.name} (${x.order.styleNo}, ${buyerName(x.order.buyerId)})${taskStatusComputed(x.task)==='Overdue' ? ' <span style="color:var(--thread-red);">· overdue</span>' : ''}</li>`).join('')}
@@ -3163,10 +3214,17 @@ function attachTabEvents(){
       DATA.buyers = DATA.buyers.filter(b=>b.id!==id);
       DATA.users.forEach(u => {
         if(u.buyerId===id) u.buyerId = null;
+        if(u.buyerIds) u.buyerIds = u.buyerIds.filter(x=>x!==id);
         if(u.managedBuyerIds) u.managedBuyerIds = u.managedBuyerIds.filter(x=>x!==id);
       });
       renderTabContent(); saveData();
     });
+  });
+
+  const newUserAllBuyers = document.getElementById('newUserAllBuyers');
+  if(newUserAllBuyers) newUserAllBuyers.addEventListener('change', () => {
+    const wrap = document.getElementById('newUserBuyerListWrap');
+    if(wrap) wrap.style.opacity = newUserAllBuyers.checked ? '.4' : '1';
   });
 
   const newUserPhotoInput = document.getElementById('newUserPhotoInput');
@@ -3193,11 +3251,14 @@ function attachTabEvents(){
     if(DATA.users.some(u=>u.username.toLowerCase()===username)){ showToast('That username is already taken'); return; }
     if(!isAdmin() && role!=='member'){ showToast('Only Admin can create Managers or Admins'); return; }
 
-    let dept=null, buyerId=null, managedBuyerIds=[], allowedTaskNames=[], designation='', tabAccess=[];
+    let dept=null, buyerId=null, buyerIds=[], allBuyers=false, managedBuyerIds=[], allowedTaskNames=[], designation='', tabAccess=[];
     if(role==='member'){
       dept = document.getElementById('newUserDept').value;
-      buyerId = document.getElementById('newUserBuyer').value;
-      if(!isAdmin() && !allowedBuyerIds().includes(buyerId)){ showToast('You can only add members to your own buyer(s)'); return; }
+      allBuyers = isAdmin() && document.getElementById('newUserAllBuyers').checked;
+      buyerIds = allBuyers ? [] : Array.from(document.querySelectorAll('.newUserBuyerCheck:checked')).map(c=>c.value);
+      if(!allBuyers && buyerIds.length===0){ showToast('Select at least one buyer, or check "All buyers"'); return; }
+      if(!isAdmin() && !buyerIds.every(bid=>allowedBuyerIds().includes(bid))){ showToast('You can only add members to your own buyer(s)'); return; }
+      buyerId = buyerIds[0] || null; // kept for backward compatibility, buyerIds is the source of truth now
       allowedTaskNames = isAdmin() ? Array.from(document.querySelectorAll('.memberTaskCheck:checked')).map(c=>c.value) : [];
     } else if(role==='manager'){
       managedBuyerIds = Array.from(document.querySelectorAll('.managerBuyerCheck:checked')).map(c=>c.value);
@@ -3206,7 +3267,7 @@ function attachTabEvents(){
       tabAccess = Array.from(document.querySelectorAll('.managerTabCheck:checked')).map(c=>c.value);
     }
 
-    DATA.users.push({id: uid('usr'), username, password, name, email, phone, role, dept, buyerId, managedBuyerIds, allowedTaskNames, designation, tabAccess, photo: pendingNewUserPhoto});
+    DATA.users.push({id: uid('usr'), username, password, name, email, phone, role, dept, buyerId, buyerIds, allBuyers, managedBuyerIds, allowedTaskNames, designation, tabAccess, photo: pendingNewUserPhoto});
     pendingNewUserPhoto = '';
     renderTabContent(); showToast('Team member added'); saveData();
   });
@@ -3283,6 +3344,34 @@ function attachTabEvents(){
       u.password = newPw;
       editingPasswordUserId = null;
       renderTabContent(); showToast('Password updated'); saveData();
+    });
+  });
+  document.querySelectorAll('[data-edit-buyers]').forEach(btn => {
+    btn.addEventListener('click', () => { if(!isAdmin()) return; editingBuyersUserId = btn.dataset.editBuyers; renderTabContent(); });
+  });
+  document.querySelectorAll('[data-cancel-buyers]').forEach(btn => {
+    btn.addEventListener('click', () => { editingBuyersUserId = null; renderTabContent(); });
+  });
+  document.querySelectorAll('.editAllBuyersCheck').forEach(cb => {
+    cb.addEventListener('change', () => {
+      const wrap = document.getElementById('ebl_'+cb.id.replace('eab_',''));
+      if(wrap) wrap.style.opacity = cb.checked ? '.4' : '1';
+    });
+  });
+  document.querySelectorAll('[data-save-buyers]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if(!isAdmin()) return;
+      const userId = btn.dataset.saveBuyers;
+      const u = DATA.users.find(x=>x.id===userId);
+      const allBuyersCb = document.getElementById('eab_'+userId);
+      const allBuyers = allBuyersCb ? allBuyersCb.checked : false;
+      const buyerIds = allBuyers ? [] : Array.from(document.querySelectorAll(`#ebl_${userId} .editBuyerCheck:checked`)).map(c=>c.value);
+      if(!allBuyers && buyerIds.length===0){ showToast('Select at least one buyer, or check "All buyers"'); return; }
+      u.allBuyers = allBuyers;
+      u.buyerIds = buyerIds;
+      u.buyerId = buyerIds[0] || null; // kept for backward compatibility, buyerIds is the source of truth now
+      editingBuyersUserId = null;
+      renderTabContent(); showToast('Buyer assignment updated'); saveData();
     });
   });
 
@@ -3362,7 +3451,7 @@ function attachTabEvents(){
       const orderId = btn.dataset.importBom;
       const order = DATA.orders.find(o=>o.id===orderId);
       const validRows = bomPreview.rows.filter(r=>!r.error);
-      const defaultStoreUser = (DATA.users.find(u=>u.role==='member' && u.buyerId===order.buyerId && u.dept==='Store') || {}).id || null;
+      const defaultStoreUser = (DATA.users.find(u=>u.role==='member' && userBuyerIds(u).includes(order.buyerId) && u.dept==='Store') || {}).id || null;
       validRows.forEach(r => {
         order.tasks.push({
           id: uid('task'), templateId: null, name: `${r.itemName} Inward (GRN)`, dept:'Store',
@@ -3384,7 +3473,7 @@ function attachTabEvents(){
   document.querySelectorAll('[data-add-bom-item]').forEach(btn => {
     btn.addEventListener('click', async () => {
       const order = DATA.orders.find(o=>o.id===btn.dataset.addBomItem);
-      const defaultStoreUser = (DATA.users.find(u=>u.role==='member' && u.buyerId===order.buyerId && u.dept==='Store') || {}).id || null;
+      const defaultStoreUser = (DATA.users.find(u=>u.role==='member' && userBuyerIds(u).includes(order.buyerId) && u.dept==='Store') || {}).id || null;
       order.tasks.push({
         id: uid('task'), templateId: null, name: 'New item Inward (GRN)', dept:'Store',
         plannedDate: order.pcd, expectedDate: order.pcd, expectedDateManuallySet: false,
