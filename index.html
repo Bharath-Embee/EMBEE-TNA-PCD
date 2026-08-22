@@ -362,6 +362,34 @@ function loadXlsxLib(){
   });
   return xlsxLoadPromise;
 }
+/* ---- Charts (Chart.js) — loaded on demand, same safe pattern as the PDF/Excel libraries ---- */
+let chartJsLoadPromise = null;
+function loadChartJsLib(){
+  if(window.Chart) return Promise.resolve(true);
+  if(chartJsLoadPromise) return chartJsLoadPromise;
+  chartJsLoadPromise = new Promise((resolve) => {
+    const timeout = setTimeout(() => { resolve(false); }, 8000);
+    const script = document.createElement('script');
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js';
+    script.onload = () => { clearTimeout(timeout); resolve(!!window.Chart); };
+    script.onerror = () => { clearTimeout(timeout); resolve(false); };
+    document.head.appendChild(script);
+  });
+  return chartJsLoadPromise;
+}
+// One place to destroy+recreate every chart instance, keyed by canvas id — every
+// render rebuilds the DOM from scratch (fresh canvas nodes), so the previous
+// Chart.js instance bound to the old node must be explicitly destroyed or it just
+// leaks (and Chart.js logs a re-use warning on the id) each time a filter changes.
+const chartInstances = {};
+function destroyChart(id){
+  if(chartInstances[id]){ chartInstances[id].destroy(); delete chartInstances[id]; }
+}
+// Shared look for every chart on the site — matches the app's own type/ink tokens
+// instead of Chart.js defaults, so charts read as part of the same design, not a
+// bolted-on widget.
+function chartBaseFont(){ return { family: "'IBM Plex Sans', sans-serif", size: 12 }; }
+
 async function downloadExcelTemplate(headers, exampleRows, filename){
   const ok = await loadXlsxLib();
   if(!ok || !window.XLSX){ showToast('Could not load the Excel library — check your internet connection and try again'); return; }
@@ -444,7 +472,7 @@ function pdfTable(doc, y, headers, rows, colWidths, marginLeft){
 
 async function exportOrderPdf(order){
   showToast('Preparing PDF…');
-  const doc = await pdfNewDoc(`${order.styleNo}${order.season?' ('+order.season+')':''} — ${order.item}`, `${buyerName(order.buyerId)} · PCD ${fmtDate(order.pcd)}${order.templateSetName?' · '+order.templateSetName:''}`);
+  const doc = await pdfNewDoc(`${order.styleNo}${order.season?' ('+order.season+')':''} — ${order.item}`, `${buyerName(order.buyerId)}${order.poNumber?' · PO '+order.poNumber:''} · PCD ${fmtDate(order.pcd)}${order.templateSetName?' · '+order.templateSetName:''}`);
   if(!doc) return;
   let y = 72;
   const tnaTasks = order.tasks.filter(t=>!t.materialType);
@@ -657,6 +685,9 @@ function migrateData(d){
   }
   // Defensively backfill every field added across versions, so data saved by an
   // older version of the system doesn't crash a newer screen that expects it to exist.
+  d.templateSets.forEach(set => {
+    (set.tasks||[]).forEach(t => { if(t.dependsOn === undefined) t.dependsOn = null; });
+  });
   d.users.forEach(u => {
     if(u.managedBuyerIds === undefined) u.managedBuyerIds = [];
     if(u.allowedTaskNames === undefined) u.allowedTaskNames = [];
@@ -682,6 +713,7 @@ function migrateData(d){
     if(o.trimRequiredQty !== undefined) delete o.trimRequiredQty;
     if(o.season === undefined) o.season = '';
     if(o.qty === undefined) o.qty = '';
+    if(o.poNumber === undefined) o.poNumber = '';
     if(o.templateSetName === undefined) o.templateSetName = '';
     if(!Array.isArray(o.tasks)) o.tasks = [];
     // Backfill offsetDays on older TNA tasks (from before PCD editing existed) so
@@ -690,6 +722,8 @@ function migrateData(d){
     o.tasks.forEach(t => {
       if(t.status === undefined) t.status = 'Pending';
       if(t.remarks === undefined) t.remarks = '';
+      if(!Array.isArray(t.history)) t.history = [];
+      if(t.dependsOn === undefined) t.dependsOn = null;
       if(t.actualDate === undefined) t.actualDate = null;
       if(t.assignedTo === undefined) t.assignedTo = null;
       if(t.materialType === undefined) t.materialType = null;
@@ -872,9 +906,12 @@ async function backendSet(key, value){
 }
 
 async function storageGet(key){
+  // Once we're in backend mode, a failed GET must surface as a failure — falling
+  // through to local storage here would silently read an unrelated (usually empty)
+  // copy, which loadData() would then mistake for "no data yet" and overwrite the
+  // real shared data with a blank slate. Let the caller decide how to handle it.
   if(USING_BACKEND_API){
-    try{ return await backendGet(key); }
-    catch(e){ console.error('Backend get failed, falling back:', e); }
+    return await backendGet(key);
   }
   if(HAS_CLAUDE_STORAGE){
     const res = await window.storage.get(key, true);
@@ -883,9 +920,12 @@ async function storageGet(key){
   try{ return localStorage.getItem('claude_fallback__' + key); }catch(e){ return null; }
 }
 async function storageSet(key, value){
+  // Same reasoning as storageGet: in backend mode a failed save must be reported
+  // to the caller (saveData() shows a toast), not silently redirected to a local
+  // copy the rest of the team will never see.
   if(USING_BACKEND_API){
-    try{ await backendSet(key, value); return; }
-    catch(e){ console.error('Backend set failed, falling back:', e); }
+    await backendSet(key, value);
+    return;
   }
   if(HAS_CLAUDE_STORAGE){
     await window.storage.set(key, value, true);
@@ -908,13 +948,37 @@ async function personalStorageSet(key, value){
   localStorage.setItem('claude_fallback_personal__' + key, value);
 }
 
+// Set when loadData() could not confirm what's actually saved (network/server error,
+// or corrupted JSON) — as opposed to a confirmed-empty first run. init() checks this
+// and shows a retry screen instead of the app, specifically so nobody edits a blank
+// slate that then gets saved over real shared data.
+let DATA_LOAD_FAILED = false;
+
 async function loadData(){
   await detectBackendApi();
+  DATA_LOAD_FAILED = false;
+  let value;
   try{
-    const value = await storageGet(STORAGE_KEY);
-    if(value){ DATA = JSON.parse(value); }
-    else { DATA = defaultData(); await saveData(); }
+    value = await storageGet(STORAGE_KEY);
   }catch(e){
+    console.error('TNA data load failed:', e);
+    DATA_LOAD_FAILED = true;
+    DATA = defaultData(); // just enough to avoid null-checks elsewhere — never saved
+    return;
+  }
+  if(value){
+    try{ DATA = JSON.parse(value); }
+    catch(e){
+      // Data came back but isn't valid JSON — corrupted, not absent. Don't paper
+      // over it by saving fresh defaults on top of whatever is actually stored.
+      console.error('TNA data parse failed:', e);
+      DATA_LOAD_FAILED = true;
+      DATA = defaultData();
+      return;
+    }
+  } else {
+    // Backend/storage responded successfully and confirmed there's genuinely
+    // nothing saved yet — safe to initialize.
     DATA = defaultData();
     await saveData();
   }
@@ -1122,6 +1186,36 @@ function taskDelayDays(task){
   if(task.actualDate) return daysBetween(ref, task.actualDate);
   if(isOpenTask(task) && ref < today()) return daysBetween(ref, today());
   return 0;
+}
+
+// Pushes the Expected Date of anything that depends on `changedTask` forward to match
+// its own finish reference (Actual Date once it's done, otherwise Expected Date) — a
+// slip in an upstream task (e.g. fabric approval running late) is reflected in what
+// comes after it instead of the downstream date silently staying stale. Only ever
+// pushes dates LATER, never pulls them earlier — finishing something early doesn't
+// yank other people's plans forward without them choosing to. This is a floor, not a
+// duration-aware schedule: it doesn't know how many days the dependent task itself
+// needs, only that it can't be due before its predecessor is.
+function cascadeTaskDelay(order, changedTask){
+  const pushed = [];
+  const visited = new Set();
+  function propagate(fromTask){
+    if(visited.has(fromTask.id)) return; // cycle guard, belt-and-braces alongside the UI's own cycle prevention
+    visited.add(fromTask.id);
+    const finishRef = fromTask.actualDate || fromTask.expectedDate;
+    if(!finishRef) return;
+    order.tasks.filter(t => t.dependsOn===fromTask.id).forEach(dep => {
+      const depRef = dep.expectedDate || dep.plannedDate;
+      if(depRef && finishRef > depRef){
+        dep.expectedDate = finishRef;
+        dep.expectedDateManuallySet = true;
+        pushed.push(dep);
+        propagate(dep);
+      }
+    });
+  }
+  propagate(changedTask);
+  return pushed;
 }
 
 function taskStatusComputed(task){
@@ -1387,13 +1481,13 @@ function renderTabContent(){
       el.innerHTML = emptyState('people', "Your admin hasn't given you access to any screens yet. Ask them to update your access under Buyers & Team.");
       return;
     }
-    if(currentTab==='dashboard') el.innerHTML = renderDashboard();
+    if(currentTab==='dashboard'){ el.innerHTML = renderDashboard(); initDashboardCharts(); }
     else if(currentTab==='orders') el.innerHTML = renderOrders();
-    else if(currentTab==='performance') el.innerHTML = renderPerformance();
+    else if(currentTab==='performance'){ el.innerHTML = renderPerformance(); initPerformanceCharts(); }
     else if(currentTab==='team') el.innerHTML = renderTeam();
     else if(currentTab==='templates') el.innerHTML = renderTemplates();
     else if(currentTab==='notify') el.innerHTML = renderNotify();
-    else el.innerHTML = renderDashboard();
+    else { el.innerHTML = renderDashboard(); initDashboardCharts(); }
     attachTabEvents();
   }catch(err){
     showRenderError(el, err);
@@ -1445,6 +1539,23 @@ function checkAndNotify(){
   }
 }
 
+// Every time Remarks is changed and saved, the previous text is kept here instead of
+// just being overwritten — this is how buyer/approval comment cycles (submit → buyer
+// feedback → revise → resubmit) actually get a record, instead of only ever showing
+// whatever the last person typed. Rendered as a native <details> so it costs nothing
+// when collapsed and needs no extra toggle-state plumbing.
+function taskHistoryHtml(task){
+  if(!task.history || task.history.length===0) return '';
+  return `<details style="margin-top:4px;">
+    <summary style="cursor:pointer;font-size:11px;color:var(--muted);">History (${task.history.length})</summary>
+    <div style="margin-top:4px;max-height:130px;overflow-y:auto;">
+      ${task.history.slice().reverse().map(h => `<div style="font-size:11.5px;color:var(--muted);padding:4px 0;border-top:1px solid var(--line);">
+        <span class="mono">${fmtDate(h.date)}</span> — <strong>${(h.author||'').replace(/</g,'&lt;')}</strong>: ${(h.text||'').replace(/</g,'&lt;')}
+      </div>`).join('')}
+    </div>
+  </details>`;
+}
+
 /* ---- My Tasks (Member role) ---- */
 function renderMyTasks(){
   const u = getActiveUser();
@@ -1488,7 +1599,7 @@ function renderMyTasks(){
             <input type="number" class="receivedqty-input" style="min-width:100px;" placeholder="Qty received" data-order="${x.order.id}" data-task="${x.task.id}" value="${x.task.receivedQty!==null && x.task.receivedQty!==undefined ? x.task.receivedQty : ''}">
             ${x.task.requiredQty ? `<div class="hint" style="margin-top:3px;">of ${x.task.requiredQty}${x.task.unit?' '+x.task.unit:''} required${pct!==null ? ` — <span class="badge ${qtyReadyClass(pct)}">${pct}%</span>` : ''}</div>` : '<div class="hint" style="margin-top:3px;">Set required qty on the order first</div>'}
           ` : '<span style="color:var(--muted);">—</span>'}</td>
-          <td><input type="text" class="remarks-input" placeholder="Add a note…" data-order="${x.order.id}" data-task="${x.task.id}" value="${x.task.remarks ? x.task.remarks.replace(/"/g,'&quot;') : ''}"></td>
+          <td><input type="text" class="remarks-input" placeholder="Add a note…" data-order="${x.order.id}" data-task="${x.task.id}" value="${x.task.remarks ? x.task.remarks.replace(/"/g,'&quot;') : ''}">${taskHistoryHtml(x.task)}</td>
           <td><button class="btn small" data-save-task-row="${x.task.id}" data-order="${x.order.id}">Save</button></td>
         </tr>`; }).join('')}
       </tbody>
@@ -1625,6 +1736,21 @@ function renderDashboard(){
     <div class="stat"><div class="num">${onTimePct===null?'—':onTimePct+'%'}</div><div class="lbl">Completed on time</div></div>
   </div>
 
+  ${all.length>0 ? `<div class="panel">
+    <h2>Visual overview</h2>
+    <p class="desc">Order health and task pipeline for everything matching your current filter.</p>
+    <div class="grid-cols" style="grid-template-columns:1fr 1fr;align-items:start;">
+      <div>
+        <div class="hint" style="margin-bottom:8px;font-weight:600;color:var(--ink-soft);">Orders by health</div>
+        ${orders.length>0 ? `<div style="position:relative;height:230px;"><canvas id="dashRagChart"></canvas></div>` : emptyState('chart', 'No orders match this filter.')}
+      </div>
+      <div>
+        <div class="hint" style="margin-bottom:8px;font-weight:600;color:var(--ink-soft);">Tasks by stage</div>
+        <div style="position:relative;height:230px;"><canvas id="dashTaskChart"></canvas></div>
+      </div>
+    </div>
+  </div>` : ''}
+
   ${buyerCards ? `<div class="panel">
     <h2>Buyer overview</h2>
     <p class="desc">Red/amber/green health per buyer, at a glance — the same way a production planning board flags what needs attention first.</p>
@@ -1672,6 +1798,74 @@ function renderDashboard(){
   </div>`;
 }
 
+// Draws the two Dashboard charts into the canvases renderDashboard() just put in the
+// DOM. Called after every dashboard render (see attachTabEvents) — recomputes from
+// the live filter state itself rather than taking numbers as arguments, since Chart.js
+// loads async and the user could switch tabs or change a filter before it resolves;
+// the canvas-existence checks below are what make that race harmless.
+async function initDashboardCharts(){
+  if(!document.getElementById('dashRagChart') && !document.getElementById('dashTaskChart')) return;
+  const ok = await loadChartJsLib();
+  if(!ok || !window.Chart) return;
+
+  const orders = dashboardFilteredOrders();
+  const all = dashboardFilteredTasks();
+  const overdue = all.filter(x => taskStatusComputed(x.task)==='Overdue');
+  const dueSoon = all.filter(x => isOpenTask(x.task) && taskStatusComputed(x.task)!=='Overdue' && daysBetween(today(), opDate(x.task)) <= 3);
+  const onTrackOpen = all.filter(x => isOpenTask(x.task) && taskStatusComputed(x.task)!=='Overdue' && daysBetween(today(), opDate(x.task)) > 3);
+  const doneTasks = all.filter(x => SUCCESS_STATUSES.includes(x.task.status));
+  const onTimeDone = doneTasks.filter(x => x.task.actualDate && x.task.actualDate <= opDate(x.task));
+  const lateDone = doneTasks.length - onTimeDone.length;
+
+  const ragCanvas = document.getElementById('dashRagChart');
+  destroyChart('dashRagChart');
+  if(ragCanvas){
+    const counts = {red:0, amber:0, green:0};
+    orders.forEach(o => counts[orderRAG(o)]++);
+    chartInstances.dashRagChart = new Chart(ragCanvas, {
+      type: 'doughnut',
+      data: {
+        labels: ['At risk','Watch','On track'],
+        datasets: [{ data: [counts.red, counts.amber, counts.green], backgroundColor: ['#C1443C','#B8862E','#3E7A4E'], borderColor: '#FBF9F4', borderWidth: 2 }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false, cutout: '62%',
+        plugins: {
+          legend: { position: 'bottom', labels: { font: chartBaseFont(), color: '#2B3A55', padding: 14, usePointStyle: true } },
+          tooltip: { callbacks: { label: ctx => ` ${ctx.label}: ${ctx.parsed} order${ctx.parsed!==1?'s':''}` } }
+        }
+      }
+    });
+  }
+
+  const taskCanvas = document.getElementById('dashTaskChart');
+  destroyChart('dashTaskChart');
+  if(taskCanvas){
+    const rows = [
+      ['Overdue', overdue.length, '#C1443C'],
+      ['Due soon', dueSoon.length, '#B8862E'],
+      ['On track', onTrackOpen.length, '#8B97AF'],
+      ['Done on time', onTimeDone.length, '#3E7A4E'],
+      ['Done late', lateDone, '#B8862E'],
+    ];
+    chartInstances.dashTaskChart = new Chart(taskCanvas, {
+      type: 'bar',
+      data: {
+        labels: rows.map(r=>r[0]),
+        datasets: [{ data: rows.map(r=>r[1]), backgroundColor: rows.map(r=>r[2]), borderRadius: 4, maxBarThickness: 34 }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ` ${ctx.parsed.y} task${ctx.parsed.y!==1?'s':''}` } } },
+        scales: {
+          x: { grid: { display: false }, ticks: { font: chartBaseFont(), color: '#6B7385' } },
+          y: { beginAtZero: true, ticks: { precision: 0, font: chartBaseFont(), color: '#6B7385' }, grid: { color: '#EFEBE0' } }
+        }
+      }
+    });
+  }
+}
+
 function renderTaskRow(order, task){
   const status = taskStatusComputed(task);
   return `<tr>
@@ -1705,6 +1899,7 @@ function renderOrders(){
         <select id="newOrderBuyer">${buyers.map(b=>`<option value="${b.id}">${b.name}</option>`).join('')}</select>
       </div>
       <div class="field"><label>Style No.</label><input id="newOrderStyle" placeholder="e.g. ST-2201"></div>
+      <div class="field"><label>Buyer PO No.</label><input id="newOrderPo" placeholder="e.g. PO-88213"></div>
       <div class="field"><label>Season</label><input id="newOrderSeason" placeholder="e.g. AW26, SS27"></div>
       <div class="field"><label>Item</label><input id="newOrderItem" placeholder="e.g. Men's Woven Shirt"></div>
       <div class="field"><label>Order qty (pcs)</label><input id="newOrderQty" type="number" placeholder="e.g. 12000"></div>
@@ -1721,7 +1916,7 @@ function renderOrders(){
     <div class="flex-between">
       <h2 style="margin:0;">Orders (${scopedOrders().length})</h2>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <input id="orderSearchInput" placeholder="Search style, item, buyer…" style="max-width:220px;" value="${orderSearchTerm}">
+        <input id="orderSearchInput" placeholder="Search style, PO#, item, buyer…" style="max-width:220px;" value="${orderSearchTerm}">
         <select id="orderRagFilter" style="max-width:150px;">
           <option value="all" ${orderRagFilter==='all'?'selected':''}>All statuses</option>
           <option value="red" ${orderRagFilter==='red'?'selected':''}>At risk</option>
@@ -1734,7 +1929,7 @@ function renderOrders(){
       let list = scopedOrders().slice();
       if(orderSearchTerm){
         const s = orderSearchTerm.toLowerCase();
-        list = list.filter(o => o.styleNo.toLowerCase().includes(s) || o.item.toLowerCase().includes(s) || buyerName(o.buyerId).toLowerCase().includes(s) || (o.season||'').toLowerCase().includes(s));
+        list = list.filter(o => o.styleNo.toLowerCase().includes(s) || (o.poNumber||'').toLowerCase().includes(s) || o.item.toLowerCase().includes(s) || buyerName(o.buyerId).toLowerCase().includes(s) || (o.season||'').toLowerCase().includes(s));
       }
       if(orderRagFilter!=='all') list = list.filter(o => orderRAG(o)===orderRagFilter);
       if(list.length===0) return emptyState('shirt', 'No orders match.');
@@ -1773,7 +1968,7 @@ function renderOrderCard(order){
     <div class="order-card-head">
       <div>
         <div class="order-title"><span class="rag-dot ${rag}" title="${ragLabel(rag)}"></span> ${order.styleNo}${order.season?` <span class="dept-tag" style="background:var(--brass-soft);color:#7A5A16;">${order.season}</span>`:''} — ${order.item}</div>
-        <div class="order-meta">${buyerName(order.buyerId)}${order.templateSetName?' · '+order.templateSetName:''} · Qty ${order.qty || '—'} · ${done}/${total} tasks done${overdue?` · <span style="color:var(--thread-red);">${overdue} overdue</span>`:''}</div>
+        <div class="order-meta">${buyerName(order.buyerId)}${order.poNumber?' · PO '+order.poNumber:''}${order.templateSetName?' · '+order.templateSetName:''} · Qty ${order.qty || '—'} · ${done}/${total} tasks done${overdue?` · <span style="color:var(--thread-red);">${overdue} overdue</span>`:''}</div>
       </div>
       <div style="text-align:right;">
         ${editingPcd ? `
@@ -1818,8 +2013,9 @@ function renderOrderTasks(order){
     `;
     const delay = taskDelayDays(t);
     const slip = estimateSlippageDays(t);
+    const dependsOnTask = t.dependsOn ? order.tasks.find(x=>x.id===t.dependsOn) : null;
     return `<tr>
-      <td>${t.name}</td>
+      <td>${t.name}${dependsOnTask ? `<div class="hint" style="margin-top:2px;">⛓ after: ${dependsOnTask.name}</div>` : ''}</td>
       <td><span class="dept-tag dept-${t.dept}">${t.dept}</span></td>
       <td>
         <select class="assignee-select" data-order="${order.id}" data-task="${t.id}">
@@ -1841,7 +2037,7 @@ function renderOrderTasks(order){
         <div class="hint" style="margin-top:3px;"><span class="badge ${taskBadgeClass(t)}">${statusDisplayText(t)}</span></div>
       </td>
       <td class="mono" style="color:${delay>0?'var(--thread-red)':delay<0?'var(--green)':'var(--muted)'};">${delay>0?'+':''}${delay || '—'}</td>
-      <td><input type="text" class="remarks-input" placeholder="Add a note…" data-order="${order.id}" data-task="${t.id}" value="${t.remarks ? t.remarks.replace(/"/g,'&quot;') : ''}"></td>
+      <td><input type="text" class="remarks-input" placeholder="Add a note…" data-order="${order.id}" data-task="${t.id}" value="${t.remarks ? t.remarks.replace(/"/g,'&quot;') : ''}">${taskHistoryHtml(t)}</td>
       <td><button class="btn small" data-save-task-row="${t.id}" data-order="${order.id}">Save</button></td>
     </tr>`;
   }).join('');
@@ -2483,6 +2679,29 @@ function renderTemplateBulkAddSection(set, bulkPreviewForThisSet){
   return '<div class="divider"></div><h2 style="font-size:13px;">' + heading + '</h2>' + body;
 }
 
+// Tasks that (directly or transitively) already depend on taskId — offered as taskId's
+// own "Depends on" would create a cycle, so the dropdown excludes them.
+function templateDescendantIds(set, taskId){
+  const result = new Set();
+  let added = true;
+  while(added){
+    added = false;
+    set.tasks.forEach(t => {
+      if(!result.has(t.id) && (t.dependsOn===taskId || result.has(t.dependsOn))){
+        result.add(t.id); added = true;
+      }
+    });
+  }
+  return result;
+}
+function templateDependsOnOptionsHtml(set, taskId, selectedId){
+  // taskId is null for the "add new task" form — a task that doesn't exist yet can't
+  // have any existing descendants, so nothing needs excluding in that case.
+  const excluded = taskId ? templateDescendantIds(set, taskId) : new Set();
+  const options = set.tasks.filter(t => t.id!==taskId && !excluded.has(t.id));
+  return `<option value="">— None —</option>` + options.map(t=>`<option value="${t.id}" ${selectedId===t.id?'selected':''}>${t.name}</option>`).join('');
+}
+
 function renderTemplates(){
   const sets = DATA.templateSets;
   const tplPreview = templatePastePreview;
@@ -2496,16 +2715,19 @@ function renderTemplates(){
           <td><input class="tpl-name-input mono" data-set="${set.id}" data-tpl="${t.id}" value="${t.name.replace(/"/g,'&quot;')}" style="min-width:220px;"></td>
           <td><select class="tpl-dept-select" data-set="${set.id}" data-tpl="${t.id}">${DEPARTMENTS.map(d=>`<option value="${d}" ${t.dept===d?'selected':''}>${d}</option>`).join('')}</select></td>
           <td><input class="tpl-offset-input mono" data-set="${set.id}" data-tpl="${t.id}" type="number" value="${t.offset}" style="width:90px;display:inline-block;"> days before PCD</td>
+          <td><select class="tpl-dependson-select" data-set="${set.id}" data-tpl="${t.id}" style="min-width:160px;">${templateDependsOnOptionsHtml(set, t.id, t.dependsOn)}</select></td>
           <td style="text-align:right;white-space:nowrap;">
             <button class="btn small" data-save-tpl-row="${t.id}" data-set="${set.id}">Save</button>
             <button class="btn danger small" data-delete-template="${t.id}" data-set="${set.id}">Remove</button>
           </td>
         </tr>`;
       }
+      const dependsOnTask = t.dependsOn ? set.tasks.find(x=>x.id===t.dependsOn) : null;
       return `<tr>
         <td>${t.name}</td>
         <td><span class="dept-tag dept-${t.dept}">${t.dept}</span></td>
         <td class="mono">${t.offset} days before PCD</td>
+        <td>${dependsOnTask ? dependsOnTask.name : '—'}</td>
         <td></td>
       </tr>`;
     }).join('');
@@ -2526,14 +2748,16 @@ function renderTemplates(){
       ${expanded ? `
         <div class="divider"></div>
         ${isAdmin() ? `
-        <div class="grid-cols" style="grid-template-columns:2fr 1fr 1fr auto;">
+        <div class="grid-cols" style="grid-template-columns:2fr 1fr 1fr 1.5fr auto;">
           <div class="field"><label>Task name</label><input id="newTplName_${set.id}" placeholder="e.g. Buyer PP Approval"></div>
           <div class="field"><label>Department</label><select id="newTplDept_${set.id}">${DEPARTMENTS.map(d=>`<option value="${d}">${d}</option>`).join('')}</select></div>
           <div class="field"><label>Days before PCD</label><input id="newTplOffset_${set.id}" type="number" placeholder="e.g. 40"></div>
+          <div class="field"><label>Depends on</label><select id="newTplDependsOn_${set.id}">${templateDependsOnOptionsHtml(set, null, null)}</select></div>
           <div style="display:flex;align-items:flex-end;"><button class="btn" data-add-template-to-set="${set.id}">Add task</button></div>
         </div>
+        <div class="hint" style="margin-top:6px;">Setting "Depends on" means every order made from this template will automatically push that task's Expected Date if the one it depends on finishes late — e.g. PP Sample depending on Fit Approval.</div>
         <div class="divider"></div>` : ''}
-        <table><thead><tr><th>Task</th><th>Dept</th><th>Timing</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+        <table><thead><tr><th>Task</th><th>Dept</th><th>Timing</th><th>Depends on</th><th></th></tr></thead><tbody>${rows}</tbody></table>
         ${isAdmin() ? renderTemplateBulkAddSection(set, bulkPreviewForThisSet) : ''}
       ` : ''}
     </div>`;
@@ -2742,18 +2966,27 @@ function csvDownloadHref(rows){
   return 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
 }
 
+// Shared between renderPerformance() and initPerformanceCharts() so the chart and
+// the table underneath it can never drift apart from applying the filter differently.
+function filteredMemberStats(){
+  const f = performanceFilters;
+  return scopedUsers().filter(u=>u.role==='member')
+    .filter(u => (f.buyerId==='all'||userBuyerIds(u).includes(f.buyerId)) && (f.memberId==='all'||u.id===f.memberId) && (f.dept==='all'||u.dept===f.dept))
+    .map(memberPerformance).sort((a,b)=> b.score - a.score);
+}
+function filteredBuyerStats(){
+  const f = performanceFilters;
+  return scopedBuyers().filter(b => f.buyerId==='all' || b.id===f.buyerId).map(buyerPerformance);
+}
+
 function renderPerformance(){
   const allMembers = scopedUsers().filter(u=>u.role==='member');
   const allBuyers = scopedBuyers();
   const f = performanceFilters;
   const isFiltered = performanceFiltersActive();
 
-  const memberStats = allMembers
-    .filter(u => (f.buyerId==='all'||userBuyerIds(u).includes(f.buyerId)) && (f.memberId==='all'||u.id===f.memberId) && (f.dept==='all'||u.dept===f.dept))
-    .map(memberPerformance).sort((a,b)=> b.score - a.score);
-  const buyerStats = allBuyers
-    .filter(b => f.buyerId==='all' || b.id===f.buyerId)
-    .map(buyerPerformance);
+  const memberStats = filteredMemberStats();
+  const buyerStats = filteredBuyerStats();
 
   const buyerOptions = `<option value="all">All buyers</option>` + allBuyers.map(b=>`<option value="${b.id}" ${f.buyerId===b.id?'selected':''}>${b.name}</option>`).join('');
   const memberOptions = `<option value="all">All team members</option>` + groupedUserOptionsHtml(allMembers, f.memberId==='all'?null:f.memberId);
@@ -2777,6 +3010,10 @@ function renderPerformance(){
   <div class="panel">
     <h2>Performance</h2>
     <p class="desc">Built from actual task dates in this system — useful as one input for incentive, salary, or increment reviews, not the whole story. A delay isn't always the person's fault (late buyer approval, mill delay, etc.) — check the Remarks on their tasks before using this for pay decisions.</p>
+    <details style="margin-top:6px;">
+      <summary style="cursor:pointer;font-size:13px;font-weight:600;color:var(--ink-soft);">How is the score calculated?</summary>
+      <p class="hint" style="margin-top:8px;">Score = (on-time % × 0.6) + (completion % × 0.4) − (3 points per task currently overdue), floored at 0. Only Done/Approved tasks count toward completion — Rejected and N/A are excluded so they don't distort the number. If nothing is completed yet, on-time % defaults to 100 so a brand-new assignment doesn't start out penalized.</p>
+    </details>
   </div>
 
   <div class="panel">
@@ -2791,6 +3028,12 @@ function renderPerformance(){
       <div class="field"><label>Department</label><select id="perfDeptFilter">${deptOptions}</select></div>
     </div>
   </div>
+
+  ${memberStats.length>0 ? `<div class="panel">
+    <h2>Score overview</h2>
+    <p class="desc">Team members ranked by score — 🟢 80+ on target · 🟡 50–79 needs attention · 🔴 below 50. Exact figures are in the table below.</p>
+    <div style="position:relative;height:${Math.min(520, Math.max(140, memberStats.length*34))}px;"><canvas id="perfScoreChart"></canvas></div>
+  </div>` : ''}
 
   ${gapCardsHtml}
 
@@ -2850,6 +3093,38 @@ function renderPerformance(){
   </div>`;
 }
 
+// Draws the Performance leaderboard chart into the canvas renderPerformance() just put
+// in the DOM — same async-load-then-recheck-the-canvas pattern as initDashboardCharts(),
+// and reuses filteredMemberStats() so the chart can never show a different ranking than
+// the table underneath it.
+async function initPerformanceCharts(){
+  if(!document.getElementById('perfScoreChart')) return;
+  const ok = await loadChartJsLib();
+  if(!ok || !window.Chart) return;
+  const canvas = document.getElementById('perfScoreChart');
+  destroyChart('perfScoreChart');
+  if(!canvas) return;
+
+  const memberStats = filteredMemberStats();
+  if(memberStats.length===0) return;
+  const tierColor = { done: '#3E7A4E', progress: '#B8862E', overdue: '#C1443C' };
+  chartInstances.perfScoreChart = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels: memberStats.map(m=>m.user.name),
+      datasets: [{ data: memberStats.map(m=>m.score), backgroundColor: memberStats.map(m=>tierColor[performanceTier(m.score).cls]), borderRadius: 4, maxBarThickness: 22 }]
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ` Score: ${ctx.parsed.x}` } } },
+      scales: {
+        x: { min: 0, max: 100, ticks: { stepSize: 20, font: chartBaseFont(), color: '#6B7385' }, grid: { color: '#EFEBE0' } },
+        y: { ticks: { font: chartBaseFont(), color: '#2B3A55' }, grid: { display: false } }
+      }
+    }
+  });
+}
 
 function buildDigestText(u, tasks){
   const overdue = tasks.filter(x=>taskStatusComputed(x.task)==='Overdue');
@@ -3115,9 +3390,23 @@ function attachTabEvents(){
       }
       if(actualInp) task.actualDate = actualInp.value || null;
       if(receivedInp) task.receivedQty = receivedInp.value===''?null:parseFloat(receivedInp.value);
-      if(remarksInp) task.remarks = remarksInp.value;
+      if(remarksInp){
+        const newRemarks = remarksInp.value;
+        // Log the change as a history entry (not every keystroke — only what actually
+        // gets saved) so a buyer-comment / revision cycle stays visible after it's
+        // overwritten, instead of only ever showing the latest note.
+        if(newRemarks.trim() && newRemarks !== task.remarks){
+          if(!Array.isArray(task.history)) task.history = [];
+          const activeUser = getActiveUser();
+          task.history.push({ date: today(), text: newRemarks.trim(), author: activeUser ? activeUser.name : 'Unknown' });
+        }
+        task.remarks = newRemarks;
+      }
       if(RESOLVED_STATUSES.includes(task.status) && task.status!=='N/A' && !task.actualDate) task.actualDate = today();
-      renderTabContent(); showToast('Saved'); saveData();
+      const pushedTasks = cascadeTaskDelay(order, task);
+      renderTabContent();
+      showToast(pushedTasks.length ? `Saved — pushed ${pushedTasks.length} dependent task date${pushedTasks.length!==1?'s':''}` : 'Saved');
+      saveData();
     });
   });
 
@@ -3125,6 +3414,7 @@ function attachTabEvents(){
   if(createBtn) createBtn.addEventListener('click', async () => {
     const buyerId = document.getElementById('newOrderBuyer').value;
     const styleNo = document.getElementById('newOrderStyle').value.trim();
+    const poNumber = document.getElementById('newOrderPo').value.trim();
     const season = document.getElementById('newOrderSeason').value.trim();
     const item = document.getElementById('newOrderItem').value.trim();
     const qty = document.getElementById('newOrderQty').value.trim();
@@ -3135,19 +3425,26 @@ function attachTabEvents(){
     const set = DATA.templateSets.find(s=>s.id===templateSetId);
     if(!set){ showToast('Select a T&A template'); return; }
 
+    // Template tasks reference each other by their OWN id (t.dependsOn); the order's
+    // generated tasks get entirely new ids, so build that mapping first and translate
+    // dependsOn through it — otherwise every order's dependency links would point at
+    // template task ids that don't exist anywhere in the order.
+    const taskIdMap = {};
+    set.tasks.forEach(t => { taskIdMap[t.id] = uid('task'); });
     const tasks = set.tasks.map(t => {
       const systemDate = addDays(pcd, -t.offset);
       return {
-        id: uid('task'), templateId: t.id, name: t.name, dept: t.dept,
+        id: taskIdMap[t.id], templateId: t.id, name: t.name, dept: t.dept,
         plannedDate: systemDate, expectedDate: systemDate, expectedDateManuallySet: false,
         offsetDays: t.offset, status: 'Pending',
         assignedTo: pickDefaultAssignee(buyerId, t.dept, t.name),
-        actualDate: null, remarks: '',
+        actualDate: null, remarks: '', history: [],
         materialType: null, requiredQty: null, receivedQty: null,
+        dependsOn: t.dependsOn ? taskIdMap[t.dependsOn] : null,
       };
     });
 
-    const order = {id: uid('ord'), buyerId, styleNo, season, item, qty, pcd, templateSetName: set.name, tasks};
+    const order = {id: uid('ord'), buyerId, styleNo, poNumber, season, item, qty, pcd, templateSetName: set.name, tasks};
     DATA.orders.push(order);
     currentOrderExpanded[order.id] = true;
     renderTabContent(); showToast('TNA generated for ' + styleNo); saveData();
@@ -3543,6 +3840,8 @@ function attachTabEvents(){
       tpl.name = nameVal;
       tpl.dept = row.querySelector('.tpl-dept-select').value;
       tpl.offset = offsetVal;
+      const dependsOnSel = row.querySelector('.tpl-dependson-select');
+      tpl.dependsOn = (dependsOnSel && dependsOnSel.value) ? dependsOnSel.value : null;
       renderTabContent(); showToast('Task saved'); saveData();
     });
   });
@@ -3558,7 +3857,14 @@ function attachTabEvents(){
     let tasks = [];
     if(cloneFromId){
       const src = DATA.templateSets.find(s=>s.id===cloneFromId);
-      if(src) tasks = src.tasks.map(t => ({id: uid('tpl'), name:t.name, dept:t.dept, offset:t.offset}));
+      if(src){
+        // Cloned tasks get fresh ids, so any "depends on" link has to be remapped from
+        // the source task's id to its clone's id — copying it verbatim would point at a
+        // task in a different template set (or nothing at all).
+        const idMap = {};
+        src.tasks.forEach(t => { idMap[t.id] = uid('tpl'); });
+        tasks = src.tasks.map(t => ({id: idMap[t.id], name:t.name, dept:t.dept, offset:t.offset, dependsOn: t.dependsOn ? idMap[t.dependsOn] : null}));
+      }
     }
     const newSet = {id: uid('tplset'), name, tasks};
     DATA.templateSets.push(newSet);
@@ -3650,7 +3956,7 @@ function attachTabEvents(){
     btn.addEventListener('click', async () => {
       const target = btn.dataset.importTplPaste;
       const validRows = templatePastePreview.rows.filter(r=>!r.error);
-      const newTasks = validRows.map(r => ({id: uid('tpl'), name:r.name, dept:r.dept, offset:r.offset}));
+      const newTasks = validRows.map(r => ({id: uid('tpl'), name:r.name, dept:r.dept, offset:r.offset, dependsOn: null}));
       if(target === 'new'){
         const newSet = {id: uid('tplset'), name: templatePastePreview.name, tasks: newTasks};
         DATA.templateSets.push(newSet);
@@ -3672,23 +3978,54 @@ function attachTabEvents(){
       const name = document.getElementById('newTplName_'+setId).value.trim();
       const dept = document.getElementById('newTplDept_'+setId).value;
       const offset = parseInt(document.getElementById('newTplOffset_'+setId).value, 10);
+      const dependsOnEl = document.getElementById('newTplDependsOn_'+setId);
+      const dependsOn = (dependsOnEl && dependsOnEl.value) ? dependsOnEl.value : null;
       if(!name || isNaN(offset)){ showToast('Enter a task name and offset'); return; }
-      set.tasks.push({id: uid('tpl'), name, dept, offset});
+      set.tasks.push({id: uid('tpl'), name, dept, offset, dependsOn});
       renderTabContent(); saveData();
     });
   });
   document.querySelectorAll('[data-delete-template]').forEach(btn => {
     btn.addEventListener('click', async () => {
       const set = DATA.templateSets.find(s=>s.id===btn.dataset.set);
-      set.tasks = set.tasks.filter(t=>t.id!==btn.dataset.deleteTemplate);
+      const removedId = btn.dataset.deleteTemplate;
+      set.tasks = set.tasks.filter(t=>t.id!==removedId);
+      // Anything that depended on the task just removed would otherwise point at a
+      // task id that no longer exists in this set.
+      set.tasks.forEach(t => { if(t.dependsOn===removedId) t.dependsOn = null; });
       renderTabContent(); saveData();
     });
+  });
+}
+
+// Shown instead of the app when loadData() couldn't confirm what's actually saved
+// (see DATA_LOAD_FAILED). Deliberately not the normal app shell — nothing here is
+// editable, so there's no way to accidentally trigger a save that would overwrite
+// real data with the placeholder defaults loadData() fell back to.
+function renderLoadError(){
+  const app = document.getElementById('app');
+  app.innerHTML = `
+    <div class="panel" style="border-color:var(--thread-red-dim);max-width:560px;margin:60px auto;">
+      <h2 style="color:var(--thread-red);">Couldn't load your data</h2>
+      <p class="desc">TNA couldn't confirm what's actually saved — the shared backend didn't respond, or the saved data looked corrupted. Nothing has been changed or saved. Check your connection and retry rather than continuing, since continuing here would risk overwriting real data with a blank slate.</p>
+      <div class="row-actions" style="margin-top:14px;">
+        <button class="btn" id="retryLoadBtn">Retry</button>
+      </div>
+    </div>`;
+  const retryBtn = app.querySelector('#retryLoadBtn');
+  if(retryBtn) retryBtn.addEventListener('click', async () => {
+    app.innerHTML = `<div class="loading" id="loadingMsg">Retrying…</div>`;
+    await loadData();
+    if(DATA_LOAD_FAILED){ renderLoadError(); return; }
+    if(getActiveUser()) applyPendingDeepLink();
+    render();
   });
 }
 
 /* ---------------- Init ---------------- */
 (async function init(){
   await loadData();
+  if(DATA_LOAD_FAILED){ renderLoadError(); return; }
   if(getActiveUser()) applyPendingDeepLink();
   render();
 })();
