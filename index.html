@@ -1291,6 +1291,16 @@ function attachGateEvents(){
   const doLogin = async () => {
     const uname = document.getElementById('loginUsername').value.trim().toLowerCase();
     const pass = document.getElementById('loginPassword').value;
+    if(!uname || !pass){ loginError = 'Username or password is incorrect.'; render(); return; }
+    // Re-fetch the latest data before checking credentials. This browser tab
+    // may have been sitting open (or cached) since before an admin removed
+    // this account — without this refresh, the login check would run against
+    // the stale in-memory copy from whenever the page first loaded, letting a
+    // removed username/password still work on that device.
+    btn.disabled = true; btn.textContent = 'Checking…';
+    try{ await loadData(); }
+    catch(e){ /* if the refresh itself fails, fall back to whatever's already in memory rather than blocking login entirely */ }
+    btn.disabled = false; btn.textContent = 'Sign in';
     const match = DATA.users.find(u => u.username && u.username.toLowerCase()===uname && u.password===pass);
     if(!match){ loginError = 'Username or password is incorrect.'; render(); return; }
     loginError = '';
