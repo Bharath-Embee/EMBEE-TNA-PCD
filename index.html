@@ -872,9 +872,12 @@ async function backendSet(key, value){
 }
 
 async function storageGet(key){
+  // Once we're in backend mode, a failed GET must surface as a failure — falling
+  // through to local storage here would silently read an unrelated (usually empty)
+  // copy, which loadData() would then mistake for "no data yet" and overwrite the
+  // real shared data with a blank slate. Let the caller decide how to handle it.
   if(USING_BACKEND_API){
-    try{ return await backendGet(key); }
-    catch(e){ console.error('Backend get failed, falling back:', e); }
+    return await backendGet(key);
   }
   if(HAS_CLAUDE_STORAGE){
     const res = await window.storage.get(key, true);
@@ -883,9 +886,12 @@ async function storageGet(key){
   try{ return localStorage.getItem('claude_fallback__' + key); }catch(e){ return null; }
 }
 async function storageSet(key, value){
+  // Same reasoning as storageGet: in backend mode a failed save must be reported
+  // to the caller (saveData() shows a toast), not silently redirected to a local
+  // copy the rest of the team will never see.
   if(USING_BACKEND_API){
-    try{ await backendSet(key, value); return; }
-    catch(e){ console.error('Backend set failed, falling back:', e); }
+    await backendSet(key, value);
+    return;
   }
   if(HAS_CLAUDE_STORAGE){
     await window.storage.set(key, value, true);
@@ -908,13 +914,37 @@ async function personalStorageSet(key, value){
   localStorage.setItem('claude_fallback_personal__' + key, value);
 }
 
+// Set when loadData() could not confirm what's actually saved (network/server error,
+// or corrupted JSON) — as opposed to a confirmed-empty first run. init() checks this
+// and shows a retry screen instead of the app, specifically so nobody edits a blank
+// slate that then gets saved over real shared data.
+let DATA_LOAD_FAILED = false;
+
 async function loadData(){
   await detectBackendApi();
+  DATA_LOAD_FAILED = false;
+  let value;
   try{
-    const value = await storageGet(STORAGE_KEY);
-    if(value){ DATA = JSON.parse(value); }
-    else { DATA = defaultData(); await saveData(); }
+    value = await storageGet(STORAGE_KEY);
   }catch(e){
+    console.error('TNA data load failed:', e);
+    DATA_LOAD_FAILED = true;
+    DATA = defaultData(); // just enough to avoid null-checks elsewhere — never saved
+    return;
+  }
+  if(value){
+    try{ DATA = JSON.parse(value); }
+    catch(e){
+      // Data came back but isn't valid JSON — corrupted, not absent. Don't paper
+      // over it by saving fresh defaults on top of whatever is actually stored.
+      console.error('TNA data parse failed:', e);
+      DATA_LOAD_FAILED = true;
+      DATA = defaultData();
+      return;
+    }
+  } else {
+    // Backend/storage responded successfully and confirmed there's genuinely
+    // nothing saved yet — safe to initialize.
     DATA = defaultData();
     await saveData();
   }
@@ -2777,6 +2807,10 @@ function renderPerformance(){
   <div class="panel">
     <h2>Performance</h2>
     <p class="desc">Built from actual task dates in this system — useful as one input for incentive, salary, or increment reviews, not the whole story. A delay isn't always the person's fault (late buyer approval, mill delay, etc.) — check the Remarks on their tasks before using this for pay decisions.</p>
+    <details style="margin-top:6px;">
+      <summary style="cursor:pointer;font-size:13px;font-weight:600;color:var(--ink-soft);">How is the score calculated?</summary>
+      <p class="hint" style="margin-top:8px;">Score = (on-time % × 0.6) + (completion % × 0.4) − (3 points per task currently overdue), floored at 0. Only Done/Approved tasks count toward completion — Rejected and N/A are excluded so they don't distort the number. If nothing is completed yet, on-time % defaults to 100 so a brand-new assignment doesn't start out penalized.</p>
+    </details>
   </div>
 
   <div class="panel">
@@ -3686,9 +3720,34 @@ function attachTabEvents(){
   });
 }
 
+// Shown instead of the app when loadData() couldn't confirm what's actually saved
+// (see DATA_LOAD_FAILED). Deliberately not the normal app shell — nothing here is
+// editable, so there's no way to accidentally trigger a save that would overwrite
+// real data with the placeholder defaults loadData() fell back to.
+function renderLoadError(){
+  const app = document.getElementById('app');
+  app.innerHTML = `
+    <div class="panel" style="border-color:var(--thread-red-dim);max-width:560px;margin:60px auto;">
+      <h2 style="color:var(--thread-red);">Couldn't load your data</h2>
+      <p class="desc">TNA couldn't confirm what's actually saved — the shared backend didn't respond, or the saved data looked corrupted. Nothing has been changed or saved. Check your connection and retry rather than continuing, since continuing here would risk overwriting real data with a blank slate.</p>
+      <div class="row-actions" style="margin-top:14px;">
+        <button class="btn" id="retryLoadBtn">Retry</button>
+      </div>
+    </div>`;
+  const retryBtn = app.querySelector('#retryLoadBtn');
+  if(retryBtn) retryBtn.addEventListener('click', async () => {
+    app.innerHTML = `<div class="loading" id="loadingMsg">Retrying…</div>`;
+    await loadData();
+    if(DATA_LOAD_FAILED){ renderLoadError(); return; }
+    if(getActiveUser()) applyPendingDeepLink();
+    render();
+  });
+}
+
 /* ---------------- Init ---------------- */
 (async function init(){
   await loadData();
+  if(DATA_LOAD_FAILED){ renderLoadError(); return; }
   if(getActiveUser()) applyPendingDeepLink();
   render();
 })();
