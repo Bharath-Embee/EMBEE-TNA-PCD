@@ -82,20 +82,41 @@ const REMINDER_SUBJECT = { due: 'due today', '1day': 'due in 1 day', '3day': 'du
 function labelFor(t) { return REMINDER_LABEL[t.startsWith('overdue') ? 'overdue' : t]; }
 function subjectFor(t) { return REMINDER_SUBJECT[t.startsWith('overdue') ? 'overdue' : t]; }
 
-function buildEmail(user, task, order, reminderType) {
-  const due = opDate(task);
+// Builds ONE email per person listing every task they currently have due —
+// replaces the old one-email-per-task approach, which could mean several
+// separate emails landing in someone's inbox on the same day for the same
+// person. Overdue items are listed first (most urgent), then by due date.
+function buildDigestEmail(user, items) {
   const appUrl = process.env.APP_URL || 'https://embee-tna-pcd.vercel.app';
-  const link = `${appUrl}/#order=${encodeURIComponent(order.id)}`;
   const firstName = (user.name || '').split(' ')[0] || 'there';
-  const subject = `TNA Task Reminder — ${task.name} ${subjectFor(reminderType)}`;
-  const html = `<div style="font-family:sans-serif;max-width:480px;color:#17233A;">
+  const sorted = [...items].sort((a, b) => {
+    const aOverdue = a.reminderType.startsWith('overdue');
+    const bOverdue = b.reminderType.startsWith('overdue');
+    if (aOverdue !== bOverdue) return aOverdue ? -1 : 1;
+    return (opDate(a.task) || '').localeCompare(opDate(b.task) || '');
+  });
+  const subject = `TNA Task Reminder — ${items.length} task${items.length > 1 ? 's' : ''} need your attention`;
+  const rows = sorted.map(({ task, order, reminderType }) => {
+    const link = `${appUrl}/#order=${encodeURIComponent(order.id)}`;
+    return `<tr>
+      <td style="padding:8px 6px;border-bottom:1px solid #eee;">
+        <a href="${link}" style="color:#17233A;text-decoration:none;font-weight:600;">${task.name}</a><br>
+        <span style="font-size:12px;color:#666;">${order.styleNo || ''} — ${order.item || ''}</span>
+      </td>
+      <td style="padding:8px 6px;border-bottom:1px solid #eee;font-size:13px;white-space:nowrap;">${fmtDate(opDate(task))}</td>
+      <td style="padding:8px 6px;border-bottom:1px solid #eee;font-size:13px;white-space:nowrap;">${labelFor(reminderType)}</td>
+    </tr>`;
+  }).join('');
+  const html = `<div style="font-family:sans-serif;max-width:560px;color:#17233A;">
     <h2 style="margin-bottom:4px;">TNA Task Reminder</h2>
     <p>Dear ${firstName},</p>
-    <p><strong>Task:</strong> ${task.name}</p>
-    <p><strong>Style:</strong> ${order.styleNo || ''} — ${order.item || ''}</p>
-    <p><strong>Due Date:</strong> ${fmtDate(due)}</p>
-    <p><strong>Reminder:</strong> ${labelFor(reminderType)}</p>
-    <p><a href="${link}" style="display:inline-block;background:#17233A;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none;">Open Task</a></p>
+    <p>You have ${items.length} task${items.length > 1 ? 's' : ''} needing attention:</p>
+    <table style="width:100%;border-collapse:collapse;">
+      <thead><tr style="text-align:left;font-size:12px;color:#888;">
+        <th style="padding:6px;">Task</th><th style="padding:6px;">Due date</th><th style="padding:6px;">Reminder</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
   </div>`;
   return { subject, html };
 }
@@ -120,18 +141,18 @@ function getGmailTransport() {
   }
   return gmailTransport;
 }
-async function sendEmail(user, to, cc, task, order, reminderType) {
+async function sendDigestEmail(user, items, managerEmails) {
   if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
     throw new Error('GMAIL_USER / GMAIL_APP_PASSWORD not set');
   }
-  const { subject, html } = buildEmail(user, task, order, reminderType);
+  const { subject, html } = buildDigestEmail(user, items);
   const mail = {
     from: `"TNA Reminders" <${process.env.GMAIL_USER}>`,
-    to,
+    to: user.email,
     subject,
     html,
   };
-  if (cc && cc.length) mail.cc = cc;
+  if (managerEmails && managerEmails.length) mail.cc = managerEmails;
   await getGmailTransport().sendMail(mail);
 }
 
@@ -176,7 +197,14 @@ export default async function handler(req, res) {
     const DATA = JSON.parse(row[0].value);
     const today = new Date().toISOString().slice(0, 10);
     const results = { checked: 0, push: { sent: 0, skipped: 0, noToken: 0, failed: 0 }, email: { sent: 0, skipped: 0, noEmail: 0, failed: 0 } };
-    const CHANNELS = ['push', 'email'];
+
+    // Email is batched — every qualifying task is CLAIMED here (same idempotency
+    // guarantee as before, per task/reminderType), but not sent individually.
+    // Claimed items are grouped by person into emailBatches, then AFTER this loop
+    // each person gets exactly one combined email listing everything they have due.
+    // Push notifications are unaffected — those still go out per task immediately,
+    // since a phone notification isn't inbox clutter the way repeated emails are.
+    const emailBatches = {}; // userId -> { user, items: [{task, order, reminderType}] }
 
     for (const order of (DATA.orders || [])) {
       for (const task of (order.tasks || [])) {
@@ -187,27 +215,17 @@ export default async function handler(req, res) {
         const user = (DATA.users || []).find(u => u.id === task.assignedTo);
         if (!user) continue; // assigned user was deleted — nothing to notify
 
-        for (const channel of CHANNELS) {
-          // Claim this (task, reminderType, channel) slot. If another run already
-          // claimed it, this insert fails and we skip — that's the idempotency
-          // guarantee, and it's per-channel, so push and email never block each other.
-          try {
-            await sql`INSERT INTO notification_log (task_id, user_id, reminder_type, channel, status)
-                       VALUES (${task.id}, ${user.id}, ${reminderType}, ${channel}, 'pending')`;
-          } catch (e) {
-            results[channel].skipped++;
-            continue;
-          }
+        // --- push: unchanged, one notification per task, sent immediately ---
+        try {
+          await sql`INSERT INTO notification_log (task_id, user_id, reminder_type, channel, status)
+                     VALUES (${task.id}, ${user.id}, ${reminderType}, 'push', 'pending')`;
 
-          if (channel === 'push') {
-            const tokenRows = await sql`SELECT token FROM notification_tokens WHERE user_id = ${user.id} AND active = true`;
-            if (tokenRows.length === 0) {
-              results.push.noToken++;
-              await sql`UPDATE notification_log SET status = 'no_token'
-                         WHERE task_id = ${task.id} AND user_id = ${user.id} AND reminder_type = ${reminderType} AND channel = 'push'`;
-              continue;
-            }
-
+          const tokenRows = await sql`SELECT token FROM notification_tokens WHERE user_id = ${user.id} AND active = true`;
+          if (tokenRows.length === 0) {
+            results.push.noToken++;
+            await sql`UPDATE notification_log SET status = 'no_token'
+                       WHERE task_id = ${task.id} AND user_id = ${user.id} AND reminder_type = ${reminderType} AND channel = 'push'`;
+          } else {
             let anySent = false;
             let lastError = null;
             for (const { token } of tokenRows) {
@@ -225,9 +243,6 @@ export default async function handler(req, res) {
                 await sql`UPDATE notification_tokens SET last_used_at = now() WHERE token = ${token}`;
               } catch (err) {
                 lastError = err.message || String(err);
-                // A token that's no longer valid gets deactivated so future runs
-                // stop trying it — this never stops the loop from continuing on
-                // to other tokens/users/tasks.
                 if (err.code === 'messaging/registration-token-not-registered' ||
                     err.code === 'messaging/invalid-registration-token') {
                   await sql`UPDATE notification_tokens SET active = false WHERE token = ${token}`;
@@ -237,38 +252,63 @@ export default async function handler(req, res) {
             await sql`UPDATE notification_log SET status = ${anySent ? 'sent' : 'failed'}, error = ${lastError}
                        WHERE task_id = ${task.id} AND user_id = ${user.id} AND reminder_type = ${reminderType} AND channel = 'push'`;
             if (anySent) results.push.sent++; else results.push.failed++;
-
-          } else if (channel === 'email') {
-            if (!user.email) {
-              results.email.noEmail++;
-              await sql`UPDATE notification_log SET status = 'no_email'
-                         WHERE task_id = ${task.id} AND user_id = ${user.id} AND reminder_type = ${reminderType} AND channel = 'email'`;
-              continue;
-            }
-            try {
-              // CC every manager assigned to this user's buyer — mirrors
-              // managersForBuyer() in index.html, kept in sync deliberately.
-              const managerEmails = (DATA.users || [])
-                .filter(m => m.role === 'manager' && (m.managedBuyerIds || []).includes(user.buyerId) && m.email)
-                .map(m => m.email);
-              await sendEmail(user, user.email, managerEmails, task, order, reminderType);
-              await sql`UPDATE notification_log SET status = 'sent'
-                         WHERE task_id = ${task.id} AND user_id = ${user.id} AND reminder_type = ${reminderType} AND channel = 'email'`;
-              results.email.sent++;
-            } catch (err) {
-              // An email failure (bad address, Resend outage, unverified-domain
-              // restriction, etc.) is recorded and skipped over — it never stops
-              // push notifications or any other task/user from being processed.
-              await sql`UPDATE notification_log SET status = 'failed', error = ${err.message || String(err)}
-                         WHERE task_id = ${task.id} AND user_id = ${user.id} AND reminder_type = ${reminderType} AND channel = 'email'`;
-              results.email.failed++;
-            }
           }
+        } catch (e) {
+          results.push.skipped++; // already claimed by an earlier run
         }
+
+        // --- email: claim the slot, but queue it into a per-person batch
+        //     instead of sending right away ---
+        try {
+          await sql`INSERT INTO notification_log (task_id, user_id, reminder_type, channel, status)
+                     VALUES (${task.id}, ${user.id}, ${reminderType}, 'email', 'pending')`;
+        } catch (e) {
+          results.email.skipped++;
+          continue;
+        }
+        if (!user.email) {
+          results.email.noEmail++;
+          await sql`UPDATE notification_log SET status = 'no_email'
+                     WHERE task_id = ${task.id} AND user_id = ${user.id} AND reminder_type = ${reminderType} AND channel = 'email'`;
+          continue;
+        }
+        if (!emailBatches[user.id]) emailBatches[user.id] = { user, items: [] };
+        emailBatches[user.id].items.push({ task, order, reminderType });
       }
     }
 
-    return res.status(200).json({ ok: true, date: today, results });
+    // One email per person, covering every task claimed above for them.
+    for (const userId of Object.keys(emailBatches)) {
+      const { user, items } = emailBatches[userId];
+      // CC every manager for every buyer represented in this person's batch — a
+      // merchandiser handling multiple buyers gets each relevant buyer's manager
+      // copied, not just one. Mirrors managersForBuyer() in index.html.
+      const buyerIds = [...new Set(items.map(i => i.order.buyerId))];
+      const managerEmails = [...new Set(
+        (DATA.users || [])
+          .filter(m => m.role === 'manager' && buyerIds.some(bid => (m.managedBuyerIds || []).includes(bid)) && m.email)
+          .map(m => m.email)
+      )];
+      try {
+        await sendDigestEmail(user, items, managerEmails);
+        for (const { task, reminderType } of items) {
+          await sql`UPDATE notification_log SET status = 'sent'
+                     WHERE task_id = ${task.id} AND user_id = ${user.id} AND reminder_type = ${reminderType} AND channel = 'email'`;
+        }
+        results.email.sent += items.length;
+      } catch (err) {
+        // One failed email doesn't lose the claim silently — every task in the
+        // batch is marked failed so it's visible, and nothing here stops the
+        // next person's batch from still being attempted.
+        for (const { task, reminderType } of items) {
+          await sql`UPDATE notification_log SET status = 'failed', error = ${err.message || String(err)}
+                     WHERE task_id = ${task.id} AND user_id = ${user.id} AND reminder_type = ${reminderType} AND channel = 'email'`;
+        }
+        results.email.failed += items.length;
+      }
+    }
+
+    return res.status(200).json({ ok: true, date: today, results, emailsSent: Object.keys(emailBatches).length });
   } catch (err) {
     console.error('send-reminders error:', err);
     return res.status(500).json({ error: 'Reminder job failed', detail: err.message });
