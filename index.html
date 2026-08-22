@@ -1196,7 +1196,7 @@ function showRenderError(container, err){
         <button class="btn ghost" id="reloadPageBtn">Reload</button>
         <button class="btn danger" id="resetLocalDataBtn">Reset saved data &amp; start fresh</button>
       </div>
-      <div class="hint" style="margin-top:10px;">Resetting clears whatever is saved for this system (in this browser, if in Local-only mode) and starts over from a fresh Admin login (admin / admin123). Only do this if reloading doesn't fix it.</div>
+      <div class="hint" style="margin-top:10px;">Resetting clears whatever is saved for this system (in this browser, if in Local-only mode) and starts over from a fresh Admin login. Only do this if reloading doesn't fix it.</div>
     </div>`;
   const reloadBtn = container.querySelector('#reloadPageBtn');
   if(reloadBtn) reloadBtn.addEventListener('click', () => location.reload());
