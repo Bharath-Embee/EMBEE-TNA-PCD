@@ -2227,10 +2227,18 @@ function renderTeam(){
       <div class="lock-note">No tasks exist yet to restrict — you don't have any T&amp;A templates set up. Go to <strong>Task Templates</strong> and create one (or add tasks to it) first, then come back here.</div>
       ` : `
       <div class="checkbox-list" style="max-height:200px;">
-        ${allTaskNamesGrouped().map(([dept, names]) => `
-          <div style="font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:0.3px;margin:8px 0 2px;">${dept}</div>
-          ${names.map(n => `<div class="checkbox-row"><input type="checkbox" class="memberTaskCheck" value="${n.replace(/"/g,'&quot;')}" id="mt_${n.replace(/[^a-z0-9]/gi,'_')}"><label for="mt_${n.replace(/[^a-z0-9]/gi,'_')}" style="margin:0;font-weight:400;">${n}</label></div>`).join('')}
-        `).join('')}
+        ${allTaskNamesGrouped().map(([dept, names]) => {
+          const deptId = 'mtdeptall_'+dept.replace(/[^a-z0-9]/gi,'_');
+          return `
+          <div style="display:flex;align-items:center;justify-content:space-between;margin:8px 0 2px;">
+            <div style="font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:0.3px;">${dept}</div>
+            <div class="checkbox-row" style="margin:0;">
+              <input type="checkbox" class="memberTaskDeptAllCheck" data-dept="${dept.replace(/"/g,'&quot;')}" id="${deptId}">
+              <label for="${deptId}" style="margin:0;font-weight:400;font-size:11px;">Select all</label>
+            </div>
+          </div>
+          ${names.map(n => `<div class="checkbox-row"><input type="checkbox" class="memberTaskCheck" data-dept="${dept.replace(/"/g,'&quot;')}" value="${n.replace(/"/g,'&quot;')}" id="mt_${n.replace(/[^a-z0-9]/gi,'_')}"><label for="mt_${n.replace(/[^a-z0-9]/gi,'_')}" style="margin:0;font-weight:400;">${n}</label></div>`).join('')}
+        `;}).join('')}
       </div>
       <div class="hint">Leave everything unchecked to let this person be assigned any task in their department (the normal default). Check specific tasks to limit them to only those — e.g. a Purchase person who should only ever handle "Fabric Bulk Booking", not testing. Only Admin can set this, for any department or buyer — Managers can add members but can't restrict their tasks.</div>
       `}
@@ -3235,6 +3243,14 @@ function attachTabEvents(){
       const dept = cb.dataset.dept;
       const row = cb.closest('tr');
       row.querySelectorAll(`.editTaskCheck[data-dept="${CSS.escape(dept)}"]`).forEach(t => { t.checked = cb.checked; });
+    });
+  });
+  document.querySelectorAll('.memberTaskDeptAllCheck').forEach(cb => {
+    cb.addEventListener('change', () => {
+      const dept = cb.dataset.dept;
+      const container = document.getElementById('memberTaskPermissions');
+      if(!container) return;
+      container.querySelectorAll(`.memberTaskCheck[data-dept="${CSS.escape(dept)}"]`).forEach(t => { t.checked = cb.checked; });
     });
   });
   document.querySelectorAll('[data-edit-password]').forEach(btn => {
