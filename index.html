@@ -685,6 +685,9 @@ function migrateData(d){
   }
   // Defensively backfill every field added across versions, so data saved by an
   // older version of the system doesn't crash a newer screen that expects it to exist.
+  d.templateSets.forEach(set => {
+    (set.tasks||[]).forEach(t => { if(t.dependsOn === undefined) t.dependsOn = null; });
+  });
   d.users.forEach(u => {
     if(u.managedBuyerIds === undefined) u.managedBuyerIds = [];
     if(u.allowedTaskNames === undefined) u.allowedTaskNames = [];
@@ -720,6 +723,7 @@ function migrateData(d){
       if(t.status === undefined) t.status = 'Pending';
       if(t.remarks === undefined) t.remarks = '';
       if(!Array.isArray(t.history)) t.history = [];
+      if(t.dependsOn === undefined) t.dependsOn = null;
       if(t.actualDate === undefined) t.actualDate = null;
       if(t.assignedTo === undefined) t.assignedTo = null;
       if(t.materialType === undefined) t.materialType = null;
@@ -1182,6 +1186,36 @@ function taskDelayDays(task){
   if(task.actualDate) return daysBetween(ref, task.actualDate);
   if(isOpenTask(task) && ref < today()) return daysBetween(ref, today());
   return 0;
+}
+
+// Pushes the Expected Date of anything that depends on `changedTask` forward to match
+// its own finish reference (Actual Date once it's done, otherwise Expected Date) — a
+// slip in an upstream task (e.g. fabric approval running late) is reflected in what
+// comes after it instead of the downstream date silently staying stale. Only ever
+// pushes dates LATER, never pulls them earlier — finishing something early doesn't
+// yank other people's plans forward without them choosing to. This is a floor, not a
+// duration-aware schedule: it doesn't know how many days the dependent task itself
+// needs, only that it can't be due before its predecessor is.
+function cascadeTaskDelay(order, changedTask){
+  const pushed = [];
+  const visited = new Set();
+  function propagate(fromTask){
+    if(visited.has(fromTask.id)) return; // cycle guard, belt-and-braces alongside the UI's own cycle prevention
+    visited.add(fromTask.id);
+    const finishRef = fromTask.actualDate || fromTask.expectedDate;
+    if(!finishRef) return;
+    order.tasks.filter(t => t.dependsOn===fromTask.id).forEach(dep => {
+      const depRef = dep.expectedDate || dep.plannedDate;
+      if(depRef && finishRef > depRef){
+        dep.expectedDate = finishRef;
+        dep.expectedDateManuallySet = true;
+        pushed.push(dep);
+        propagate(dep);
+      }
+    });
+  }
+  propagate(changedTask);
+  return pushed;
 }
 
 function taskStatusComputed(task){
@@ -1979,8 +2013,9 @@ function renderOrderTasks(order){
     `;
     const delay = taskDelayDays(t);
     const slip = estimateSlippageDays(t);
+    const dependsOnTask = t.dependsOn ? order.tasks.find(x=>x.id===t.dependsOn) : null;
     return `<tr>
-      <td>${t.name}</td>
+      <td>${t.name}${dependsOnTask ? `<div class="hint" style="margin-top:2px;">⛓ after: ${dependsOnTask.name}</div>` : ''}</td>
       <td><span class="dept-tag dept-${t.dept}">${t.dept}</span></td>
       <td>
         <select class="assignee-select" data-order="${order.id}" data-task="${t.id}">
@@ -2644,6 +2679,29 @@ function renderTemplateBulkAddSection(set, bulkPreviewForThisSet){
   return '<div class="divider"></div><h2 style="font-size:13px;">' + heading + '</h2>' + body;
 }
 
+// Tasks that (directly or transitively) already depend on taskId — offered as taskId's
+// own "Depends on" would create a cycle, so the dropdown excludes them.
+function templateDescendantIds(set, taskId){
+  const result = new Set();
+  let added = true;
+  while(added){
+    added = false;
+    set.tasks.forEach(t => {
+      if(!result.has(t.id) && (t.dependsOn===taskId || result.has(t.dependsOn))){
+        result.add(t.id); added = true;
+      }
+    });
+  }
+  return result;
+}
+function templateDependsOnOptionsHtml(set, taskId, selectedId){
+  // taskId is null for the "add new task" form — a task that doesn't exist yet can't
+  // have any existing descendants, so nothing needs excluding in that case.
+  const excluded = taskId ? templateDescendantIds(set, taskId) : new Set();
+  const options = set.tasks.filter(t => t.id!==taskId && !excluded.has(t.id));
+  return `<option value="">— None —</option>` + options.map(t=>`<option value="${t.id}" ${selectedId===t.id?'selected':''}>${t.name}</option>`).join('');
+}
+
 function renderTemplates(){
   const sets = DATA.templateSets;
   const tplPreview = templatePastePreview;
@@ -2657,16 +2715,19 @@ function renderTemplates(){
           <td><input class="tpl-name-input mono" data-set="${set.id}" data-tpl="${t.id}" value="${t.name.replace(/"/g,'&quot;')}" style="min-width:220px;"></td>
           <td><select class="tpl-dept-select" data-set="${set.id}" data-tpl="${t.id}">${DEPARTMENTS.map(d=>`<option value="${d}" ${t.dept===d?'selected':''}>${d}</option>`).join('')}</select></td>
           <td><input class="tpl-offset-input mono" data-set="${set.id}" data-tpl="${t.id}" type="number" value="${t.offset}" style="width:90px;display:inline-block;"> days before PCD</td>
+          <td><select class="tpl-dependson-select" data-set="${set.id}" data-tpl="${t.id}" style="min-width:160px;">${templateDependsOnOptionsHtml(set, t.id, t.dependsOn)}</select></td>
           <td style="text-align:right;white-space:nowrap;">
             <button class="btn small" data-save-tpl-row="${t.id}" data-set="${set.id}">Save</button>
             <button class="btn danger small" data-delete-template="${t.id}" data-set="${set.id}">Remove</button>
           </td>
         </tr>`;
       }
+      const dependsOnTask = t.dependsOn ? set.tasks.find(x=>x.id===t.dependsOn) : null;
       return `<tr>
         <td>${t.name}</td>
         <td><span class="dept-tag dept-${t.dept}">${t.dept}</span></td>
         <td class="mono">${t.offset} days before PCD</td>
+        <td>${dependsOnTask ? dependsOnTask.name : '—'}</td>
         <td></td>
       </tr>`;
     }).join('');
@@ -2687,14 +2748,16 @@ function renderTemplates(){
       ${expanded ? `
         <div class="divider"></div>
         ${isAdmin() ? `
-        <div class="grid-cols" style="grid-template-columns:2fr 1fr 1fr auto;">
+        <div class="grid-cols" style="grid-template-columns:2fr 1fr 1fr 1.5fr auto;">
           <div class="field"><label>Task name</label><input id="newTplName_${set.id}" placeholder="e.g. Buyer PP Approval"></div>
           <div class="field"><label>Department</label><select id="newTplDept_${set.id}">${DEPARTMENTS.map(d=>`<option value="${d}">${d}</option>`).join('')}</select></div>
           <div class="field"><label>Days before PCD</label><input id="newTplOffset_${set.id}" type="number" placeholder="e.g. 40"></div>
+          <div class="field"><label>Depends on</label><select id="newTplDependsOn_${set.id}">${templateDependsOnOptionsHtml(set, null, null)}</select></div>
           <div style="display:flex;align-items:flex-end;"><button class="btn" data-add-template-to-set="${set.id}">Add task</button></div>
         </div>
+        <div class="hint" style="margin-top:6px;">Setting "Depends on" means every order made from this template will automatically push that task's Expected Date if the one it depends on finishes late — e.g. PP Sample depending on Fit Approval.</div>
         <div class="divider"></div>` : ''}
-        <table><thead><tr><th>Task</th><th>Dept</th><th>Timing</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+        <table><thead><tr><th>Task</th><th>Dept</th><th>Timing</th><th>Depends on</th><th></th></tr></thead><tbody>${rows}</tbody></table>
         ${isAdmin() ? renderTemplateBulkAddSection(set, bulkPreviewForThisSet) : ''}
       ` : ''}
     </div>`;
@@ -3340,7 +3403,10 @@ function attachTabEvents(){
         task.remarks = newRemarks;
       }
       if(RESOLVED_STATUSES.includes(task.status) && task.status!=='N/A' && !task.actualDate) task.actualDate = today();
-      renderTabContent(); showToast('Saved'); saveData();
+      const pushedTasks = cascadeTaskDelay(order, task);
+      renderTabContent();
+      showToast(pushedTasks.length ? `Saved — pushed ${pushedTasks.length} dependent task date${pushedTasks.length!==1?'s':''}` : 'Saved');
+      saveData();
     });
   });
 
@@ -3359,15 +3425,22 @@ function attachTabEvents(){
     const set = DATA.templateSets.find(s=>s.id===templateSetId);
     if(!set){ showToast('Select a T&A template'); return; }
 
+    // Template tasks reference each other by their OWN id (t.dependsOn); the order's
+    // generated tasks get entirely new ids, so build that mapping first and translate
+    // dependsOn through it — otherwise every order's dependency links would point at
+    // template task ids that don't exist anywhere in the order.
+    const taskIdMap = {};
+    set.tasks.forEach(t => { taskIdMap[t.id] = uid('task'); });
     const tasks = set.tasks.map(t => {
       const systemDate = addDays(pcd, -t.offset);
       return {
-        id: uid('task'), templateId: t.id, name: t.name, dept: t.dept,
+        id: taskIdMap[t.id], templateId: t.id, name: t.name, dept: t.dept,
         plannedDate: systemDate, expectedDate: systemDate, expectedDateManuallySet: false,
         offsetDays: t.offset, status: 'Pending',
         assignedTo: pickDefaultAssignee(buyerId, t.dept, t.name),
         actualDate: null, remarks: '', history: [],
         materialType: null, requiredQty: null, receivedQty: null,
+        dependsOn: t.dependsOn ? taskIdMap[t.dependsOn] : null,
       };
     });
 
@@ -3767,6 +3840,8 @@ function attachTabEvents(){
       tpl.name = nameVal;
       tpl.dept = row.querySelector('.tpl-dept-select').value;
       tpl.offset = offsetVal;
+      const dependsOnSel = row.querySelector('.tpl-dependson-select');
+      tpl.dependsOn = (dependsOnSel && dependsOnSel.value) ? dependsOnSel.value : null;
       renderTabContent(); showToast('Task saved'); saveData();
     });
   });
@@ -3782,7 +3857,14 @@ function attachTabEvents(){
     let tasks = [];
     if(cloneFromId){
       const src = DATA.templateSets.find(s=>s.id===cloneFromId);
-      if(src) tasks = src.tasks.map(t => ({id: uid('tpl'), name:t.name, dept:t.dept, offset:t.offset}));
+      if(src){
+        // Cloned tasks get fresh ids, so any "depends on" link has to be remapped from
+        // the source task's id to its clone's id — copying it verbatim would point at a
+        // task in a different template set (or nothing at all).
+        const idMap = {};
+        src.tasks.forEach(t => { idMap[t.id] = uid('tpl'); });
+        tasks = src.tasks.map(t => ({id: idMap[t.id], name:t.name, dept:t.dept, offset:t.offset, dependsOn: t.dependsOn ? idMap[t.dependsOn] : null}));
+      }
     }
     const newSet = {id: uid('tplset'), name, tasks};
     DATA.templateSets.push(newSet);
@@ -3874,7 +3956,7 @@ function attachTabEvents(){
     btn.addEventListener('click', async () => {
       const target = btn.dataset.importTplPaste;
       const validRows = templatePastePreview.rows.filter(r=>!r.error);
-      const newTasks = validRows.map(r => ({id: uid('tpl'), name:r.name, dept:r.dept, offset:r.offset}));
+      const newTasks = validRows.map(r => ({id: uid('tpl'), name:r.name, dept:r.dept, offset:r.offset, dependsOn: null}));
       if(target === 'new'){
         const newSet = {id: uid('tplset'), name: templatePastePreview.name, tasks: newTasks};
         DATA.templateSets.push(newSet);
@@ -3896,15 +3978,21 @@ function attachTabEvents(){
       const name = document.getElementById('newTplName_'+setId).value.trim();
       const dept = document.getElementById('newTplDept_'+setId).value;
       const offset = parseInt(document.getElementById('newTplOffset_'+setId).value, 10);
+      const dependsOnEl = document.getElementById('newTplDependsOn_'+setId);
+      const dependsOn = (dependsOnEl && dependsOnEl.value) ? dependsOnEl.value : null;
       if(!name || isNaN(offset)){ showToast('Enter a task name and offset'); return; }
-      set.tasks.push({id: uid('tpl'), name, dept, offset});
+      set.tasks.push({id: uid('tpl'), name, dept, offset, dependsOn});
       renderTabContent(); saveData();
     });
   });
   document.querySelectorAll('[data-delete-template]').forEach(btn => {
     btn.addEventListener('click', async () => {
       const set = DATA.templateSets.find(s=>s.id===btn.dataset.set);
-      set.tasks = set.tasks.filter(t=>t.id!==btn.dataset.deleteTemplate);
+      const removedId = btn.dataset.deleteTemplate;
+      set.tasks = set.tasks.filter(t=>t.id!==removedId);
+      // Anything that depended on the task just removed would otherwise point at a
+      // task id that no longer exists in this set.
+      set.tasks.forEach(t => { if(t.dependsOn===removedId) t.dependsOn = null; });
       renderTabContent(); saveData();
     });
   });
