@@ -362,6 +362,34 @@ function loadXlsxLib(){
   });
   return xlsxLoadPromise;
 }
+/* ---- Charts (Chart.js) — loaded on demand, same safe pattern as the PDF/Excel libraries ---- */
+let chartJsLoadPromise = null;
+function loadChartJsLib(){
+  if(window.Chart) return Promise.resolve(true);
+  if(chartJsLoadPromise) return chartJsLoadPromise;
+  chartJsLoadPromise = new Promise((resolve) => {
+    const timeout = setTimeout(() => { resolve(false); }, 8000);
+    const script = document.createElement('script');
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js';
+    script.onload = () => { clearTimeout(timeout); resolve(!!window.Chart); };
+    script.onerror = () => { clearTimeout(timeout); resolve(false); };
+    document.head.appendChild(script);
+  });
+  return chartJsLoadPromise;
+}
+// One place to destroy+recreate every chart instance, keyed by canvas id — every
+// render rebuilds the DOM from scratch (fresh canvas nodes), so the previous
+// Chart.js instance bound to the old node must be explicitly destroyed or it just
+// leaks (and Chart.js logs a re-use warning on the id) each time a filter changes.
+const chartInstances = {};
+function destroyChart(id){
+  if(chartInstances[id]){ chartInstances[id].destroy(); delete chartInstances[id]; }
+}
+// Shared look for every chart on the site — matches the app's own type/ink tokens
+// instead of Chart.js defaults, so charts read as part of the same design, not a
+// bolted-on widget.
+function chartBaseFont(){ return { family: "'IBM Plex Sans', sans-serif", size: 12 }; }
+
 async function downloadExcelTemplate(headers, exampleRows, filename){
   const ok = await loadXlsxLib();
   if(!ok || !window.XLSX){ showToast('Could not load the Excel library — check your internet connection and try again'); return; }
@@ -1417,13 +1445,13 @@ function renderTabContent(){
       el.innerHTML = emptyState('people', "Your admin hasn't given you access to any screens yet. Ask them to update your access under Buyers & Team.");
       return;
     }
-    if(currentTab==='dashboard') el.innerHTML = renderDashboard();
+    if(currentTab==='dashboard'){ el.innerHTML = renderDashboard(); initDashboardCharts(); }
     else if(currentTab==='orders') el.innerHTML = renderOrders();
-    else if(currentTab==='performance') el.innerHTML = renderPerformance();
+    else if(currentTab==='performance'){ el.innerHTML = renderPerformance(); initPerformanceCharts(); }
     else if(currentTab==='team') el.innerHTML = renderTeam();
     else if(currentTab==='templates') el.innerHTML = renderTemplates();
     else if(currentTab==='notify') el.innerHTML = renderNotify();
-    else el.innerHTML = renderDashboard();
+    else { el.innerHTML = renderDashboard(); initDashboardCharts(); }
     attachTabEvents();
   }catch(err){
     showRenderError(el, err);
@@ -1655,6 +1683,21 @@ function renderDashboard(){
     <div class="stat"><div class="num">${onTimePct===null?'—':onTimePct+'%'}</div><div class="lbl">Completed on time</div></div>
   </div>
 
+  ${all.length>0 ? `<div class="panel">
+    <h2>Visual overview</h2>
+    <p class="desc">Order health and task pipeline for everything matching your current filter.</p>
+    <div class="grid-cols" style="grid-template-columns:1fr 1fr;align-items:start;">
+      <div>
+        <div class="hint" style="margin-bottom:8px;font-weight:600;color:var(--ink-soft);">Orders by health</div>
+        ${orders.length>0 ? `<div style="position:relative;height:230px;"><canvas id="dashRagChart"></canvas></div>` : emptyState('chart', 'No orders match this filter.')}
+      </div>
+      <div>
+        <div class="hint" style="margin-bottom:8px;font-weight:600;color:var(--ink-soft);">Tasks by stage</div>
+        <div style="position:relative;height:230px;"><canvas id="dashTaskChart"></canvas></div>
+      </div>
+    </div>
+  </div>` : ''}
+
   ${buyerCards ? `<div class="panel">
     <h2>Buyer overview</h2>
     <p class="desc">Red/amber/green health per buyer, at a glance — the same way a production planning board flags what needs attention first.</p>
@@ -1700,6 +1743,74 @@ function renderDashboard(){
       <tbody>${filtered.map(x => renderTaskRow(x.order, x.task)).join('')}</tbody>
     </table>`}
   </div>`;
+}
+
+// Draws the two Dashboard charts into the canvases renderDashboard() just put in the
+// DOM. Called after every dashboard render (see attachTabEvents) — recomputes from
+// the live filter state itself rather than taking numbers as arguments, since Chart.js
+// loads async and the user could switch tabs or change a filter before it resolves;
+// the canvas-existence checks below are what make that race harmless.
+async function initDashboardCharts(){
+  if(!document.getElementById('dashRagChart') && !document.getElementById('dashTaskChart')) return;
+  const ok = await loadChartJsLib();
+  if(!ok || !window.Chart) return;
+
+  const orders = dashboardFilteredOrders();
+  const all = dashboardFilteredTasks();
+  const overdue = all.filter(x => taskStatusComputed(x.task)==='Overdue');
+  const dueSoon = all.filter(x => isOpenTask(x.task) && taskStatusComputed(x.task)!=='Overdue' && daysBetween(today(), opDate(x.task)) <= 3);
+  const onTrackOpen = all.filter(x => isOpenTask(x.task) && taskStatusComputed(x.task)!=='Overdue' && daysBetween(today(), opDate(x.task)) > 3);
+  const doneTasks = all.filter(x => SUCCESS_STATUSES.includes(x.task.status));
+  const onTimeDone = doneTasks.filter(x => x.task.actualDate && x.task.actualDate <= opDate(x.task));
+  const lateDone = doneTasks.length - onTimeDone.length;
+
+  const ragCanvas = document.getElementById('dashRagChart');
+  destroyChart('dashRagChart');
+  if(ragCanvas){
+    const counts = {red:0, amber:0, green:0};
+    orders.forEach(o => counts[orderRAG(o)]++);
+    chartInstances.dashRagChart = new Chart(ragCanvas, {
+      type: 'doughnut',
+      data: {
+        labels: ['At risk','Watch','On track'],
+        datasets: [{ data: [counts.red, counts.amber, counts.green], backgroundColor: ['#C1443C','#B8862E','#3E7A4E'], borderColor: '#FBF9F4', borderWidth: 2 }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false, cutout: '62%',
+        plugins: {
+          legend: { position: 'bottom', labels: { font: chartBaseFont(), color: '#2B3A55', padding: 14, usePointStyle: true } },
+          tooltip: { callbacks: { label: ctx => ` ${ctx.label}: ${ctx.parsed} order${ctx.parsed!==1?'s':''}` } }
+        }
+      }
+    });
+  }
+
+  const taskCanvas = document.getElementById('dashTaskChart');
+  destroyChart('dashTaskChart');
+  if(taskCanvas){
+    const rows = [
+      ['Overdue', overdue.length, '#C1443C'],
+      ['Due soon', dueSoon.length, '#B8862E'],
+      ['On track', onTrackOpen.length, '#8B97AF'],
+      ['Done on time', onTimeDone.length, '#3E7A4E'],
+      ['Done late', lateDone, '#B8862E'],
+    ];
+    chartInstances.dashTaskChart = new Chart(taskCanvas, {
+      type: 'bar',
+      data: {
+        labels: rows.map(r=>r[0]),
+        datasets: [{ data: rows.map(r=>r[1]), backgroundColor: rows.map(r=>r[2]), borderRadius: 4, maxBarThickness: 34 }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ` ${ctx.parsed.y} task${ctx.parsed.y!==1?'s':''}` } } },
+        scales: {
+          x: { grid: { display: false }, ticks: { font: chartBaseFont(), color: '#6B7385' } },
+          y: { beginAtZero: true, ticks: { precision: 0, font: chartBaseFont(), color: '#6B7385' }, grid: { color: '#EFEBE0' } }
+        }
+      }
+    });
+  }
 }
 
 function renderTaskRow(order, task){
@@ -2772,18 +2883,27 @@ function csvDownloadHref(rows){
   return 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
 }
 
+// Shared between renderPerformance() and initPerformanceCharts() so the chart and
+// the table underneath it can never drift apart from applying the filter differently.
+function filteredMemberStats(){
+  const f = performanceFilters;
+  return scopedUsers().filter(u=>u.role==='member')
+    .filter(u => (f.buyerId==='all'||userBuyerIds(u).includes(f.buyerId)) && (f.memberId==='all'||u.id===f.memberId) && (f.dept==='all'||u.dept===f.dept))
+    .map(memberPerformance).sort((a,b)=> b.score - a.score);
+}
+function filteredBuyerStats(){
+  const f = performanceFilters;
+  return scopedBuyers().filter(b => f.buyerId==='all' || b.id===f.buyerId).map(buyerPerformance);
+}
+
 function renderPerformance(){
   const allMembers = scopedUsers().filter(u=>u.role==='member');
   const allBuyers = scopedBuyers();
   const f = performanceFilters;
   const isFiltered = performanceFiltersActive();
 
-  const memberStats = allMembers
-    .filter(u => (f.buyerId==='all'||userBuyerIds(u).includes(f.buyerId)) && (f.memberId==='all'||u.id===f.memberId) && (f.dept==='all'||u.dept===f.dept))
-    .map(memberPerformance).sort((a,b)=> b.score - a.score);
-  const buyerStats = allBuyers
-    .filter(b => f.buyerId==='all' || b.id===f.buyerId)
-    .map(buyerPerformance);
+  const memberStats = filteredMemberStats();
+  const buyerStats = filteredBuyerStats();
 
   const buyerOptions = `<option value="all">All buyers</option>` + allBuyers.map(b=>`<option value="${b.id}" ${f.buyerId===b.id?'selected':''}>${b.name}</option>`).join('');
   const memberOptions = `<option value="all">All team members</option>` + groupedUserOptionsHtml(allMembers, f.memberId==='all'?null:f.memberId);
@@ -2825,6 +2945,12 @@ function renderPerformance(){
       <div class="field"><label>Department</label><select id="perfDeptFilter">${deptOptions}</select></div>
     </div>
   </div>
+
+  ${memberStats.length>0 ? `<div class="panel">
+    <h2>Score overview</h2>
+    <p class="desc">Team members ranked by score — 🟢 80+ on target · 🟡 50–79 needs attention · 🔴 below 50. Exact figures are in the table below.</p>
+    <div style="position:relative;height:${Math.min(520, Math.max(140, memberStats.length*34))}px;"><canvas id="perfScoreChart"></canvas></div>
+  </div>` : ''}
 
   ${gapCardsHtml}
 
@@ -2884,6 +3010,38 @@ function renderPerformance(){
   </div>`;
 }
 
+// Draws the Performance leaderboard chart into the canvas renderPerformance() just put
+// in the DOM — same async-load-then-recheck-the-canvas pattern as initDashboardCharts(),
+// and reuses filteredMemberStats() so the chart can never show a different ranking than
+// the table underneath it.
+async function initPerformanceCharts(){
+  if(!document.getElementById('perfScoreChart')) return;
+  const ok = await loadChartJsLib();
+  if(!ok || !window.Chart) return;
+  const canvas = document.getElementById('perfScoreChart');
+  destroyChart('perfScoreChart');
+  if(!canvas) return;
+
+  const memberStats = filteredMemberStats();
+  if(memberStats.length===0) return;
+  const tierColor = { done: '#3E7A4E', progress: '#B8862E', overdue: '#C1443C' };
+  chartInstances.perfScoreChart = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels: memberStats.map(m=>m.user.name),
+      datasets: [{ data: memberStats.map(m=>m.score), backgroundColor: memberStats.map(m=>tierColor[performanceTier(m.score).cls]), borderRadius: 4, maxBarThickness: 22 }]
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ` Score: ${ctx.parsed.x}` } } },
+      scales: {
+        x: { min: 0, max: 100, ticks: { stepSize: 20, font: chartBaseFont(), color: '#6B7385' }, grid: { color: '#EFEBE0' } },
+        y: { ticks: { font: chartBaseFont(), color: '#2B3A55' }, grid: { display: false } }
+      }
+    }
+  });
+}
 
 function buildDigestText(u, tasks){
   const overdue = tasks.filter(x=>taskStatusComputed(x.task)==='Overdue');
