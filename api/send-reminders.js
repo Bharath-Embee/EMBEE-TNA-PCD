@@ -82,13 +82,15 @@ const REMINDER_SUBJECT = { due: 'due today', '1day': 'due in 1 day', '3day': 'du
 function labelFor(t) { return REMINDER_LABEL[t.startsWith('overdue') ? 'overdue' : t]; }
 function subjectFor(t) { return REMINDER_SUBJECT[t.startsWith('overdue') ? 'overdue' : t]; }
 
-function buildEmail(task, order, reminderType) {
+function buildEmail(user, task, order, reminderType) {
   const due = opDate(task);
   const appUrl = process.env.APP_URL || 'https://embee-tna-pcd.vercel.app';
   const link = `${appUrl}/#order=${encodeURIComponent(order.id)}`;
+  const firstName = (user.name || '').split(' ')[0] || 'there';
   const subject = `TNA Task Reminder — ${task.name} ${subjectFor(reminderType)}`;
   const html = `<div style="font-family:sans-serif;max-width:480px;color:#17233A;">
     <h2 style="margin-bottom:4px;">TNA Task Reminder</h2>
+    <p>Dear ${firstName},</p>
     <p><strong>Task:</strong> ${task.name}</p>
     <p><strong>Style:</strong> ${order.styleNo || ''} — ${order.item || ''}</p>
     <p><strong>Due Date:</strong> ${fmtDate(due)}</p>
@@ -118,11 +120,11 @@ function getGmailTransport() {
   }
   return gmailTransport;
 }
-async function sendEmail(to, cc, task, order, reminderType) {
+async function sendEmail(user, to, cc, task, order, reminderType) {
   if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
     throw new Error('GMAIL_USER / GMAIL_APP_PASSWORD not set');
   }
-  const { subject, html } = buildEmail(task, order, reminderType);
+  const { subject, html } = buildEmail(user, task, order, reminderType);
   const mail = {
     from: `"TNA Reminders" <${process.env.GMAIL_USER}>`,
     to,
@@ -249,7 +251,7 @@ export default async function handler(req, res) {
               const managerEmails = (DATA.users || [])
                 .filter(m => m.role === 'manager' && (m.managedBuyerIds || []).includes(user.buyerId) && m.email)
                 .map(m => m.email);
-              await sendEmail(user.email, managerEmails, task, order, reminderType);
+              await sendEmail(user, user.email, managerEmails, task, order, reminderType);
               await sql`UPDATE notification_log SET status = 'sent'
                          WHERE task_id = ${task.id} AND user_id = ${user.id} AND reminder_type = ${reminderType} AND channel = 'email'`;
               results.email.sent++;
