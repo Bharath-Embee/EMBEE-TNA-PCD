@@ -1175,6 +1175,24 @@ function getActiveUser(){
 }
 function isAdmin(){ const u=getActiveUser(); return u && u.role==='admin'; }
 function isManagerOrAdmin(){ const u=getActiveUser(); return u && (u.role==='admin' || u.role==='manager'); }
+// BOM/material field-level permissions — who negotiates timing (Merchandising/Manager/
+// Admin) is deliberately a different group from who physically receives goods
+// (Store/Admin), so these are two separate checks rather than one "can edit BOM" flag.
+// Only gates BOM/material tasks' own Expected Date and Actual Date/Received Qty —
+// regular TNA tasks keep working exactly as before (their assignee edits their own
+// Expected/Actual date, unrestricted).
+function canEditBomDates(){
+  const u = getActiveUser();
+  if(!u) return false;
+  if(u.role==='admin' || u.role==='manager') return true;
+  return u.role==='member' && u.dept==='Merchandising';
+}
+function canEditBomReceiving(){
+  const u = getActiveUser();
+  if(!u) return false;
+  if(u.role==='admin') return true;
+  return u.role==='member' && u.dept==='Store';
+}
 
 // Which buyer IDs a given user is scoped to. allBuyers means every buyer,
 // including ones added later — not a snapshot of today's buyer list — which is
@@ -1326,8 +1344,16 @@ function balanceQty(task){
 function qtyReadyClass(pct){
   if(pct===null) return '';
   if(pct>=100) return 'done';
-  if(pct>=80) return 'progress';
+  if(pct>=30) return 'progress';
   return 'overdue';
+}
+// A received-qty percentage as a bold, solidly-filled chip — not just colored text —
+// so material readiness reads at a glance: green at 100%+, amber/orange from 30% up
+// to just under 100%, red below 30%.
+function qtyPctChipHtml(pct){
+  if(pct===null) return `<span class="bom-pct-display">—</span>`;
+  const bg = pct>=100 ? 'var(--green)' : pct>=30 ? 'var(--brass)' : 'var(--thread-red)';
+  return `<span class="bom-pct-display" style="display:inline-block;padding:3px 10px;border-radius:5px;background:${bg};color:#fff;font-weight:700;font-family:'Space Grotesk',sans-serif;font-size:12.5px;">${pct}%</span>`;
 }
 
 // RAG (Red/Amber/Green) health of an order — same logic FastReact-style planning boards use
@@ -1685,13 +1711,22 @@ function renderMyTasks(){
     <table>
       <thead><tr><th>System Estimated</th><th>Task</th><th>Order</th><th>Buyer</th><th>Expected date</th><th>Status</th><th>Actual date</th><th>Received qty</th><th>Remarks</th><th></th></tr></thead>
       <tbody>
-        ${mine.map(x => { const pct = qtyPercent(x.task); const slip = estimateSlippageDays(x.task); return `<tr>
-          <td class="mono readonly-cell">${fmtDate(x.task.plannedDate)}${x.task.materialType ? `<div class="hint" style="margin-top:2px;">Required I/H (PCD): ${fmtDate(x.order.pcd)}</div>` : ''}</td>
+        ${mine.map(x => {
+          const pct = qtyPercent(x.task);
+          const slip = estimateSlippageDays(x.task);
+          const isMaterial = !!x.task.materialType;
+          // Regular TNA tasks are unaffected — this only locks Expected/Actual Date
+          // down for BOM/material items, where who's allowed to set them is split by
+          // role (see canEditBomDates/canEditBomReceiving).
+          const expEditable = !isMaterial || canEditBomDates();
+          const receivingEditable = !isMaterial || canEditBomReceiving();
+          return `<tr>
+          <td class="mono readonly-cell">${fmtDate(x.task.plannedDate)}${isMaterial ? `<div class="hint" style="margin-top:2px;">Required I/H (PCD): ${fmtDate(addDays(x.order.pcd,-3))}</div>` : ''}</td>
           <td>${x.task.name}</td>
           <td>${x.order.styleNo} <span style="color:var(--muted);font-size:11.5px;">(${x.order.item})</span></td>
           <td>${buyerName(x.order.buyerId)}</td>
           <td>
-            <input type="date" class="expdate-input" data-order="${x.order.id}" data-task="${x.task.id}" value="${x.task.expectedDate || x.task.plannedDate || ''}">
+            <input type="date" class="expdate-input" data-order="${x.order.id}" data-task="${x.task.id}" value="${x.task.expectedDate || x.task.plannedDate || ''}" ${expEditable?'':'disabled title="Only Merchandising, Manager, or Admin can set this"'}>
             ${slip>0 ? `<div class="hint" style="color:var(--brass);margin-top:2px;">Slipping ${slip}d vs plan</div>` : ''}
           </td>
           <td>
@@ -1700,10 +1735,10 @@ function renderMyTasks(){
             </select>
             <div class="hint" style="margin-top:3px;"><span class="badge ${taskBadgeClass(x.task)}">${statusDisplayText(x.task)}</span></div>
           </td>
-          <td><input type="date" class="actualdate-input" data-order="${x.order.id}" data-task="${x.task.id}" value="${x.task.actualDate || ''}"></td>
-          <td>${x.task.materialType ? `
-            <input type="number" class="receivedqty-input" style="min-width:100px;" placeholder="Qty received" data-order="${x.order.id}" data-task="${x.task.id}" value="${x.task.receivedQty!==null && x.task.receivedQty!==undefined ? x.task.receivedQty : ''}">
-            ${x.task.requiredQty ? `<div class="hint" style="margin-top:3px;">of ${x.task.requiredQty}${x.task.unit?' '+x.task.unit:''} required${pct!==null ? ` — <span class="badge ${qtyReadyClass(pct)}">${pct}%</span>` : ''}</div>` : '<div class="hint" style="margin-top:3px;">Set required qty on the order first</div>'}
+          <td><input type="date" class="actualdate-input" data-order="${x.order.id}" data-task="${x.task.id}" value="${x.task.actualDate || ''}" ${receivingEditable?'':'disabled title="Only Store or Admin can set this"'}></td>
+          <td>${isMaterial ? `
+            <input type="number" class="receivedqty-input" style="min-width:100px;" placeholder="Qty received" data-order="${x.order.id}" data-task="${x.task.id}" value="${x.task.receivedQty!==null && x.task.receivedQty!==undefined ? x.task.receivedQty : ''}" ${receivingEditable?'':'disabled title="Only Store or Admin can set this"'}>
+            ${x.task.requiredQty ? `<div class="hint" style="margin-top:3px;">of ${x.task.requiredQty}${x.task.unit?' '+x.task.unit:''} required${pct!==null ? ` — ${qtyPctChipHtml(pct)}` : ''}</div>` : '<div class="hint" style="margin-top:3px;">Set required qty on the order first</div>'}
           ` : '<span style="color:var(--muted);">—</span>'}</td>
           <td><input type="text" class="remarks-input" placeholder="Add a note…" data-order="${x.order.id}" data-task="${x.task.id}" value="${x.task.remarks ? x.task.remarks.replace(/"/g,'&quot;') : ''}">${taskHistoryHtml(x.task)}</td>
           <td><button class="btn small" data-save-task-row="${x.task.id}" data-order="${x.order.id}">Save</button></td>
@@ -2062,7 +2097,9 @@ function renderOrderCard(order){
     const known = withPct.filter(x=>x.pct!==null);
     const completeCount = known.filter(x=>x.pct>=100).length;
     const worst = known.length ? Math.min(...known.map(x=>x.pct)) : null;
-    const readyLabel = worst===null ? 'Awaiting receipt' : worst>=100 ? 'Ready for production' : worst>=80 ? 'Nearly ready — check shortfall' : 'Not enough material received';
+    // Kept in sync with qtyReadyClass()'s own thresholds (100 / 30) so the label text
+    // and the badge color it's paired with never disagree on severity.
+    const readyLabel = worst===null ? 'Awaiting receipt' : worst>=100 ? 'Ready for production' : worst>=30 ? 'Nearly ready — check shortfall' : 'Not enough material received';
     const readyClass = worst===null ? 'pending' : qtyReadyClass(worst);
     readinessHtml = `<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
       <span class="badge ${readyClass}">${readyLabel}</span>
@@ -2381,17 +2418,19 @@ function parseBomPaste(text, pcd, defaultLeadDays){
 function bomGridRow(order, t){
   const pct = qtyPercent(t);
   const bal = balanceQty(t);
+  const datesEditable = canEditBomDates();
+  const receivingEditable = canEditBomReceiving();
   return `<tr>
     <td><input class="bom-item-input" data-order="${order.id}" data-task="${t.id}" value="${(t.materialType||'').replace(/"/g,'&quot;')}" placeholder="Item name"></td>
     <td><input class="bom-qty-input" type="number" data-order="${order.id}" data-task="${t.id}" value="${t.requiredQty??''}" placeholder="Qty"></td>
     <td><input class="bom-unit-input" data-order="${order.id}" data-task="${t.id}" value="${(t.unit||'').replace(/"/g,'&quot;')}" placeholder="Unit"></td>
     <td><input class="bom-supplier-input" data-order="${order.id}" data-task="${t.id}" value="${(t.supplier||'').replace(/"/g,'&quot;')}" placeholder="Supplier"></td>
-    <td class="readonly"><input value="${fmtDate(order.pcd)}" disabled title="Always equals this order's PCD"></td>
-    <td><input class="bom-estdate-input" type="date" data-order="${order.id}" data-task="${t.id}" value="${t.expectedDate||t.plannedDate||''}"></td>
-    <td><input class="bom-actualdate-input" type="date" data-order="${order.id}" data-task="${t.id}" value="${t.actualDate||''}"></td>
-    <td><input class="bom-receivedqty-input" type="number" data-order="${order.id}" data-task="${t.id}" value="${t.receivedQty??''}" placeholder="Received"></td>
+    <td class="readonly"><input value="${fmtDate(addDays(order.pcd,-3))}" disabled title="Always 3 days before this order's PCD"></td>
+    <td><input class="bom-estdate-input" type="date" data-order="${order.id}" data-task="${t.id}" value="${t.expectedDate||t.plannedDate||''}" ${datesEditable?'':'disabled title="Only Merchandising, Manager, or Admin can set this"'}></td>
+    <td><input class="bom-actualdate-input" type="date" data-order="${order.id}" data-task="${t.id}" value="${t.actualDate||''}" ${receivingEditable?'':'disabled title="Only Store or Admin can set this"'}></td>
+    <td><input class="bom-receivedqty-input" type="number" data-order="${order.id}" data-task="${t.id}" value="${t.receivedQty??''}" placeholder="Received" ${receivingEditable?'':'disabled title="Only Store or Admin can set this"'}></td>
     <td class="readonly"><input class="bom-balance-display" value="${bal===null?'—':bal}" disabled></td>
-    <td class="readonly"><input class="bom-pct-display" value="${pct===null?'—':pct+'%'}" disabled></td>
+    <td class="readonly" style="text-align:center;">${qtyPctChipHtml(pct)}</td>
     <td><input class="bom-remarks-input" data-order="${order.id}" data-task="${t.id}" value="${(t.remarks||'').replace(/"/g,'&quot;')}" placeholder="Remarks"></td>
     <td style="border:none;text-align:center;white-space:nowrap;">
       <button class="btn small" data-save-bom-row="${t.id}" data-order="${order.id}">Save</button>
@@ -2470,7 +2509,7 @@ function renderBomPanel(order){
             <td><input class="bom-preview-qty" type="number" data-idx="${i}" value="${r.requiredQty??''}"></td>
             <td><input class="bom-preview-unit" data-idx="${i}" value="${(r.unit||'').replace(/"/g,'&quot;')}"></td>
             <td><input class="bom-preview-supplier" data-idx="${i}" value="${(r.supplier||'').replace(/"/g,'&quot;')}"></td>
-            <td class="readonly"><input value="${fmtDate(order.pcd)}" disabled></td>
+            <td class="readonly"><input value="${fmtDate(addDays(order.pcd,-3))}" disabled></td>
             <td><input class="bom-preview-date" type="date" data-idx="${i}" value="${r.plannedDate||''}"></td>
             <td class="readonly"><input value="${r.dateSource==='date'?'from BOM date':r.dateSource==='lead'?'from lead days':'default lead time'}" disabled></td>
             <td class="readonly"><input value="${r.error||'OK'}" disabled></td>
@@ -3389,10 +3428,10 @@ function attachTabEvents(){
     if(!reqInput || !recvInput || !balCell || !pctCell) return;
     const req = parseFloat(reqInput.value);
     const recv = parseFloat(recvInput.value);
-    if(isNaN(req) || req<=0){ balCell.value = '—'; pctCell.value = '—'; return; }
+    if(isNaN(req) || req<=0){ balCell.value = '—'; pctCell.outerHTML = qtyPctChipHtml(null); return; }
     const recvSafe = isNaN(recv) ? 0 : recv;
     balCell.value = Math.max(0, req - recvSafe);
-    pctCell.value = Math.round((recvSafe/req)*100) + '%';
+    pctCell.outerHTML = qtyPctChipHtml(Math.round((recvSafe/req)*100));
   }
   document.querySelectorAll('.bom-qty-input, .bom-receivedqty-input').forEach(inp => {
     inp.addEventListener('input', () => liveUpdateBomRow(inp));
