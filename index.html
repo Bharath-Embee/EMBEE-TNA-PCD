@@ -895,15 +895,30 @@ async function backendGet(key){
   const res = await fetch(BACKEND_API_URL + '?key=' + encodeURIComponent(key), {headers: backendHeaders()});
   if(!res.ok) throw new Error('Backend GET failed');
   const data = await res.json();
-  return data.value || null;
+  return { value: data.value || null, rev: data.rev || 0 };
 }
-async function backendSet(key, value){
+// expectedRev is the revision this client last read. The API does an atomic
+// compare-and-swap: if someone else saved in between, this is refused (409) instead
+// of silently overwriting their change — see the conflict handling in saveData().
+// Passing no expectedRev falls back to an unconditional overwrite (used by the
+// "reset and start fresh" flow, which is explicitly meant to force it).
+async function backendSet(key, value, expectedRev){
   const res = await fetch(BACKEND_API_URL, {
     method: 'POST',
     headers: backendHeaders({'Content-Type': 'application/json'}),
-    body: JSON.stringify({key, value})
+    body: JSON.stringify({key, value, expectedRev})
   });
+  if(res.status === 409){
+    const data = await res.json().catch(()=>({}));
+    const err = new Error('Backend save conflict');
+    err.isConflict = true;
+    err.serverValue = data.value;
+    err.serverRev = data.rev;
+    throw err;
+  }
   if(!res.ok) throw new Error('Backend POST failed');
+  const data = await res.json();
+  return data.rev;
 }
 
 async function storageGet(key){
@@ -916,23 +931,25 @@ async function storageGet(key){
   }
   if(HAS_CLAUDE_STORAGE){
     const res = await window.storage.get(key, true);
-    return res ? res.value : null;
+    return { value: res ? res.value : null, rev: null };
   }
-  try{ return localStorage.getItem('claude_fallback__' + key); }catch(e){ return null; }
+  try{ return { value: localStorage.getItem('claude_fallback__' + key), rev: null }; }catch(e){ return { value: null, rev: null }; }
 }
-async function storageSet(key, value){
+// Returns the new revision (backend mode) or null (local-only modes, which have no
+// concurrent-writer risk to guard against — a single browser can't race itself).
+async function storageSet(key, value, expectedRev){
   // Same reasoning as storageGet: in backend mode a failed save must be reported
   // to the caller (saveData() shows a toast), not silently redirected to a local
   // copy the rest of the team will never see.
   if(USING_BACKEND_API){
-    await backendSet(key, value);
-    return;
+    return await backendSet(key, value, expectedRev);
   }
   if(HAS_CLAUDE_STORAGE){
     await window.storage.set(key, value, true);
-    return;
+    return null;
   }
   localStorage.setItem('claude_fallback__' + key, value);
+  return null;
 }
 async function personalStorageGet(key){
   if(HAS_CLAUDE_STORAGE){
@@ -954,6 +971,11 @@ async function personalStorageSet(key, value){
 // and shows a retry screen instead of the app, specifically so nobody edits a blank
 // slate that then gets saved over real shared data.
 let DATA_LOAD_FAILED = false;
+// The revision last read from the backend for the current DATA — passed back on save
+// so the server can detect whether someone else saved in between (see saveData() and
+// api/data.js). null in local-only storage modes, which can't race against another
+// writer, so there's nothing to guard against.
+let DATA_REV = null;
 
 // SHA-256 with a random per-user salt, via the browser's built-in Web Crypto API —
 // no external library needed, consistent with this app's zero-dependency approach.
@@ -993,17 +1015,17 @@ async function migratePasswordsToHashed(d){
 async function loadData(){
   await detectBackendApi();
   DATA_LOAD_FAILED = false;
-  let value;
+  let loaded;
   try{
-    value = await storageGet(STORAGE_KEY);
+    loaded = await storageGet(STORAGE_KEY);
   }catch(e){
     console.error('TNA data load failed:', e);
     DATA_LOAD_FAILED = true;
     DATA = defaultData(); // just enough to avoid null-checks elsewhere — never saved
     return;
   }
-  if(value){
-    try{ DATA = JSON.parse(value); }
+  if(loaded.value){
+    try{ DATA = JSON.parse(loaded.value); }
     catch(e){
       // Data came back but isn't valid JSON — corrupted, not absent. Don't paper
       // over it by saving fresh defaults on top of whatever is actually stored.
@@ -1019,13 +1041,14 @@ async function loadData(){
     // to storage in plaintext even for a moment.
     DATA = defaultData();
   }
+  DATA_REV = loaded.rev;
   DATA = migrateData(DATA);
   // Hashes any user still carrying a plaintext password — a brand-new install's seed
   // admin account, or an existing account from before this change (or restored from an
   // older backup). Runs on every load, so nothing plaintext survives past the first
   // save either way.
   const passwordsMigrated = await migratePasswordsToHashed(DATA);
-  if(!value || passwordsMigrated) await saveData();
+  if(!loaded.value || passwordsMigrated) await saveData();
   try{
     const value2 = await personalStorageGet(ACTIVE_USER_KEY);
     if(value2){ ACTIVE_USER_ID = value2; }
@@ -1034,8 +1057,25 @@ async function loadData(){
 
 async function saveData(){
   try{
-    await storageSet(STORAGE_KEY, JSON.stringify(DATA));
+    const newRev = await storageSet(STORAGE_KEY, JSON.stringify(DATA), DATA_REV);
+    if(newRev !== null) DATA_REV = newRev;
   }catch(e){
+    if(e && e.isConflict){
+      // Someone else saved in between — the backend refused this write instead of
+      // silently overwriting theirs (see api/data.js). The edit that was just
+      // attempted here is NOT reapplied automatically — merging two people's changes
+      // safely isn't something this app can do on its own — but nothing is lost
+      // quietly either: the latest data goes on screen and whoever was mid-edit sees
+      // clearly that they need to redo it.
+      showToast("Someone else just saved changes here — refreshed to the latest version. Please redo your last change if it didn't take.");
+      console.warn('Save conflict — refreshing to latest before retrying anything.');
+      try{
+        if(e.serverValue){ DATA = migrateData(JSON.parse(e.serverValue)); DATA_REV = e.serverRev; }
+        else { await loadData(); }
+        render();
+      }catch(e2){ console.error('Conflict recovery failed:', e2); }
+      return;
+    }
     showToast('Save failed — changes may not persist');
     console.error(e);
   }
