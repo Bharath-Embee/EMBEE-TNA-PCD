@@ -661,7 +661,7 @@ async function exportTeamPdf(){
 function defaultData(){
   const buyerId = uid('byr');
   return {
-    buyers: [{id:buyerId, name:'Sample Buyer Co.'}],
+    buyers: [{id:buyerId, name:'Sample Buyer Co.', active:true}],
     users: [
       {id: uid('usr'), username:'admin', password:'admin123', name:'System Admin', email:'', phone:'',
        role:'admin', dept:null, buyerId:null, managedBuyerIds:[]},
@@ -708,6 +708,7 @@ function migrateData(d){
     if(u.email === undefined) u.email = '';
     if(u.phone === undefined) u.phone = '';
   });
+  d.buyers.forEach(b => { if(b.active === undefined) b.active = true; });
   d.orders.forEach(o => {
     if(o.fabricRequiredQty !== undefined) delete o.fabricRequiredQty;
     if(o.trimRequiredQty !== undefined) delete o.trimRequiredQty;
@@ -954,6 +955,41 @@ async function personalStorageSet(key, value){
 // slate that then gets saved over real shared data.
 let DATA_LOAD_FAILED = false;
 
+// SHA-256 with a random per-user salt, via the browser's built-in Web Crypto API —
+// no external library needed, consistent with this app's zero-dependency approach.
+// Framed honestly: this stops a password from being trivially readable off an admin's
+// screen or a raw data export, which is the real exposure this app has today. It is
+// not a claim of bank-grade security — this app already ships every user record to
+// the browser before login (see the storage-layer comment above), so a determined
+// attacker who already has that access has the hash too. Salting still blocks the
+// cheap attack (rainbow tables / shared passwords across users), which is the
+// realistic threat here.
+async function hashPassword(password, salt){
+  const enc = new TextEncoder().encode(salt + ':' + password);
+  const digest = await crypto.subtle.digest('SHA-256', enc);
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2,'0')).join('');
+}
+function randomSalt(){
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes).map(b => b.toString(16).padStart(2,'0')).join('');
+}
+// Replaces any user's plaintext `password` field with `passwordHash`/`passwordSalt` and
+// removes the plaintext. Safe to run every load — a user with no plaintext field left
+// is skipped, so this is a no-op once everyone's migrated.
+async function migratePasswordsToHashed(d){
+  let migrated = false;
+  for(const u of d.users){
+    if(u.password !== undefined){
+      const salt = randomSalt();
+      u.passwordHash = await hashPassword(u.password, salt);
+      u.passwordSalt = salt;
+      delete u.password;
+      migrated = true;
+    }
+  }
+  return migrated;
+}
+
 async function loadData(){
   await detectBackendApi();
   DATA_LOAD_FAILED = false;
@@ -978,11 +1014,18 @@ async function loadData(){
     }
   } else {
     // Backend/storage responded successfully and confirmed there's genuinely
-    // nothing saved yet — safe to initialize.
+    // nothing saved yet — safe to initialize. Saving is deferred until after the
+    // password-hashing step below, so the seed admin password is never written
+    // to storage in plaintext even for a moment.
     DATA = defaultData();
-    await saveData();
   }
   DATA = migrateData(DATA);
+  // Hashes any user still carrying a plaintext password — a brand-new install's seed
+  // admin account, or an existing account from before this change (or restored from an
+  // older backup). Runs on every load, so nothing plaintext survives past the first
+  // save either way.
+  const passwordsMigrated = await migratePasswordsToHashed(DATA);
+  if(!value || passwordsMigrated) await saveData();
   try{
     const value2 = await personalStorageGet(ACTIVE_USER_KEY);
     if(value2){ ACTIVE_USER_ID = value2; }
@@ -1324,7 +1367,11 @@ function showRenderError(container, err){
     if(!confirm('This permanently deletes all saved buyers, orders, users, and templates for this system and starts fresh. This cannot be undone. Continue?')) return;
     try{ localStorage.removeItem('claude_fallback__'+STORAGE_KEY); localStorage.removeItem('claude_fallback_personal__'+ACTIVE_USER_KEY); }catch(e){}
     try{ await personalStorageSet(ACTIVE_USER_KEY, ''); }catch(e){}
-    try{ await storageSet(STORAGE_KEY, JSON.stringify(defaultData())); }catch(e){}
+    try{
+      const fresh = defaultData();
+      await migratePasswordsToHashed(fresh); // don't let the seed admin password hit storage in plaintext
+      await storageSet(STORAGE_KEY, JSON.stringify(fresh));
+    }catch(e){}
     location.reload();
   });
 }
@@ -1395,7 +1442,8 @@ function attachGateEvents(){
     try{ await loadData(); }
     catch(e){ /* if the refresh itself fails, fall back to whatever's already in memory rather than blocking login entirely */ }
     btn.disabled = false; btn.textContent = 'Sign in';
-    const match = DATA.users.find(u => u.username && u.username.toLowerCase()===uname && u.password===pass);
+    const candidate = DATA.users.find(u => u.username && u.username.toLowerCase()===uname);
+    const match = (candidate && candidate.passwordSalt && await hashPassword(pass, candidate.passwordSalt) === candidate.passwordHash) ? candidate : null;
     if(!match){ loginError = 'Username or password is incorrect.'; render(); return; }
     loginError = '';
     await setActiveUser(match.id);
@@ -1886,7 +1934,9 @@ function renderTaskRow(order, task){
 
 /* ---- Orders ---- */
 function renderOrders(){
-  const buyers = scopedBuyers();
+  // Deactivated buyers can't take on a new order but keep every order they already
+  // have — this only governs the "start something new" picker.
+  const buyers = scopedBuyers().filter(b=>b.active);
   const sets = DATA.templateSets;
   return `
   <div class="panel">
@@ -2410,7 +2460,11 @@ function renderBomPanel(order){
 /* ---- Buyers & Team ---- */
 function renderTeam(){
   const buyers = scopedBuyers();
-  const allBuyersForForm = isAdmin() ? DATA.buyers : scopedBuyers();
+  // Inactive buyers stay fully visible everywhere they're already linked (existing
+  // orders, existing team members' access) — they're only left out of pickers used to
+  // assign something NEW, so nobody accidentally staffs up a buyer you've stopped
+  // working with.
+  const activeBuyersForForm = (isAdmin() ? DATA.buyers : scopedBuyers()).filter(b=>b.active);
 
   const roleOptionsHtml = isAdmin()
     ? `<option value="member">Member — own tasks only</option><option value="manager">Manager — buyer team head</option><option value="admin">Admin — all buyers</option>`
@@ -2426,7 +2480,11 @@ function renderTeam(){
       <button class="btn" id="addBuyerBtn">Add buyer</button>
     </div>
     ${DATA.buyers.length ? `<table style="margin-top:14px;"><tbody>
-      ${DATA.buyers.map(b=>`<tr><td>${b.name}</td><td style="text-align:right;"><button class="btn danger small" data-delete-buyer="${b.id}">Remove</button></td></tr>`).join('')}
+      ${DATA.buyers.map(b=>`<tr>
+        <td>${b.name}</td>
+        <td><span class="badge ${b.active?'done':'pending'}">${b.active?'Active':'Inactive'}</span></td>
+        <td style="text-align:right;"><button class="btn ${b.active?'ghost':''} small" data-toggle-buyer-active="${b.id}">${b.active?'Deactivate':'Reactivate'}</button></td>
+      </tr>`).join('')}
     </tbody></table>` : ''}
   </div>` : `
   <div class="panel">
@@ -2449,7 +2507,7 @@ function renderTeam(){
       </div>
       <div class="field"><label>Full name</label><input id="newUserName" placeholder="Full name"></div>
       <div class="field"><label>Username</label><input id="newUserUsername" placeholder="e.g. jane.merch" autocomplete="off"></div>
-      <div class="field"><label>Password</label><input id="newUserPassword" type="text" placeholder="Set a password" autocomplete="off"></div>
+      <div class="field"><label>Password</label><input id="newUserPassword" type="password" placeholder="Set a password" autocomplete="new-password"></div>
     </div>
     <div class="grid-cols">
       <div class="field"><label>Role</label><select id="newUserRole">${roleOptionsHtml}</select></div>
@@ -2467,7 +2525,7 @@ function renderTeam(){
         <label for="newUserAllBuyers" style="margin:0;font-weight:400;">All buyers (current and future) — for roles like Purchase, Store, Shipping, PPC that work across every buyer</label>
       </div>
       <div id="newUserBuyerListWrap" class="checkbox-list" style="margin-bottom:12px;">
-        ${allBuyersForForm.map(b=>`<div class="checkbox-row"><input type="checkbox" class="newUserBuyerCheck" value="${b.id}" id="nub_${b.id}"><label for="nub_${b.id}" style="margin:0;font-weight:400;">${b.name}</label></div>`).join('')}
+        ${activeBuyersForForm.map(b=>`<div class="checkbox-row"><input type="checkbox" class="newUserBuyerCheck" value="${b.id}" id="nub_${b.id}"><label for="nub_${b.id}" style="margin:0;font-weight:400;">${b.name}</label></div>`).join('')}
       </div>
       <div class="hint" style="margin-bottom:12px;">One person can be checked for several buyers — e.g. a merchandiser handling both H&amp;M and another buyer needs just one account, not two.</div>
     </div>
@@ -2504,7 +2562,7 @@ function renderTeam(){
       </div>
       <label>Buyers this manager can see</label>
       <div class="checkbox-list" style="margin-bottom:12px;">
-        ${DATA.buyers.map(b=>`<div class="checkbox-row"><input type="checkbox" class="managerBuyerCheck" value="${b.id}" id="mb_${b.id}"><label for="mb_${b.id}" style="margin:0;font-weight:400;">${b.name}</label></div>`).join('')}
+        ${activeBuyersForForm.map(b=>`<div class="checkbox-row"><input type="checkbox" class="managerBuyerCheck" value="${b.id}" id="mb_${b.id}"><label for="mb_${b.id}" style="margin:0;font-weight:400;">${b.name}</label></div>`).join('')}
       </div>
       <label>Screen access</label>
       <div class="checkbox-list">
@@ -2587,7 +2645,7 @@ function renderTeam(){
               <div style="padding:8px 4px;">
                 <label style="display:block;margin-bottom:6px;">New password for ${u.name}</label>
                 <div class="field" style="max-width:260px;margin-bottom:10px;">
-                  <input type="text" class="editPasswordInput" id="epw_${u.id}" placeholder="Set a new password" autocomplete="off">
+                  <input type="password" class="editPasswordInput" id="epw_${u.id}" placeholder="Set a new password" autocomplete="new-password">
                 </div>
                 <div class="row-actions">
                   <button class="btn small" data-save-password="${u.id}">Save password</button>
@@ -2605,7 +2663,7 @@ function renderTeam(){
                   <label for="eab_${u.id}" style="margin:0;font-weight:400;">All buyers (current and future)</label>
                 </div>
                 <div class="checkbox-list editBuyerListWrap" id="ebl_${u.id}" style="margin-bottom:10px;${u.allBuyers?'opacity:.4;':''}">
-                  ${DATA.buyers.map(b=>`<div class="checkbox-row"><input type="checkbox" class="editBuyerCheck" value="${b.id}" id="eb_${u.id}_${b.id}" ${(u.buyerIds||[]).includes(b.id)?'checked':''}><label for="eb_${u.id}_${b.id}" style="margin:0;font-weight:400;">${b.name}</label></div>`).join('')}
+                  ${DATA.buyers.filter(b=>b.active || (u.buyerIds||[]).includes(b.id)).map(b=>`<div class="checkbox-row"><input type="checkbox" class="editBuyerCheck" value="${b.id}" id="eb_${u.id}_${b.id}" ${(u.buyerIds||[]).includes(b.id)?'checked':''}><label for="eb_${u.id}_${b.id}" style="margin:0;font-weight:400;">${b.name}${!b.active?' (inactive)':''}</label></div>`).join('')}
                 </div>
                 <div class="row-actions">
                   <button class="btn small" data-save-buyers="${u.id}">Save buyers</button>
@@ -3511,20 +3569,21 @@ function attachTabEvents(){
   if(addBuyerBtn) addBuyerBtn.addEventListener('click', async () => {
     const name = document.getElementById('newBuyerName').value.trim();
     if(!name){ showToast('Enter a buyer name'); return; }
-    DATA.buyers.push({id: uid('byr'), name});
+    if(DATA.buyers.some(b=>b.name.toLowerCase()===name.toLowerCase())){ showToast('A buyer with that name already exists'); return; }
+    DATA.buyers.push({id: uid('byr'), name, active: true});
     renderTabContent(); saveData();
   });
-  document.querySelectorAll('[data-delete-buyer]').forEach(btn => {
+  // Deactivating (not deleting) a buyer — existing orders and every team member's
+  // access stay exactly as they are, so nothing breaks and nothing has to be redone
+  // if the relationship picks back up. Deactivating just takes them out of the "New
+  // order" and "add team member" pickers so nothing new gets assigned to them.
+  document.querySelectorAll('[data-toggle-buyer-active]').forEach(btn => {
     btn.addEventListener('click', async () => {
-      const id = btn.dataset.deleteBuyer;
-      if(!confirm('Remove this buyer? Team members and managers linked to them will lose that link.')) return;
-      DATA.buyers = DATA.buyers.filter(b=>b.id!==id);
-      DATA.users.forEach(u => {
-        if(u.buyerId===id) u.buyerId = null;
-        if(u.buyerIds) u.buyerIds = u.buyerIds.filter(x=>x!==id);
-        if(u.managedBuyerIds) u.managedBuyerIds = u.managedBuyerIds.filter(x=>x!==id);
-      });
-      renderTabContent(); saveData();
+      const b = DATA.buyers.find(x=>x.id===btn.dataset.toggleBuyerActive);
+      if(!b) return;
+      if(b.active && !confirm(`Deactivate ${b.name}? They'll disappear from "New order" and "add team member" pickers, but existing orders and access stay untouched — you can reactivate any time.`)) return;
+      b.active = !b.active;
+      renderTabContent(); showToast(b.active ? `${b.name} reactivated` : `${b.name} deactivated`); saveData();
     });
   });
 
@@ -3574,7 +3633,9 @@ function attachTabEvents(){
       tabAccess = Array.from(document.querySelectorAll('.managerTabCheck:checked')).map(c=>c.value);
     }
 
-    DATA.users.push({id: uid('usr'), username, password, name, email, phone, role, dept, buyerId, buyerIds, allBuyers, managedBuyerIds, allowedTaskNames, designation, tabAccess, photo: pendingNewUserPhoto});
+    const newUserSalt = randomSalt();
+    const newUserPasswordHash = await hashPassword(password, newUserSalt);
+    DATA.users.push({id: uid('usr'), username, passwordHash: newUserPasswordHash, passwordSalt: newUserSalt, name, email, phone, role, dept, buyerId, buyerIds, allBuyers, managedBuyerIds, allowedTaskNames, designation, tabAccess, photo: pendingNewUserPhoto});
     pendingNewUserPhoto = '';
     renderTabContent(); showToast('Team member added'); saveData();
   });
@@ -3642,13 +3703,15 @@ function attachTabEvents(){
     btn.addEventListener('click', () => { editingPasswordUserId = null; renderTabContent(); });
   });
   document.querySelectorAll('[data-save-password]').forEach(btn => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       if(!isAdmin()) return;
       const u = DATA.users.find(x=>x.id===btn.dataset.savePassword);
       const input = document.getElementById('epw_'+btn.dataset.savePassword);
       const newPw = input ? input.value.trim() : '';
       if(!newPw){ showToast('Enter a new password'); return; }
-      u.password = newPw;
+      const salt = randomSalt();
+      u.passwordHash = await hashPassword(newPw, salt);
+      u.passwordSalt = salt;
       editingPasswordUserId = null;
       renderTabContent(); showToast('Password updated'); saveData();
     });
