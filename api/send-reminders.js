@@ -57,6 +57,10 @@ function addDays(iso, n) {
   d.setUTCDate(d.getUTCDate() + n);
   return d.toISOString().slice(0, 10);
 }
+function daysBetween(a, b) {
+  const A = new Date(a + 'T00:00:00Z'), B = new Date(b + 'T00:00:00Z');
+  return Math.round((B - A) / 86400000);
+}
 function fmtDate(iso) {
   const d = new Date(iso + 'T00:00:00Z');
   return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'UTC' });
@@ -156,6 +160,69 @@ async function sendDigestEmail(user, items, managerEmails) {
   await getGmailTransport().sendMail(mail);
 }
 
+// A task overdue this many days or more gets escalated: a dedicated email TO the
+// buyer's manager(s) — not just CC'd on the assignee's routine digest — since
+// something stuck that long usually needs someone above the assignee to actually
+// chase it. Re-sent daily for as long as it stays this overdue, same "nags until
+// resolved" philosophy as the regular overdue reminder above.
+const ESCALATION_DAYS = 5;
+function buildEscalationEmail(manager, items) {
+  const appUrl = process.env.APP_URL || 'https://embee-tna-pcd.vercel.app';
+  const firstName = (manager.name || '').split(' ')[0] || 'there';
+  const sorted = [...items].sort((a, b) => b.daysLate - a.daysLate);
+  const subject = `TNA Escalation — ${items.length} task${items.length > 1 ? 's' : ''} overdue ${ESCALATION_DAYS}+ days`;
+  const rows = sorted.map(({ task, order, assigneeName, daysLate }) => {
+    const link = `${appUrl}/#order=${encodeURIComponent(order.id)}`;
+    return `<tr>
+      <td style="padding:8px 6px;border-bottom:1px solid #eee;">
+        <a href="${link}" style="color:#17233A;text-decoration:none;font-weight:600;">${task.name}</a><br>
+        <span style="font-size:12px;color:#666;">${order.styleNo || ''} — ${order.item || ''}</span>
+      </td>
+      <td style="padding:8px 6px;border-bottom:1px solid #eee;font-size:13px;white-space:nowrap;">${assigneeName}</td>
+      <td style="padding:8px 6px;border-bottom:1px solid #eee;font-size:13px;white-space:nowrap;color:#A83A33;font-weight:600;">${daysLate}d overdue</td>
+    </tr>`;
+  }).join('');
+  const html = `<div style="font-family:sans-serif;max-width:560px;color:#17233A;">
+    <h2 style="margin-bottom:4px;color:#A83A33;">TNA Escalation</h2>
+    <p>Dear ${firstName},</p>
+    <p>${items.length} task${items.length > 1 ? 's are' : ' is'} overdue by ${ESCALATION_DAYS}+ days and may need your attention beyond the assignee:</p>
+    <table style="width:100%;border-collapse:collapse;">
+      <thead><tr style="text-align:left;font-size:12px;color:#888;">
+        <th style="padding:6px;">Task</th><th style="padding:6px;">Assigned to</th><th style="padding:6px;">Status</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </div>`;
+  return { subject, html };
+}
+async function sendEscalationEmail(manager, items) {
+  if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
+    throw new Error('GMAIL_USER / GMAIL_APP_PASSWORD not set');
+  }
+  const { subject, html } = buildEscalationEmail(manager, items);
+  await getGmailTransport().sendMail({ from: `"TNA Reminders" <${process.env.GMAIL_USER}>`, to: manager.email, subject, html });
+}
+
+// Bounds the growth of tables that only ever get INSERTed into. Safe to run on every
+// invocation (three times a day) — deleting rows older than a fixed cutoff is
+// naturally idempotent. Only ever removes tokens already marked inactive (a currently
+// active token is never touched here, regardless of how long it's been since it was
+// last used — an unused-but-valid token belongs to someone with nothing due
+// recently, not a dead token) and log rows old enough that nothing depends on them
+// for idempotency (only recent rows for currently-open tasks matter for that).
+async function cleanupOldRecords() {
+  await sql`DELETE FROM notification_tokens WHERE active = false AND last_used_at < now() - INTERVAL '90 days'`;
+  await sql`DELETE FROM notification_log WHERE sent_at < now() - INTERVAL '180 days'`;
+  // weekly_report_log is created by api/bom-weekly-report.js, not this file — guard
+  // separately so a fresh environment that's never run that job doesn't fail the
+  // whole cleanup pass over one table that may not exist yet.
+  try {
+    await sql`DELETE FROM weekly_report_log WHERE sent_at < now() - INTERVAL '365 days'`;
+  } catch (e) {
+    console.warn('weekly_report_log cleanup skipped (table not present yet?):', e.message);
+  }
+}
+
 async function ensureTables() {
   await sql`CREATE TABLE IF NOT EXISTS notification_tokens (
     id SERIAL PRIMARY KEY, user_id TEXT NOT NULL, token TEXT NOT NULL UNIQUE,
@@ -190,6 +257,7 @@ export default async function handler(req, res) {
 
   try {
     await ensureTables();
+    try { await cleanupOldRecords(); } catch (e) { console.warn('Cleanup pass failed (non-fatal):', e.message); }
 
     const row = await sql`SELECT value FROM tna_kv WHERE key = 'tna:tna_data_v2'`;
     if (!row[0]) return res.status(200).json({ ok: true, message: 'No TNA data saved yet' });
@@ -308,7 +376,60 @@ export default async function handler(req, res) {
       }
     }
 
-    return res.status(200).json({ ok: true, date: today, results, emailsSent: Object.keys(emailBatches).length });
+    // Escalation: tasks overdue ESCALATION_DAYS+ get a direct email to the buyer's
+    // manager(s) — separate from the CC they already get on the assignee's routine
+    // digest above, and addressed TO them so it reads as urgent, not routine. One
+    // digest per manager per day (not one email per task), claimed via
+    // notification_log exactly like the reminders above — the manager id is baked
+    // into reminder_type itself (escalation_<date>_<managerId>) so the existing
+    // (task_id, reminder_type, channel) UNIQUE constraint still gives correct
+    // per-manager idempotency without any schema change, the same way overdue
+    // reminders already bake the date into their own reminder_type.
+    const escalationBatches = {}; // managerId -> { manager, items: [{task, order, assigneeName, daysLate, escalationType}] }
+    for (const order of (DATA.orders || [])) {
+      for (const task of (order.tasks || [])) {
+        if (!isOpenTask(task) || !task.assignedTo) continue;
+        const due = opDate(task);
+        if (!due || due >= today) continue;
+        const daysLate = daysBetween(due, today);
+        if (daysLate < ESCALATION_DAYS) continue;
+
+        const managers = (DATA.users || []).filter(m => m.role === 'manager' && (m.managedBuyerIds || []).includes(order.buyerId) && m.email);
+        for (const manager of managers) {
+          const escalationType = `escalation_${today}_${manager.id}`;
+          try {
+            await sql`INSERT INTO notification_log (task_id, user_id, reminder_type, channel, status)
+                       VALUES (${task.id}, ${manager.id}, ${escalationType}, 'email', 'pending')`;
+          } catch (e) {
+            continue; // already claimed for this manager today
+          }
+          const assignee = (DATA.users || []).find(u => u.id === task.assignedTo);
+          if (!escalationBatches[manager.id]) escalationBatches[manager.id] = { manager, items: [] };
+          escalationBatches[manager.id].items.push({ task, order, assigneeName: assignee ? assignee.name : 'Unassigned', daysLate, escalationType });
+        }
+      }
+    }
+
+    results.escalation = { sent: 0, failed: 0 };
+    for (const managerId of Object.keys(escalationBatches)) {
+      const { manager, items } = escalationBatches[managerId];
+      try {
+        await sendEscalationEmail(manager, items);
+        for (const { task, escalationType } of items) {
+          await sql`UPDATE notification_log SET status = 'sent'
+                     WHERE task_id = ${task.id} AND user_id = ${manager.id} AND reminder_type = ${escalationType} AND channel = 'email'`;
+        }
+        results.escalation.sent += items.length;
+      } catch (err) {
+        for (const { task, escalationType } of items) {
+          await sql`UPDATE notification_log SET status = 'failed', error = ${err.message || String(err)}
+                     WHERE task_id = ${task.id} AND user_id = ${manager.id} AND reminder_type = ${escalationType} AND channel = 'email'`;
+        }
+        results.escalation.failed += items.length;
+      }
+    }
+
+    return res.status(200).json({ ok: true, date: today, results, emailsSent: Object.keys(emailBatches).length, escalationsSent: Object.keys(escalationBatches).length });
   } catch (err) {
     console.error('send-reminders error:', err);
     return res.status(500).json({ error: 'Reminder job failed', detail: err.message });
