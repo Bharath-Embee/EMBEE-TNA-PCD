@@ -179,7 +179,10 @@ export default async function handler(req, res) {
 
   try {
     await ensureTables();
-    const isTestRun = req.query && req.query.test === '1';
+    // Parsed via the WHATWG URL API rather than the request's auto-populated `.query`
+    // (which Vercel's Node runtime derives internally using the legacy, deprecated
+    // `url.parse()` — DEP0169). This sidesteps that entirely instead of just moving it.
+    const isTestRun = new URL(req.url, 'http://localhost').searchParams.get('test') === '1';
     const weekKey = isoWeekKey(new Date());
 
     if (!isTestRun) {

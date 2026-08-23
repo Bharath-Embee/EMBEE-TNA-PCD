@@ -69,7 +69,12 @@ export default async function handler(req, res) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  const key = (req.method === 'GET' ? req.query.key : req.body && req.body.key);
+  // Parsed via the WHATWG URL API rather than the request's auto-populated `.query`
+  // (which Vercel's Node runtime derives internally using the legacy, deprecated
+  // `url.parse()` — DEP0169). This sidesteps that entirely instead of just moving it.
+  const key = req.method === 'GET'
+    ? new URL(req.url, 'http://localhost').searchParams.get('key')
+    : (req.body && req.body.key);
   if (!key || typeof key !== 'string') {
     return res.status(400).json({ error: 'Missing key' });
   }
