@@ -89,14 +89,26 @@
   input:focus, select:focus, textarea:focus{outline:2px solid var(--brass-soft); border-color:var(--brass);}
   .field{margin-bottom:0;}
 
-  button.btn{font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:13px;padding:9px 16px;border-radius:7px;border:1px solid var(--ink);background:var(--ink);color:#fff;cursor:pointer;}
+  button.btn{font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:13px;padding:9px 16px;border-radius:7px;border:1px solid var(--ink);background:var(--ink);color:#fff;cursor:pointer;transition:transform .12s ease, background .15s ease, border-color .15s ease;}
   button.btn:hover{background:var(--ink-soft);}
+  button.btn:active:not(:disabled){transform:scale(0.96);}
   button.btn.ghost{background:transparent;color:var(--ink);border:1px solid var(--line);}
   button.btn.ghost:hover{border-color:var(--ink);}
   button.btn.danger{background:transparent;color:var(--thread-red);border:1px solid var(--thread-red-dim);}
   button.btn.danger:hover{background:var(--thread-red-dim);}
   button.btn.small{padding:5px 10px;font-size:12px;}
   button.btn:disabled{opacity:.45;cursor:not-allowed;}
+
+  /* ---- Motion — kept small and purposeful: feedback on actions, not decoration ---- */
+  @keyframes tabFadeIn{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:translateY(0);}}
+  .tab-fade-in{animation:tabFadeIn .28s ease;}
+  @keyframes badgePop{0%{transform:scale(0.55);}55%{transform:scale(1.18);}100%{transform:scale(1);}}
+  .badge-pop{display:inline-block;animation:badgePop .45s cubic-bezier(.34,1.56,.64,1);}
+  @media (prefers-reduced-motion: reduce){
+    .tab-fade-in{animation:none;}
+    .badge-pop{animation:none;}
+    button.btn{transition:none;}
+  }
 
   table{width:100%;border-collapse:collapse;font-size:13px;}
   th{text-align:left;font-family:'Space Grotesk',sans-serif;font-size:11.5px;text-transform:uppercase;letter-spacing:0.4px;color:var(--muted);padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap;}
@@ -299,6 +311,11 @@ const DEFAULT_TEMPLATES = [
 let DATA = null;
 let ACTIVE_USER_ID = null;
 let currentTab = 'dashboard';
+// Set right before a real tab switch (see attachTabEvents' .tab click handler) so
+// renderTabContent() can fade the new content in — but only for an actual tab
+// change, not the many other things that call renderTabContent() on every filter
+// tweak or keystroke, where a fade replaying constantly would be distracting.
+let tabJustSwitched = false;
 let currentUserFilter = 'all';
 let dashboardFilters = { buyerId:'all', personId:'all', style:'', season:'', dateFrom:'', dateTo:'' };
 let currentOrderExpanded = {};
@@ -561,6 +578,18 @@ async function exportDashboardPdf(){
     [220,80,80,80,80]
   );
 
+  const workload = dashboardPersonWorkload(all);
+  if(workload.length>0){
+    y += 8;
+    if(y > doc.internal.pageSize.getHeight()-100){ doc.addPage(); y = 40; }
+    y = pdfSectionTitle(doc, y, 'Team workload — effort-days of open work');
+    y = pdfTable(doc, y,
+      ['Person','Overdue','Due soon','On track','Total'],
+      workload.map(e => [userName(e.userId), e.overdue, e.dueSoon, e.onTrack, e.total]),
+      [220,90,90,90,90]
+    );
+  }
+
   y += 8;
   if(y > doc.internal.pageSize.getHeight()-100){ doc.addPage(); y = 40; }
   y = pdfSectionTitle(doc, y, `Open tasks (${open.length})`);
@@ -686,7 +715,14 @@ function migrateData(d){
   // Defensively backfill every field added across versions, so data saved by an
   // older version of the system doesn't crash a newer screen that expects it to exist.
   d.templateSets.forEach(set => {
-    (set.tasks||[]).forEach(t => { if(t.dependsOn === undefined) t.dependsOn = null; });
+    (set.tasks||[]).forEach(t => {
+      if(t.dependsOn === undefined) t.dependsOn = null;
+      // Effort — estimated person-days of actual work this task takes, distinct from
+      // "offset" (calendar days before PCD it's scheduled). A task can sit 20 calendar
+      // days out but only take half a day of real work, or vice versa — workload views
+      // need this, not the scheduling offset, to reflect who's actually carrying load.
+      if(t.effort === undefined) t.effort = 1;
+    });
   });
   d.users.forEach(u => {
     if(u.managedBuyerIds === undefined) u.managedBuyerIds = [];
@@ -739,6 +775,11 @@ function migrateData(d){
         if(t.requiredQty === undefined) t.requiredQty = null;
         if(t.receivedQty === undefined) t.receivedQty = null;
         return;
+      }
+      if(t.effortDays === undefined){
+        let matchedTemplate = null;
+        d.templateSets.forEach(set => { const m = (set.tasks||[]).find(st=>st.id===t.templateId); if(m) matchedTemplate = m; });
+        t.effortDays = matchedTemplate && matchedTemplate.effort ? matchedTemplate.effort : 1;
       }
       if(t.offsetDays !== undefined) return;
       let matchedTemplate = null;
@@ -1238,6 +1279,68 @@ const STATUS_OPTIONS = ['Pending','In Progress','Done','Approved','Rejected','N/
 const RESOLVED_STATUSES = ['Done','Approved','Rejected','N/A']; // never shows as Overdue, drops off open-task lists
 const SUCCESS_STATUSES = ['Done','Approved']; // counts as a positive completion for performance/on-time scoring
 
+function isOrderFullyDone(order){
+  return order.tasks.length>0 && order.tasks.every(t => SUCCESS_STATUSES.includes(t.status));
+}
+// A lightweight confetti burst — pure canvas, no image/GIF asset and no external
+// library, so it stays free of network dependency and page weight. Uses the app's
+// own palette so it reads as part of the system rather than a bolted-on effect.
+// Fires once, for a real milestone (an entire order finishing), not on every save.
+function celebrateOrderComplete(){
+  const canvas = document.createElement('canvas');
+  canvas.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;pointer-events:none;z-index:9999;';
+  canvas.width = window.innerWidth; canvas.height = window.innerHeight;
+  document.body.appendChild(canvas);
+  const ctx = canvas.getContext('2d');
+  const colors = ['#C1443C','#B8862E','#3E7A4E','#2B3A55','#FBF9F4'];
+  const particles = Array.from({length: 130}, () => ({
+    x: Math.random()*canvas.width,
+    y: -20 - Math.random()*canvas.height*0.25,
+    w: 5 + Math.random()*4,
+    h: 3 + Math.random()*3,
+    color: colors[Math.floor(Math.random()*colors.length)],
+    vx: (Math.random()-0.5)*2.2,
+    vy: 2.5 + Math.random()*3,
+    rot: Math.random()*Math.PI*2,
+    vrot: (Math.random()-0.5)*0.3,
+  }));
+  const start = performance.now();
+  const duration = 1900;
+  function frame(now){
+    const elapsed = now - start;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    particles.forEach(p => {
+      p.x += p.vx; p.y += p.vy; p.vy += 0.035; p.rot += p.vrot;
+      ctx.save();
+      ctx.globalAlpha = elapsed > duration-400 ? Math.max(0, (duration-elapsed)/400) : 1;
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(-p.w/2, -p.h/2, p.w, p.h);
+      ctx.restore();
+    });
+    if(elapsed < duration) requestAnimationFrame(frame);
+    else canvas.remove();
+  }
+  if(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches){ canvas.remove(); return; }
+  requestAnimationFrame(frame);
+}
+// Called from every task-save handler (regular TNA rows and BOM/material rows) right
+// after the mutation and re-render — pulses the row's badge the moment a task first
+// becomes Done/Approved, and fires the confetti burst the moment that save is what
+// tips the whole order over to 100% complete. wasResolved/wasFullyDone are snapshots
+// the caller takes BEFORE mutating task.status, so this can tell a genuine transition
+// apart from re-saving something already finished.
+function celebrateTaskSave(order, task, wasResolved, wasFullyDone){
+  if(!wasResolved && SUCCESS_STATUSES.includes(task.status)){
+    const anchor = document.querySelector(`[data-save-task-row="${task.id}"], [data-save-bom-row="${task.id}"]`);
+    const anchorRow = anchor ? anchor.closest('tr') : null;
+    const badge = anchorRow ? anchorRow.querySelector('.badge') : null;
+    if(badge) badge.classList.add('badge-pop');
+  }
+  if(!wasFullyDone && isOrderFullyDone(order)) celebrateOrderComplete();
+}
+
 function statusOptionsHtml(current){
   return STATUS_OPTIONS.map(s=>`<option value="${s}" ${current===s?'selected':''}>${s}</option>`).join('');
 }
@@ -1596,24 +1699,59 @@ function allTasksScoped(){
 function renderTabContent(){
   const el = document.getElementById('tabContent');
   try{
-    if(!isManagerOrAdmin()){ el.innerHTML = renderMyTasks(); attachTabEvents(); return; }
+    if(!isManagerOrAdmin()){ el.innerHTML = renderMyTasks(); attachTabEvents(); applyTabFadeIn(el); return; }
     const allowed = userTabAccess(getActiveUser());
     if(!allowed.includes(currentTab)) currentTab = allowed[0] || 'dashboard';
     if(allowed.length===0){
       el.innerHTML = emptyState('people', "Your admin hasn't given you access to any screens yet. Ask them to update your access under Buyers & Team.");
       return;
     }
-    if(currentTab==='dashboard'){ el.innerHTML = renderDashboard(); initDashboardCharts(); }
+    if(currentTab==='dashboard'){ el.innerHTML = renderDashboard(); initDashboardCharts(); animateKpiNumbers(); }
     else if(currentTab==='orders') el.innerHTML = renderOrders();
     else if(currentTab==='performance'){ el.innerHTML = renderPerformance(); initPerformanceCharts(); }
     else if(currentTab==='team') el.innerHTML = renderTeam();
     else if(currentTab==='templates') el.innerHTML = renderTemplates();
     else if(currentTab==='notify') el.innerHTML = renderNotify();
-    else { el.innerHTML = renderDashboard(); initDashboardCharts(); }
+    else { el.innerHTML = renderDashboard(); initDashboardCharts(); animateKpiNumbers(); }
     attachTabEvents();
+    applyTabFadeIn(el);
   }catch(err){
     showRenderError(el, err);
   }
+}
+// Fades the tab content in, but only right after a genuine tab switch (see
+// tabJustSwitched) — every other renderTabContent() call (filter changes, saves,
+// keystrokes) leaves it alone so the UI doesn't flash on every edit.
+function applyTabFadeIn(el){
+  if(!tabJustSwitched) return;
+  tabJustSwitched = false;
+  el.classList.remove('tab-fade-in');
+  void el.offsetWidth; // force reflow so the animation restarts even if the class never left
+  el.classList.add('tab-fade-in');
+}
+// Animates each Dashboard KPI tile's number counting up from 0 on render, instead of
+// just appearing — cheap, automatic, and runs on every dashboard render (including
+// filter changes), so the numbers visibly "answer" a filter tweak rather than
+// silently snapping to a new value.
+function animateKpiNumbers(){
+  document.querySelectorAll('.kpi-grid .num').forEach(el => {
+    const text = el.textContent.trim();
+    const match = text.match(/^-?\d+(\.\d+)?/);
+    if(!match) return; // e.g. "—" — nothing numeric to animate
+    const target = parseFloat(match[0]);
+    const suffix = text.slice(match[0].length);
+    if(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches){ return; }
+    const duration = 550;
+    const start = performance.now();
+    function frame(now){
+      const t = Math.min(1, (now-start)/duration);
+      const eased = 1 - Math.pow(1-t, 3);
+      el.textContent = Math.round(target*eased) + suffix;
+      if(t<1) requestAnimationFrame(frame);
+      else el.textContent = target + suffix;
+    }
+    requestAnimationFrame(frame);
+  });
 }
 
 /* ---- Alerts ---- */
@@ -1917,6 +2055,19 @@ function renderDashboard(){
     </div>
   </div>` : ''}
 
+  ${(() => {
+    const workload = dashboardPersonWorkload(all);
+    if(workload.length===0) return '';
+    return `<div class="panel">
+    <div class="flex-between">
+      <h2 style="margin:0;">Team workload</h2>
+      <span class="hint" style="font-family:'IBM Plex Mono',monospace;">Effort-days of open work, not just task count</span>
+    </div>
+    <p class="desc">Each person's currently open work, weighted by how many person-days each task actually takes (set per task in Task Templates) rather than a raw task count — a fairer picture to bring to management than "who has the most tasks." Include this panel in <strong>Export PDF</strong> above to share it as-is.</p>
+    <div style="position:relative;height:${Math.min(560, Math.max(160, workload.length*32))}px;"><canvas id="dashWorkloadChart"></canvas></div>
+  </div>`;
+  })()}
+
   ${buyerCards ? `<div class="panel">
     <h2>Buyer overview</h2>
     <p class="desc">Red/amber/green health per buyer, at a glance — the same way a production planning board flags what needs attention first.</p>
@@ -1961,6 +2112,15 @@ function generateDashboardInsights(orders, all){
 
   const dueSoonCount = all.filter(x => isOpenTask(x.task) && taskStatusComputed(x.task)!=='Overdue' && daysBetween(today(), opDate(x.task))<=3).length;
   if(dueSoonCount>=5) insights.push({level:'watch', text:`${dueSoonCount} tasks fall due within the next 3 days — a busy stretch coming up.`});
+
+  const workload = dashboardPersonWorkload(all);
+  if(workload.length>=2){
+    const rest = workload.slice(1);
+    const restAvg = rest.reduce((s,e)=>s+e.total,0) / rest.length;
+    if(workload[0].total>=3 && workload[0].total >= restAvg*1.5){
+      insights.push({level:'watch', text:`${userName(workload[0].userId)} is carrying ${workload[0].total} effort-day${workload[0].total!==1?'s':''} of open work — noticeably more than the rest of the team (avg ${Math.round(restAvg*10)/10}). Worth checking if work needs redistributing.`});
+    }
+  }
 
   const cleanBuyers = Object.entries(buyerRag).filter(([,c]) => c.total>0 && c.red===0 && c.amber===0).sort((a,b)=>b[1].total-a[1].total);
   if(cleanBuyers.length>0){
@@ -2011,6 +2171,28 @@ function dashboardDeptWorkload(all){
     else if(isOpenTask(x.task)) map[d].onTrack++;
   });
   return DEPARTMENTS.map(d => ({dept:d, ...map[d]})).filter(e => e.overdue+e.dueSoon+e.onTrack+e.done>0);
+}
+// Per-person open workload, weighted by each task's effort (person-days), not just
+// task count — a task's effortDays comes from its template (see Task Templates);
+// anything without one (older data, ad-hoc BOM/material lines) falls back to 1 so
+// it still counts instead of silently vanishing from the total. Sorted heaviest
+// first, capped to the busiest 15 people so the chart stays readable.
+function dashboardPersonWorkload(all){
+  const map = new Map();
+  all.forEach(x => {
+    if(!isOpenTask(x.task) || !x.task.assignedTo) return;
+    const uid = x.task.assignedTo;
+    if(!map.has(uid)) map.set(uid, {userId:uid, overdue:0, dueSoon:0, onTrack:0});
+    const e = map.get(uid);
+    const effort = x.task.effortDays || 1;
+    if(taskStatusComputed(x.task)==='Overdue') e.overdue += effort;
+    else if(daysBetween(today(), opDate(x.task))<=3) e.dueSoon += effort;
+    else e.onTrack += effort;
+  });
+  return Array.from(map.values())
+    .map(e => ({...e, total: e.overdue+e.dueSoon+e.onTrack}))
+    .sort((a,b) => b.total-a.total)
+    .slice(0,15);
 }
 // Open-task counts bucketed into the next 6 calendar weeks (Mon–Sun, starting this
 // week) — a capacity look-ahead so a heavy week can be spotted before it arrives.
@@ -2182,6 +2364,34 @@ function initDashboardAdvancedCharts(){
         scales: {
           x: { grid: { display: false }, ticks: { font: chartBaseFont(), color: '#6B7385' } },
           y: { beginAtZero: true, ticks: { precision: 0, font: chartBaseFont(), color: '#6B7385' }, grid: { color: '#EFEBE0' } }
+        }
+      }
+    });
+  }
+
+  const workloadCanvas = document.getElementById('dashWorkloadChart');
+  destroyChart('dashWorkloadChart');
+  if(workloadCanvas){
+    const workload = dashboardPersonWorkload(all);
+    chartInstances.dashWorkloadChart = new Chart(workloadCanvas, {
+      type: 'bar',
+      data: {
+        labels: workload.map(e => userName(e.userId)),
+        datasets: [
+          { label: 'Overdue', data: workload.map(e=>e.overdue), backgroundColor: '#C1443C' },
+          { label: 'Due soon', data: workload.map(e=>e.dueSoon), backgroundColor: '#B8862E' },
+          { label: 'On track', data: workload.map(e=>e.onTrack), backgroundColor: '#8B97AF' },
+        ]
+      },
+      options: {
+        indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'bottom', labels: { font: chartBaseFont(), color: '#2B3A55', usePointStyle: true, padding: 12 } },
+          tooltip: { callbacks: { footer: items => { const e = workload[items[0].dataIndex]; return `Total: ${e.total} effort-day${e.total!==1?'s':''}`; } } }
+        },
+        scales: {
+          x: { stacked: true, title: { display: true, text: 'Effort-days of open work', font: chartBaseFont(), color: '#6B7385' }, ticks: { precision: 0, font: chartBaseFont(), color: '#6B7385' }, grid: { color: '#EFEBE0' } },
+          y: { stacked: true, ticks: { font: chartBaseFont(), color: '#2B3A55' }, grid: { display: false } }
         }
       }
     });
@@ -3033,6 +3243,7 @@ function renderTemplates(){
           <td><input class="tpl-name-input mono" data-set="${set.id}" data-tpl="${t.id}" value="${t.name.replace(/"/g,'&quot;')}" style="min-width:220px;"></td>
           <td><select class="tpl-dept-select" data-set="${set.id}" data-tpl="${t.id}">${DEPARTMENTS.map(d=>`<option value="${d}" ${t.dept===d?'selected':''}>${d}</option>`).join('')}</select></td>
           <td><input class="tpl-offset-input mono" data-set="${set.id}" data-tpl="${t.id}" type="number" value="${t.offset}" style="width:90px;display:inline-block;"> days before PCD</td>
+          <td><input class="tpl-effort-input mono" data-set="${set.id}" data-tpl="${t.id}" type="number" min="0" step="0.5" value="${t.effort??1}" style="width:70px;display:inline-block;" title="Estimated person-days of actual work"></td>
           <td><select class="tpl-dependson-select" data-set="${set.id}" data-tpl="${t.id}" style="min-width:160px;">${templateDependsOnOptionsHtml(set, t.id, t.dependsOn)}</select></td>
           <td style="text-align:right;white-space:nowrap;">
             <button class="btn small" data-save-tpl-row="${t.id}" data-set="${set.id}">Save</button>
@@ -3045,6 +3256,7 @@ function renderTemplates(){
         <td>${t.name}</td>
         <td><span class="dept-tag dept-${t.dept}">${t.dept}</span></td>
         <td class="mono">${t.offset} days before PCD</td>
+        <td class="mono">${t.effort??1}</td>
         <td>${dependsOnTask ? dependsOnTask.name : '—'}</td>
         <td></td>
       </tr>`;
@@ -3066,16 +3278,17 @@ function renderTemplates(){
       ${expanded ? `
         <div class="divider"></div>
         ${isAdmin() ? `
-        <div class="grid-cols" style="grid-template-columns:2fr 1fr 1fr 1.5fr auto;">
+        <div class="grid-cols" style="grid-template-columns:2fr 1fr 1fr 1fr 1.5fr auto;">
           <div class="field"><label>Task name</label><input id="newTplName_${set.id}" placeholder="e.g. Buyer PP Approval"></div>
           <div class="field"><label>Department</label><select id="newTplDept_${set.id}">${DEPARTMENTS.map(d=>`<option value="${d}">${d}</option>`).join('')}</select></div>
           <div class="field"><label>Days before PCD</label><input id="newTplOffset_${set.id}" type="number" placeholder="e.g. 40"></div>
+          <div class="field"><label>Effort (person-days)</label><input id="newTplEffort_${set.id}" type="number" min="0" step="0.5" placeholder="e.g. 1"></div>
           <div class="field"><label>Depends on</label><select id="newTplDependsOn_${set.id}">${templateDependsOnOptionsHtml(set, null, null)}</select></div>
           <div style="display:flex;align-items:flex-end;"><button class="btn" data-add-template-to-set="${set.id}">Add task</button></div>
         </div>
-        <div class="hint" style="margin-top:6px;">Setting "Depends on" means every order made from this template will automatically push that task's Expected Date if the one it depends on finishes late — e.g. PP Sample depending on Fit Approval.</div>
+        <div class="hint" style="margin-top:6px;">Setting "Depends on" means every order made from this template will automatically push that task's Expected Date if the one it depends on finishes late — e.g. PP Sample depending on Fit Approval. Effort is how many person-days this task actually takes to do — separate from its calendar timing — and is what the Dashboard's Team workload chart is weighted by.</div>
         <div class="divider"></div>` : ''}
-        <table><thead><tr><th>Task</th><th>Dept</th><th>Timing</th><th>Depends on</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+        <table><thead><tr><th>Task</th><th>Dept</th><th>Timing</th><th>Effort</th><th>Depends on</th><th></th></tr></thead><tbody>${rows}</tbody></table>
         ${isAdmin() ? renderTemplateBulkAddSection(set, bulkPreviewForThisSet) : ''}
       ` : ''}
     </div>`;
@@ -3514,6 +3727,7 @@ function attachTabEvents(){
   document.querySelectorAll('.tab').forEach(el => {
     el.addEventListener('click', () => {
       currentTab = el.dataset.tab;
+      tabJustSwitched = true;
       renderTabContent();
       document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
       el.classList.add('active');
@@ -3675,6 +3889,8 @@ function attachTabEvents(){
       const actualInp = row.querySelector('.actualdate-input');
       const receivedInp = row.querySelector('.receivedqty-input');
       const remarksInp = row.querySelector('.remarks-input');
+      const wasResolved = SUCCESS_STATUSES.includes(task.status);
+      const wasFullyDone = isOrderFullyDone(order);
       if(statusSel) task.status = statusSel.value;
       if(assigneeSel) task.assignedTo = assigneeSel.value || null;
       if(expInp && expInp.value){
@@ -3698,6 +3914,7 @@ function attachTabEvents(){
       if(RESOLVED_STATUSES.includes(task.status) && task.status!=='N/A' && !task.actualDate) task.actualDate = today();
       const pushedTasks = cascadeTaskDelay(order, task);
       renderTabContent();
+      celebrateTaskSave(order, task, wasResolved, wasFullyDone);
       showToast(pushedTasks.length ? `Saved — pushed ${pushedTasks.length} dependent task date${pushedTasks.length!==1?'s':''}` : 'Saved');
       saveData();
     });
@@ -3729,7 +3946,7 @@ function attachTabEvents(){
       return {
         id: taskIdMap[t.id], templateId: t.id, name: t.name, dept: t.dept,
         plannedDate: systemDate, expectedDate: systemDate, expectedDateManuallySet: false,
-        offsetDays: t.offset, status: 'Pending',
+        offsetDays: t.offset, effortDays: t.effort || 1, status: 'Pending',
         assignedTo: pickDefaultAssignee(buyerId, t.dept, t.name),
         actualDate: null, remarks: '', history: [],
         materialType: null, requiredQty: null, receivedQty: null,
@@ -4104,6 +4321,8 @@ function attachTabEvents(){
       const t = order.tasks.find(x=>x.id===btn.dataset.saveBomRow);
       const row = btn.closest('tr');
       const itemVal = row.querySelector('.bom-item-input').value.trim();
+      const wasResolved = SUCCESS_STATUSES.includes(t.status);
+      const wasFullyDone = isOrderFullyDone(order);
       t.materialType = itemVal;
       t.requiredQty = (v => v===''?null:parseFloat(v))(row.querySelector('.bom-qty-input').value);
       t.unit = row.querySelector('.bom-unit-input').value.trim();
@@ -4120,7 +4339,9 @@ function attachTabEvents(){
       const remarksField = row.querySelector('.bom-remarks-input');
       if(remarksField) t.remarks = remarksField.value;
       if(itemVal) t.name = `${itemVal} Inward (GRN)`;
-      renderTabContent(); showToast('BOM item saved'); saveData();
+      renderTabContent();
+      celebrateTaskSave(order, t, wasResolved, wasFullyDone);
+      showToast('BOM item saved'); saveData();
     });
   });
 
@@ -4133,11 +4354,14 @@ function attachTabEvents(){
       const row = btn.closest('tr');
       const nameVal = row.querySelector('.tpl-name-input').value.trim();
       const offsetVal = parseInt(row.querySelector('.tpl-offset-input').value, 10);
+      const effortVal = parseFloat(row.querySelector('.tpl-effort-input').value);
       if(!nameVal){ showToast("Task name can't be empty"); return; }
       if(isNaN(offsetVal)){ showToast('Enter a valid number of days'); return; }
+      if(isNaN(effortVal) || effortVal<0){ showToast('Enter a valid effort (person-days)'); return; }
       tpl.name = nameVal;
       tpl.dept = row.querySelector('.tpl-dept-select').value;
       tpl.offset = offsetVal;
+      tpl.effort = effortVal;
       const dependsOnSel = row.querySelector('.tpl-dependson-select');
       tpl.dependsOn = (dependsOnSel && dependsOnSel.value) ? dependsOnSel.value : null;
       renderTabContent(); showToast('Task saved'); saveData();
@@ -4276,10 +4500,13 @@ function attachTabEvents(){
       const name = document.getElementById('newTplName_'+setId).value.trim();
       const dept = document.getElementById('newTplDept_'+setId).value;
       const offset = parseInt(document.getElementById('newTplOffset_'+setId).value, 10);
+      const effortRaw = document.getElementById('newTplEffort_'+setId).value;
+      const effort = effortRaw==='' ? 1 : parseFloat(effortRaw);
       const dependsOnEl = document.getElementById('newTplDependsOn_'+setId);
       const dependsOn = (dependsOnEl && dependsOnEl.value) ? dependsOnEl.value : null;
       if(!name || isNaN(offset)){ showToast('Enter a task name and offset'); return; }
-      set.tasks.push({id: uid('tpl'), name, dept, offset, dependsOn});
+      if(isNaN(effort) || effort<0){ showToast('Enter a valid effort (person-days)'); return; }
+      set.tasks.push({id: uid('tpl'), name, dept, offset, effort, dependsOn});
       renderTabContent(); saveData();
     });
   });
