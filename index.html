@@ -815,6 +815,11 @@ function loadFirebaseMessaging(){
 
 function notifDismissed(){ try{ return !!localStorage.getItem('tna_notif_dismissed'); }catch(e){ return false; } }
 function setNotifDismissed(){ try{ localStorage.setItem('tna_notif_dismissed','1'); }catch(e){} }
+// True once THIS device has successfully registered a push token (enablePushNotifications).
+// Used to skip the separate local desktop-alert poll below once push already covers
+// the same ground with more detail (which task, not just a count) and even when this
+// tab/browser is closed — so a push-enabled user doesn't get double-notified.
+function pushRegisteredOnThisDevice(){ try{ return !!localStorage.getItem('tna_push_registered'); }catch(e){ return false; } }
 
 async function enablePushNotifications(){
   if(typeof Notification === 'undefined'){ showToast('This browser does not support notifications'); return; }
@@ -841,6 +846,7 @@ async function enablePushNotifications(){
       body: JSON.stringify({ userId: u.id, token, deviceInfo: navigator.userAgent })
     });
     setNotifDismissed();
+    try{ localStorage.setItem('tna_push_registered', '1'); }catch(e){}
     showToast('Notifications enabled');
     render();
   }catch(err){
@@ -1439,6 +1445,8 @@ function render(){
     if(enableBtn) enableBtn.addEventListener('click', enablePushNotifications);
     const dismissBtn = document.getElementById('dismissPushBtn');
     if(dismissBtn) dismissBtn.addEventListener('click', () => { setNotifDismissed(); render(); });
+    const snoozeBtn = document.getElementById('snoozeAlertBtn');
+    if(snoozeBtn) snoozeBtn.addEventListener('click', () => { snoozeAlertForToday(); render(); });
   }catch(err){
     showRenderError(app, err);
   }
@@ -1592,26 +1600,31 @@ function myOverdueOpenTasks(){
   const open = all.filter(x=>isOpenTask(x.task));
   return {overdue, open};
 }
+function alertSnoozedToday(){
+  try{ return localStorage.getItem('tna_alert_snoozed_date') === today(); }catch(e){ return false; }
+}
+function snoozeAlertForToday(){
+  try{ localStorage.setItem('tna_alert_snoozed_date', today()); }catch(e){}
+}
 function renderAlertBanner(){
   const u = getActiveUser();
   const {overdue, open} = myOverdueOpenTasks();
   if(overdue.length===0) return '';
+  if(alertSnoozedToday()) return '';
+  // The separate "enable desktop alerts" opt-in used to live here as its own button,
+  // duplicating the one already offered globally by notificationBanner() — same
+  // browser permission, two different-looking prompts. One prompt, one flow now.
   const notifHint = (typeof Notification !== 'undefined' && Notification.permission === 'default')
-    ? ` <button class="btn ghost small" id="enableAlertsBtn" style="margin-left:8px;">Enable desktop alerts</button>` : '';
-  return `<div class="lock-note" style="background:var(--thread-red-dim);border-color:var(--thread-red);color:var(--thread-red);">
-    ⚠ ${u.name.split(' ')[0]}, you have ${overdue.length} overdue task${overdue.length>1?'s':''} out of ${open.length} open.
-    ${isManagerOrAdmin() ? 'Open Notifications to send reminders.' : 'Please update them as soon as you can.'}${notifHint}
+    ? ` Enable notifications above so TNA can tell you about this without needing the app open.` : '';
+  return `<div class="lock-note" style="background:var(--thread-red-dim);border-color:var(--thread-red);color:var(--thread-red);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+    <span>⚠ ${u.name.split(' ')[0]}, you have ${overdue.length} overdue task${overdue.length>1?'s':''} out of ${open.length} open.
+    ${isManagerOrAdmin() ? 'Open Notifications to send reminders.' : 'Please update them as soon as you can.'}${notifHint}</span>
+    <button class="btn ghost small" id="snoozeAlertBtn" style="flex-shrink:0;">Remind me later today</button>
   </div>`;
 }
 let alertIntervalStarted = false;
 let lastNotifiedOverdueCount = -1;
 function setupBrowserAlerts(){
-  const btn = document.getElementById('enableAlertsBtn');
-  if(btn) btn.addEventListener('click', () => {
-    if(typeof Notification !== 'undefined'){
-      Notification.requestPermission().then(perm => { if(perm==='granted'){ showToast('Desktop alerts enabled'); checkAndNotify(); } });
-    }
-  });
   if(!alertIntervalStarted){
     alertIntervalStarted = true;
     checkAndNotify();
@@ -1620,6 +1633,11 @@ function setupBrowserAlerts(){
 }
 function checkAndNotify(){
   if(typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+  // Push notifications already cover this — with more detail (which task, not just a
+  // count) and even when this tab/browser is closed. Once this device has a push
+  // token registered, this local poll would just be a duplicate, less useful ping —
+  // so it only runs as a fallback for whenever push setup hasn't succeeded here.
+  if(pushRegisteredOnThisDevice()) return;
   const {overdue} = myOverdueOpenTasks();
   if(overdue.length > 0 && overdue.length !== lastNotifiedOverdueCount){
     lastNotifiedOverdueCount = overdue.length;
@@ -3297,17 +3315,22 @@ function renderNotify(){
   }).join('');
 
   return `
+  <div class="panel" style="background:var(--green-soft);border-color:var(--green);">
+    <h2 style="color:var(--green);">✓ Automatic reminders are already running</h2>
+    <p class="desc" style="color:var(--ink);">Nobody needs to click anything below for the normal reminder cycle to work. Every day, the system on its own: sends a push notification and one daily email to each person for tasks due in 3 days, due tomorrow, due today, or overdue (re-sent daily for as long as a task stays overdue) — CC'ing that buyer's manager on the email. A task overdue 5+ days or more also triggers a direct escalation email to the manager. PPC additionally gets a BOM status PDF every Saturday. The two tools below are for a manual, right-now nudge — use them when you don't want to wait for the next automatic cycle, not because the automatic one isn't running.</p>
+  </div>
+
   <div class="panel" style="border-color:var(--thread-red-dim);">
-    <h2>⚠ 3-day alert — Merchandising</h2>
-    <p class="desc">Every Merchandising task due within 3 days or overdue, one alert per person, automatically CC'ing that buyer's Manager. This is the alert you asked to always go to Merchandiser + Merchandising Manager together.</p>
+    <h2>⚠ Manual: 3-day alert — Merchandising</h2>
+    <p class="desc">Every Merchandising task due within 3 days or overdue, one alert per person, automatically CC'ing that buyer's Manager. Use this to send the same alert right now instead of waiting for the next automatic cycle.</p>
     ${merchAlertHtml || '<div class="hint">Nothing due within 3 days for Merchandising right now.</div>'}
   </div>
 
   <div class="panel">
-    <h2>All notifications</h2>
+    <h2>Manual: send a nudge to anyone</h2>
     <p class="desc">Every open task assigned to each person in your buyers, overdue ones flagged first.</p>
     <div class="hint" style="margin-bottom:14px;">
-      <strong>Send email</strong> / <strong>Send on WhatsApp</strong> open a pre-filled message in your own app — one click, you hit send. This still isn't automatic delivery without you clicking — that needs a connected email service running on a schedule, which is a separate step we've discussed.
+      <strong>Send email</strong> / <strong>Send on WhatsApp</strong> open a pre-filled message in your own email/WhatsApp app for you to review and send — a manual, immediate alternative to the automatic reminders above, not a replacement for them.
     </div>
     ${previews || emptyState('mail', 'No open tasks assigned yet.')}
   </div>`;
