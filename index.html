@@ -3164,7 +3164,7 @@ function renderPerformance(){
   return `
   <div class="panel">
     <h2>Performance</h2>
-    <p class="desc">Built from actual task dates in this system — useful as one input for incentive, salary, or increment reviews, not the whole story. A delay isn't always the person's fault (late buyer approval, mill delay, etc.) — check the Remarks on their tasks before using this for pay decisions.</p>
+    <p class="desc">On-time delivery and completion, based on task dates in this system.</p>
     <details style="margin-top:6px;">
       <summary style="cursor:pointer;font-size:13px;font-weight:600;color:var(--ink-soft);">How is the score calculated?</summary>
       <p class="hint" style="margin-top:8px;">Score = (on-time % × 0.6) + (completion % × 0.4) − (3 points per task currently overdue), floored at 0. Only Done/Approved tasks count toward completion — Rejected and N/A are excluded so they don't distort the number. If nothing is completed yet, on-time % defaults to 100 so a brand-new assignment doesn't start out penalized.</p>
