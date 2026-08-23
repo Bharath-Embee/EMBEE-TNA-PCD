@@ -1825,12 +1825,11 @@ function renderDashboard(){
   const doneTasks = all.filter(x => SUCCESS_STATUSES.includes(x.task.status));
   const onTimeDone = doneTasks.filter(x => x.task.actualDate && x.task.actualDate <= opDate(x.task));
   const onTimePct = doneTasks.length ? Math.round((onTimeDone.length/doneTasks.length)*100) : null;
+  const atRiskOrders = orders.filter(o => orderRAG(o)==='red').length;
   const members = scopedUsers().filter(u=>u.role==='member');
 
   const personOptions = `<option value="all">Everyone</option>` + groupedUserOptionsHtml(members, dashboardFilters.personId==='all'?null:dashboardFilters.personId);
   const buyerOptions = `<option value="all">All buyers</option>` + scopedBuyers().map(b=>`<option value="${b.id}" ${dashboardFilters.buyerId===b.id?'selected':''}>${b.name}</option>`).join('');
-
-  let filtered = all.filter(x => isOpenTask(x.task)).sort((a,b)=> opDate(a.task) < opDate(b.task) ? -1 : 1);
 
   const buyerCards = scopedBuyers().filter(b => dashboardFilters.buyerId==='all' || dashboardFilters.buyerId===b.id).map(b => {
     const bOrders = orders.filter(o=>o.buyerId===b.id);
@@ -1848,13 +1847,15 @@ function renderDashboard(){
     </div>`;
   }).filter(Boolean).join('');
 
+  const insights = generateDashboardInsights(orders, all);
+
   return `
   <div class="panel">
     <div class="flex-between">
       <h2 style="margin:0;">Filter</h2>
       ${dashboardFiltersActive() ? `<button class="btn ghost small" id="clearDashboardFiltersBtn">Clear filters</button>` : ''}
     </div>
-    <p class="desc">Narrow everything below — KPIs, buyer overview, style performance, and the task board — to measure exactly what you need, e.g. one person's performance on one buyer this season.</p>
+    <p class="desc">Narrow everything below — KPIs, insights, and charts — to measure exactly what you need, e.g. one person's performance on one buyer this season.</p>
     <div class="grid-cols" style="grid-template-columns:repeat(6,1fr);">
       <div class="field"><label>Buyer</label><select id="dashBuyerFilter">${buyerOptions}</select></div>
       <div class="field"><label>Person</label><select id="dashPersonFilter">${personOptions}</select></div>
@@ -1872,14 +1873,26 @@ function renderDashboard(){
   <div class="kpi-grid">
     <div class="stat alert"><div class="num">${overdue.length}</div><div class="lbl">Overdue tasks</div></div>
     <div class="stat"><div class="num">${dueSoon.length}</div><div class="lbl">Due within 3 days</div></div>
+    <div class="stat alert"><div class="num">${atRiskOrders}</div><div class="lbl">Orders at risk</div></div>
     <div class="stat"><div class="num">${orders.length}</div><div class="lbl">Active orders</div></div>
     <div class="stat"><div class="num">${doneTasks.length}</div><div class="lbl">Tasks completed</div></div>
     <div class="stat"><div class="num">${onTimePct===null?'—':onTimePct+'%'}</div><div class="lbl">Completed on time</div></div>
   </div>
 
+  <div class="panel">
+    <div class="flex-between">
+      <h2 style="margin:0;">Smart insights</h2>
+      <span class="hint" style="font-family:'IBM Plex Mono',monospace;">Auto-generated from this filter</span>
+    </div>
+    <p class="desc">Patterns pulled automatically from the data below — a starting point for where to look first, not a verdict.</p>
+    <div style="display:flex;flex-direction:column;gap:8px;">
+      ${insights.map(insightRowHtml).join('')}
+    </div>
+  </div>
+
   ${all.length>0 ? `<div class="panel">
     <h2>Visual overview</h2>
-    <p class="desc">Order health and task pipeline for everything matching your current filter.</p>
+    <p class="desc">Order health, task pipeline, buyer risk, department load, and the next six weeks of demand — everything matching your current filter.</p>
     <div class="grid-cols" style="grid-template-columns:1fr 1fr;align-items:start;">
       <div>
         <div class="hint" style="margin-bottom:8px;font-weight:600;color:var(--ink-soft);">Orders by health</div>
@@ -1889,6 +1902,18 @@ function renderDashboard(){
         <div class="hint" style="margin-bottom:8px;font-weight:600;color:var(--ink-soft);">Tasks by stage</div>
         <div style="position:relative;height:230px;"><canvas id="dashTaskChart"></canvas></div>
       </div>
+      <div>
+        <div class="hint" style="margin-bottom:8px;font-weight:600;color:var(--ink-soft);">Buyer risk matrix — on-time % vs. overdue tasks, bubble size = orders</div>
+        ${orders.length>0 ? `<div style="position:relative;height:260px;"><canvas id="dashBuyerRiskChart"></canvas></div>` : emptyState('chart', 'No orders match this filter.')}
+      </div>
+      <div>
+        <div class="hint" style="margin-bottom:8px;font-weight:600;color:var(--ink-soft);">Department workload</div>
+        <div style="position:relative;height:260px;"><canvas id="dashDeptChart"></canvas></div>
+      </div>
+      <div style="grid-column:1/-1;">
+        <div class="hint" style="margin-bottom:8px;font-weight:600;color:var(--ink-soft);">Upcoming workload — open tasks by week</div>
+        <div style="position:relative;height:220px;"><canvas id="dashUpcomingChart"></canvas></div>
+      </div>
     </div>
   </div>` : ''}
 
@@ -1896,50 +1921,119 @@ function renderDashboard(){
     <h2>Buyer overview</h2>
     <p class="desc">Red/amber/green health per buyer, at a glance — the same way a production planning board flags what needs attention first.</p>
     <div class="buyer-overview">${buyerCards}</div>
-  </div>` : ''}
+  </div>` : ''}`;
+}
 
-  <div class="panel">
-    <h2>Style-wise performance</h2>
-    <p class="desc">Every matching order's performance to date — on-time completion weighted with current overdue tasks. Green means on track, orange means watch it, red means it needs attention now.</p>
-    ${orders.length===0 ? emptyState('chart', 'No orders match this filter.') : `
-    <table>
-      <thead><tr><th>Buyer</th><th>Style</th><th>Season</th><th>Item</th><th>Qty</th><th>Merchandising head</th><th>Marketing head</th><th>Merchandiser</th><th>Performance</th></tr></thead>
-      <tbody>
-        ${orders.slice().sort((a,b)=> orderPerformance(a).score - orderPerformance(b).score).map(o => {
-          const perf = orderPerformance(o);
-          const tier = performanceTier(perf.score);
-          return `<tr>
-            <td>${buyerName(o.buyerId)}</td>
-            <td>${o.styleNo}</td>
-            <td>${o.season || '—'}</td>
-            <td>${o.item}</td>
-            <td class="mono">${o.qty || '—'}</td>
-            <td>${headsForBuyerByKeyword(o.buyerId, 'merchandising')}</td>
-            <td>${headsForBuyerByKeyword(o.buyerId, 'marketing')}</td>
-            <td>${merchandisersForOrder(o)}</td>
-            <td><span class="badge ${tier.cls}">${tier.label} — ${perf.score}%</span></td>
-          </tr>`;
-        }).join('')}
-      </tbody>
-    </table>`}
-  </div>
+// Rule-based "smart insights" for the dashboard — surfaces the handful of patterns
+// worth a human's attention out of everything matching the current filter, instead
+// of making someone read every chart to notice them. Deliberately deterministic
+// (no external model call) so it's instant, free, and always explainable from the
+// same data the charts below are drawn from.
+function generateDashboardInsights(orders, all){
+  const insights = [];
 
-  <div class="panel">
-    <div class="flex-between">
-      <div>
-        <h2>Task board</h2>
-        <p class="desc">${isAdmin() ? 'Every open task matching your filter.' : 'Every open task matching your filter, across your buyers.'} Team members only see their own tasks.</p>
-      </div>
-    </div>
-    ${filtered.length===0 ? emptyState('checklist', 'No open tasks for this filter. Nice.') : `
-    <table>
-      <thead><tr><th>Expected date</th><th>Task</th><th>Order</th><th>Buyer</th><th>Owner</th><th>Status</th><th>Remarks</th></tr></thead>
-      <tbody>${filtered.map(x => renderTaskRow(x.order, x.task)).join('')}</tbody>
-    </table>`}
+  const deptOverdue = {};
+  all.forEach(x => { if(taskStatusComputed(x.task)==='Overdue'){ const d = x.task.dept||'Unassigned'; deptOverdue[d] = (deptOverdue[d]||0)+1; } });
+  const worstDept = Object.entries(deptOverdue).sort((a,b)=>b[1]-a[1])[0];
+  if(worstDept) insights.push({level:'risk', text:`${worstDept[0]} is carrying the most overdue tasks right now (${worstDept[1]}) — likely bottleneck department.`});
+
+  const buyerRag = {};
+  orders.forEach(o => {
+    buyerRag[o.buyerId] = buyerRag[o.buyerId] || {red:0, amber:0, green:0, total:0};
+    buyerRag[o.buyerId][orderRAG(o)]++;
+    buyerRag[o.buyerId].total++;
+  });
+  const worstBuyerEntry = Object.entries(buyerRag).sort((a,b)=>b[1].red-a[1].red)[0];
+  if(worstBuyerEntry && worstBuyerEntry[1].red>0){
+    const [bid, c] = worstBuyerEntry;
+    insights.push({level:'risk', text:`${buyerName(bid)} has ${c.red} of ${c.total} order${c.total>1?'s':''} at risk — the buyer needing the closest attention.`});
+  }
+
+  const atRiskOrders = orders.filter(o => {
+    const open = o.tasks.filter(isOpenTask);
+    if(open.length===0) return false;
+    const daysLeft = daysBetween(today(), o.pcd);
+    return daysLeft>=0 && daysLeft<=14 && open.length>daysLeft;
+  });
+  if(atRiskOrders.length>0){
+    insights.push({level:'risk', text:`${atRiskOrders.length} style${atRiskOrders.length>1?'s':''} (e.g. ${atRiskOrders[0].styleNo}) ${atRiskOrders.length>1?'have':'has'} more open tasks left than days until PCD — pace needs to pick up to land on time.`});
+  }
+
+  const dueSoonCount = all.filter(x => isOpenTask(x.task) && taskStatusComputed(x.task)!=='Overdue' && daysBetween(today(), opDate(x.task))<=3).length;
+  if(dueSoonCount>=5) insights.push({level:'watch', text:`${dueSoonCount} tasks fall due within the next 3 days — a busy stretch coming up.`});
+
+  const cleanBuyers = Object.entries(buyerRag).filter(([,c]) => c.total>0 && c.red===0 && c.amber===0).sort((a,b)=>b[1].total-a[1].total);
+  if(cleanBuyers.length>0){
+    const [bid, c] = cleanBuyers[0];
+    insights.push({level:'good', text:`${buyerName(bid)} — all ${c.total} order${c.total>1?'s':''} on track, no risk flags.`});
+  }
+
+  if(insights.length===0) insights.push({level:'good', text:'No major risk patterns in the current filter — everything is tracking cleanly.'});
+  return insights.slice(0,5);
+}
+function insightRowHtml(i){
+  const dotClass = i.level==='risk' ? 'red' : i.level==='watch' ? 'amber' : 'green';
+  return `<div style="display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border-radius:8px;background:#fff;border:1px solid var(--line);">
+    <span class="rag-dot ${dotClass}" style="margin-top:4px;"></span>
+    <span style="font-size:13.5px;color:var(--ink-soft);line-height:1.5;">${i.text}</span>
   </div>`;
 }
 
-// Draws the two Dashboard charts into the canvases renderDashboard() just put in the
+// Per-buyer stats for the risk-matrix bubble chart, scoped to whatever orders the
+// dashboard filter currently returns (not the buyer's full order book) — so the
+// chart never disagrees with the KPIs and insights sitting right above it.
+function dashboardBuyerRiskData(orders){
+  const map = new Map();
+  orders.forEach(o => {
+    if(!map.has(o.buyerId)) map.set(o.buyerId, {buyerId:o.buyerId, orders:0, red:0, amber:0, green:0, tasks:[]});
+    const e = map.get(o.buyerId);
+    e.orders++;
+    e[orderRAG(o)]++;
+    o.tasks.forEach(t => e.tasks.push(t));
+  });
+  return Array.from(map.values()).map(e => {
+    const done = e.tasks.filter(t => SUCCESS_STATUSES.includes(t.status));
+    const onTime = done.filter(t => t.actualDate && t.actualDate<=opDate(t));
+    const overdueOpen = e.tasks.filter(t => taskStatusComputed(t)==='Overdue');
+    return { ...e, onTimeRate: done.length ? Math.round((onTime.length/done.length)*100) : 100, overdueOpen: overdueOpen.length };
+  });
+}
+// Open/due-soon/overdue/done counts per department, for the workload stacked bar.
+function dashboardDeptWorkload(all){
+  const map = {};
+  DEPARTMENTS.forEach(d => map[d] = {overdue:0, dueSoon:0, onTrack:0, done:0});
+  all.forEach(x => {
+    const d = x.task.dept;
+    if(!map[d]) return;
+    if(SUCCESS_STATUSES.includes(x.task.status)) map[d].done++;
+    else if(taskStatusComputed(x.task)==='Overdue') map[d].overdue++;
+    else if(isOpenTask(x.task) && daysBetween(today(), opDate(x.task))<=3) map[d].dueSoon++;
+    else if(isOpenTask(x.task)) map[d].onTrack++;
+  });
+  return DEPARTMENTS.map(d => ({dept:d, ...map[d]})).filter(e => e.overdue+e.dueSoon+e.onTrack+e.done>0);
+}
+// Open-task counts bucketed into the next 6 calendar weeks (Mon–Sun, starting this
+// week) — a capacity look-ahead so a heavy week can be spotted before it arrives.
+function dashboardUpcomingWeeks(all){
+  const dt = new Date(today()+'T00:00:00Z');
+  const dow = (dt.getUTCDay()+6)%7;
+  dt.setUTCDate(dt.getUTCDate()-dow);
+  const weekStart0 = dt.toISOString().slice(0,10);
+  const weeks = Array.from({length:6}, (_,i) => {
+    const start = addDays(weekStart0, i*7);
+    return { start, end: addDays(start,6), count:0 };
+  });
+  all.forEach(x => {
+    if(!isOpenTask(x.task)) return;
+    const d = opDate(x.task);
+    if(!d) return;
+    const wk = weeks.find(w => d>=w.start && d<=w.end);
+    if(wk) wk.count++;
+  });
+  return weeks;
+}
+
+// Draws all five Dashboard charts into the canvases renderDashboard() just put in the
 // DOM. Called after every dashboard render (see attachTabEvents) — recomputes from
 // the live filter state itself rather than taking numbers as arguments, since Chart.js
 // loads async and the user could switch tabs or change a filter before it resolves;
@@ -1948,7 +2042,10 @@ async function initDashboardCharts(){
   if(!document.getElementById('dashRagChart') && !document.getElementById('dashTaskChart')) return;
   const ok = await loadChartJsLib();
   if(!ok || !window.Chart) return;
-
+  initDashboardChartsCore();
+  initDashboardAdvancedCharts();
+}
+function initDashboardChartsCore(){
   const orders = dashboardFilteredOrders();
   const all = dashboardFilteredTasks();
   const overdue = all.filter(x => taskStatusComputed(x.task)==='Overdue');
@@ -2006,23 +2103,89 @@ async function initDashboardCharts(){
     });
   }
 }
+// The three "advanced" dashboard charts — buyer risk bubble, department workload,
+// and the 6-week upcoming-demand bar — kept in their own pass so a missing canvas
+// (e.g. this filter has no matching tasks) just skips that one chart instead of
+// short-circuiting the RAG/task-stage charts above.
+function initDashboardAdvancedCharts(){
+  const orders = dashboardFilteredOrders();
+  const all = dashboardFilteredTasks();
 
-function renderTaskRow(order, task){
-  const status = taskStatusComputed(task);
-  return `<tr>
-    <td class="mono">${fmtDate(opDate(task))}</td>
-    <td>${task.name} <span class="dept-tag dept-${task.dept}">${task.dept}</span></td>
-    <td>${order.styleNo} <span style="color:var(--muted);font-size:11.5px;">(${order.item})</span></td>
-    <td>${buyerName(order.buyerId)}</td>
-    <td>${userName(task.assignedTo)}</td>
-    <td>
-      <select class="status-select" data-order="${order.id}" data-task="${task.id}">
-        ${statusOptionsHtml(task.status)}
-      </select>
-      ${status==='Overdue' ? `<span class="badge overdue" style="margin-left:6px;">${statusDisplayText(task)}</span>` : status==='Rejected' ? '<span class="badge overdue" style="margin-left:6px;">Rejected</span>' : ''}
-    </td>
-    <td>${task.remarks ? task.remarks : '<span style="color:var(--muted);">—</span>'}</td>
-  </tr>`;
+  const riskCanvas = document.getElementById('dashBuyerRiskChart');
+  destroyChart('dashBuyerRiskChart');
+  if(riskCanvas){
+    const riskData = dashboardBuyerRiskData(orders);
+    chartInstances.dashBuyerRiskChart = new Chart(riskCanvas, {
+      type: 'bubble',
+      data: {
+        datasets: [{
+          label: 'Buyers',
+          data: riskData.map(e => ({ x: e.onTimeRate, y: e.overdueOpen, r: Math.max(7, Math.min(26, 7 + e.orders*2.5)) })),
+          backgroundColor: riskData.map(e => e.red>0 ? 'rgba(193,68,60,0.55)' : e.amber>0 ? 'rgba(184,134,46,0.55)' : 'rgba(62,122,78,0.55)'),
+          borderColor: riskData.map(e => e.red>0 ? '#C1443C' : e.amber>0 ? '#B8862E' : '#3E7A4E'),
+          borderWidth: 1.5
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: ctx => { const e = riskData[ctx.dataIndex]; return [` ${buyerName(e.buyerId)}`, ` On-time ${e.onTimeRate}% · Overdue ${e.overdueOpen} · Orders ${e.orders}`]; } } }
+        },
+        scales: {
+          x: { min: 0, max: 100, title: { display: true, text: 'On-time completion %', font: chartBaseFont(), color: '#6B7385' }, ticks: { font: chartBaseFont(), color: '#6B7385' }, grid: { color: '#EFEBE0' } },
+          y: { beginAtZero: true, title: { display: true, text: 'Overdue tasks', font: chartBaseFont(), color: '#6B7385' }, ticks: { precision: 0, font: chartBaseFont(), color: '#6B7385' }, grid: { color: '#EFEBE0' } }
+        }
+      }
+    });
+  }
+
+  const deptCanvas = document.getElementById('dashDeptChart');
+  destroyChart('dashDeptChart');
+  if(deptCanvas){
+    const deptData = dashboardDeptWorkload(all);
+    chartInstances.dashDeptChart = new Chart(deptCanvas, {
+      type: 'bar',
+      data: {
+        labels: deptData.map(d=>d.dept),
+        datasets: [
+          { label: 'Overdue', data: deptData.map(d=>d.overdue), backgroundColor: '#C1443C' },
+          { label: 'Due soon', data: deptData.map(d=>d.dueSoon), backgroundColor: '#B8862E' },
+          { label: 'On track', data: deptData.map(d=>d.onTrack), backgroundColor: '#8B97AF' },
+          { label: 'Done', data: deptData.map(d=>d.done), backgroundColor: '#3E7A4E' },
+        ]
+      },
+      options: {
+        indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { position: 'bottom', labels: { font: chartBaseFont(), color: '#2B3A55', usePointStyle: true, padding: 12 } } },
+        scales: {
+          x: { stacked: true, ticks: { precision: 0, font: chartBaseFont(), color: '#6B7385' }, grid: { color: '#EFEBE0' } },
+          y: { stacked: true, ticks: { font: chartBaseFont(), color: '#2B3A55' }, grid: { display: false } }
+        }
+      }
+    });
+  }
+
+  const upcomingCanvas = document.getElementById('dashUpcomingChart');
+  destroyChart('dashUpcomingChart');
+  if(upcomingCanvas){
+    const weeks = dashboardUpcomingWeeks(all);
+    chartInstances.dashUpcomingChart = new Chart(upcomingCanvas, {
+      type: 'bar',
+      data: {
+        labels: weeks.map(w => fmtDate(w.start).replace(/ \d{4}$/,'')),
+        datasets: [{ data: weeks.map(w=>w.count), backgroundColor: '#2B3A55', borderRadius: 4, maxBarThickness: 60 }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ` ${ctx.parsed.y} task${ctx.parsed.y!==1?'s':''} due` } } },
+        scales: {
+          x: { grid: { display: false }, ticks: { font: chartBaseFont(), color: '#6B7385' } },
+          y: { beginAtZero: true, ticks: { precision: 0, font: chartBaseFont(), color: '#6B7385' }, grid: { color: '#EFEBE0' } }
+        }
+      }
+    });
+  }
 }
 
 /* ---- Orders ---- */
@@ -3076,40 +3239,10 @@ function gapCardHtml(name, sub, score, insights){
   </div>`;
 }
 
-// Performance for a single style/order, "till date" — same scoring approach as
-// member/buyer performance, just scoped to this one order's tasks.
-function orderPerformance(order){
-  const all = order.tasks;
-  const done = all.filter(t=>SUCCESS_STATUSES.includes(t.status));
-  const onTime = done.filter(t=>t.actualDate && t.actualDate<=opDate(t));
-  const overdueOpen = all.filter(t=>taskStatusComputed(t)==='Overdue');
-  const onTimeRate = done.length ? (onTime.length/done.length)*100 : null;
-  const completionRate = all.length ? (done.length/all.length)*100 : 0;
-  const score = Math.max(0, Math.round(((onTimeRate ?? 100) * 0.6) + (completionRate * 0.4) - (overdueOpen.length * 3)));
-  return {score, onTimeRate: onTimeRate===null?null:Math.round(onTimeRate), completionRate: Math.round(completionRate), overdueOpen: overdueOpen.length};
-}
 function performanceTier(score){
   if(score>=80) return {cls:'done', label:'Good'};
   if(score>=50) return {cls:'progress', label:'Medium'};
   return {cls:'overdue', label:'Low'};
-}
-// The Merchandiser(s) actually assigned to this order's Merchandising tasks
-function merchandisersForOrder(order){
-  const ids = new Set(order.tasks.filter(t=>t.dept==='Merchandising' && t.assignedTo).map(t=>t.assignedTo));
-  return Array.from(ids).map(userName).join(', ') || '—';
-}
-// The Manager(s) who head this buyer, split by their designation label —
-// e.g. so a buyer's Merchandising Head and Marketing Head both surface distinctly.
-// A manager with no designation set yet defaults into "merchandising" (the primary role),
-// so nobody just disappears from the table because they haven't been labeled.
-function headsForBuyerByKeyword(buyerId, keyword){
-  const managers = managersForBuyer(buyerId);
-  const names = managers.filter(m => {
-    const d = (m.designation||'').toLowerCase().trim();
-    if(keyword==='merchandising') return d==='' || d.includes('merchandising');
-    return d.includes(keyword);
-  }).map(m=>m.name);
-  return names.join(', ') || '—';
 }
 function headsForBuyer(buyerId){
   const names = managersForBuyer(buyerId).map(m=>m.name);
