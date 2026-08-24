@@ -322,6 +322,8 @@ let dashboardFilters = { buyerId:'all', personId:'all', style:'', season:'', dat
 let currentOrderExpanded = {};
 let editingPcdOrderId = null;
 let currentSetExpanded = {};
+let consumptionMode = 'manual'; // 'manual' | 'automatic' — Consumption Calculator tab
+let consMarkerParsed = null; // last successfully-parsed CAD marker PDF, or null
 let templatePastePreview = null; // {setId: string|null, name?: string, rows:[{name,dept,offset,error}]}
 let editingAccessUserId = null;
 let editingTasksUserId = null;
@@ -379,6 +381,52 @@ function loadXlsxLib(){
     document.head.appendChild(script);
   });
   return xlsxLoadPromise;
+}
+/* ---- PDF reading (pdf.js) — for the Consumption Calculator's Automatic mode, which
+   extracts marker Length/Width/Sets straight out of an uploaded CAD marker PDF instead
+   of someone retyping them. Pinned to the 2.x line specifically because that's the last
+   major version cdnjs mirrors as a classic global-exposing script (window.pdfjsLib) —
+   3.x+ ships ES-module-only builds there, which a plain <script> tag can't consume the
+   same way jsPDF/xlsx/Chart.js are loaded elsewhere in this file. */
+let pdfJsLoadPromise = null;
+function loadPdfJsLib(){
+  if(window.pdfjsLib) return Promise.resolve(true);
+  if(pdfJsLoadPromise) return pdfJsLoadPromise;
+  pdfJsLoadPromise = new Promise((resolve) => {
+    const timeout = setTimeout(() => { resolve(false); }, 10000);
+    const script = document.createElement('script');
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js';
+    script.onload = () => {
+      clearTimeout(timeout);
+      if(!window.pdfjsLib){ resolve(false); return; }
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+      resolve(true);
+    };
+    script.onerror = () => { clearTimeout(timeout); resolve(false); };
+    document.head.appendChild(script);
+  });
+  return pdfJsLoadPromise;
+}
+// Pulls every page's text out of an uploaded marker PDF, joined into one string for
+// parseMarkerPdfText() to search. Returns null if the library couldn't load — callers
+// show that as "couldn't read this PDF, try Manual mode" rather than crashing.
+async function extractPdfText(file){
+  const ok = await loadPdfJsLib();
+  if(!ok || !window.pdfjsLib) return null;
+  try{
+    const buf = await file.arrayBuffer();
+    const doc = await window.pdfjsLib.getDocument({ data: buf }).promise;
+    let text = '';
+    for(let i=1; i<=doc.numPages; i++){
+      const page = await doc.getPage(i);
+      const content = await page.getTextContent();
+      text += content.items.map(it => it.str).join(' ') + '\n';
+    }
+    return text;
+  }catch(e){
+    console.error('extractPdfText error:', e);
+    return null;
+  }
 }
 /* ---- Charts (Chart.js) — loaded on demand, same safe pattern as the PDF/Excel libraries ---- */
 let chartJsLoadPromise = null;
@@ -3829,9 +3877,12 @@ function renderNotify(){
    of a one-off Excel calculation. */
 function calcFabricConsumption(inputs){
   const { width, markerYds, markerIn, extraIn, gsm, pcsInMarker, wastagePct, orderQty } = inputs;
-  if([width, markerYds, markerIn, extraIn, gsm, pcsInMarker].some(v => v===null || isNaN(v) || v<=0)){
-    return null;
-  }
+  // Width/marker-yards/GSM/pieces can never legitimately be zero — treat as missing.
+  // markerIn/extraIn CAN legitimately be exactly 0 (a whole-yard marker length, or no
+  // extra allowance) — only reject those if truly missing or negative, not zero, since
+  // Automatic mode (CAD-parsed markers) always passes extraIn 0 deliberately.
+  if([width, markerYds, gsm, pcsInMarker].some(v => v===null || isNaN(v) || v<=0)) return null;
+  if([markerIn, extraIn].some(v => v===null || isNaN(v) || v<0)) return null;
   const markerTotalYds = markerYds + ((markerIn + extraIn) / 36);
   const ydsPerPc = markerTotalYds / pcsInMarker;
   const mtrPerPc = ydsPerPc * 0.9144;
@@ -3850,15 +3901,10 @@ function readConsumptionInputs(){
   };
 }
 function fmtKg(n){ return n===null || n===undefined ? '—' : n.toFixed(4); }
-function updateConsumptionResults(){
-  const out = document.getElementById('consResults');
-  if(!out) return;
-  const r = calcFabricConsumption(readConsumptionInputs());
-  if(!r){
-    out.innerHTML = emptyState('chart', 'Fill in Fabric Width, Marker Length (yds + inches), Extra allowance, GSM, and No. of Pcs in Marker to see the calculation.');
-    return;
-  }
-  out.innerHTML = `
+// Shared by both Manual and Automatic mode so the result presentation — and the
+// exact wording of each formula step — never drifts between the two.
+function consumptionResultHtml(r){
+  return `
     <div class="kpi-grid" style="margin-bottom:14px;">
       <div class="stat"><div class="num">${fmtKg(r.kgPerPc)}</div><div class="lbl">Kg / Pc (no wastage)</div></div>
       <div class="stat alert"><div class="num">${fmtKg(r.kgPerPcWithWastage)}</div><div class="lbl">Kg / Pc (with ${r.wastage}% wastage)</div></div>
@@ -3875,6 +3921,13 @@ function updateConsumptionResults(){
         ${r.totalKg!==null ? `<tr><td>Total for order</td><td class="mono">Kg/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalKg.toFixed(2)} kg</td></tr>` : ''}
       </tbody>
     </table>`;
+}
+function updateConsumptionResults(){
+  const out = document.getElementById('consResults');
+  if(!out) return;
+  const r = calcFabricConsumption(readConsumptionInputs());
+  out.innerHTML = r ? consumptionResultHtml(r)
+    : emptyState('chart', 'Fill in Fabric Width, Marker Length (yds + inches), Extra allowance, GSM, and No. of Pcs in Marker to see the calculation.');
 }
 async function exportConsumptionPdf(){
   const r = calcFabricConsumption(readConsumptionInputs());
@@ -3906,11 +3959,192 @@ async function exportConsumptionPdf(){
   );
   doc.save('fabric_consumption.pdf');
 }
+
+/* ---- Automatic mode — reads Length/Width/Sets straight out of an uploaded CAD marker
+   PDF instead of someone retyping them off a printout. The marker PDFs this reads
+   export a plain-text summary line at the bottom of the page in one of two forms:
+     Length:8yard6.16inch(8.17yard); Width:2yard0inch(72inch); ... Sets:25,...;
+     Length:0m60.34cm(0.6m);         Width:1m2cm(102cm);       ... Sets:22,...;
+   i.e. yard/inch markers or meter/cm markers — both seen in practice. Either way, the
+   parenthesised figure is already the fully-combined decimal (yards, or meters) for
+   Length, and the fully-combined decimal (inches, or cm) for Width, so no manual
+   whole+fraction arithmetic is needed — just pull those two numbers out.
+   Deliberately regex-based rather than routed through an LLM: the source data is
+   already exact, machine-generated text (not a photo or handwriting), so a precise text
+   match is strictly more reliable than a probabilistic reading — and this is a number
+   that drives real fabric purchasing, where "usually right" isn't good enough. */
+function parseMarkerPdfText(text){
+  const clean = text.replace(/\s+/g, ' ');
+  const styleMatch = clean.match(/Style\s*Name\s*:\s*([^;]+);/i);
+  const sizeMatch = clean.match(/\bSize\s*:\s*([^;]+);/i);
+  const materialMatch = clean.match(/Material\s*:\s*([^;]+);/i);
+  const setsMatch = clean.match(/Sets\s*:\s*(\d+)/i);
+  const effMatch = clean.match(/Efficiency\s*:\s*([\d.]+)\s*%/i);
+
+  let unitSystem = null, lengthBig = null, widthSmall = null;
+  const lenYd = clean.match(/Length\s*:\s*[\d.]+\s*yard\s*[\d.]+\s*inch\s*\(\s*([\d.]+)\s*yard\s*\)/i);
+  const widYd = clean.match(/Width\s*:\s*[\d.]+\s*yard\s*[\d.]+\s*inch\s*\(\s*([\d.]+)\s*inch\s*\)/i);
+  if(lenYd && widYd){
+    unitSystem = 'yard';
+    lengthBig = parseFloat(lenYd[1]);
+    widthSmall = parseFloat(widYd[1]);
+  }else{
+    const lenM = clean.match(/Length\s*:\s*[\d.]+\s*m\s*[\d.]+\s*cm\s*\(\s*([\d.]+)\s*m\s*\)/i);
+    const widM = clean.match(/Width\s*:\s*[\d.]+\s*m\s*[\d.]+\s*cm\s*\(\s*([\d.]+)\s*cm\s*\)/i);
+    if(lenM && widM){
+      unitSystem = 'metric';
+      lengthBig = parseFloat(lenM[1]);
+      widthSmall = parseFloat(widM[1]);
+    }
+  }
+  if(!unitSystem || !setsMatch) return null;
+
+  return {
+    styleName: styleMatch ? styleMatch[1].trim() : '',
+    sizes: sizeMatch ? sizeMatch[1].trim() : '',
+    material: materialMatch ? materialMatch[1].trim() : '',
+    sets: parseInt(setsMatch[1], 10),
+    efficiency: effMatch ? parseFloat(effMatch[1]) : null,
+    unitSystem, lengthBig, widthSmall,
+  };
+}
+// Normalizes a parsed marker (whichever unit system it came in) onto the exact same
+// (yards, inches) basis calcFabricConsumption() already expects, then calls that same
+// function unchanged — Automatic mode is a different INPUT PATH, not different math.
+// Per spec: no extra allowance on the length side here (the CAD length is used as-is,
+// unlike Manual mode's marker-length extra) — only the width gets a user-editable
+// extra, because a marker's reported width is the CUTTABLE width, and real fabric
+// rolls run wider than that (selvage/finishing you can't cut from), so the full
+// fabric width used for the weight calc is the marker's width plus that allowance.
+function calcAutomaticConsumption(marker, gsm, widthExtraIn, wastagePct, orderQty){
+  if(!marker) return null;
+  const markerYds = marker.unitSystem==='yard' ? marker.lengthBig : marker.lengthBig * 1.0936133;
+  const widthInchesCuttable = marker.unitSystem==='yard' ? marker.widthSmall : marker.widthSmall / 2.54;
+  const extra = (widthExtraIn===null || isNaN(widthExtraIn)) ? 0 : widthExtraIn;
+  return calcFabricConsumption({
+    width: widthInchesCuttable + extra, markerYds, markerIn: 0, extraIn: 0,
+    gsm, pcsInMarker: marker.sets, wastagePct, orderQty,
+  });
+}
+function readAutomaticInputs(){
+  const num = id => { const el = document.getElementById(id); if(!el || el.value==='') return null; const v = parseFloat(el.value); return isNaN(v) ? null : v; };
+  return { gsm: num('consAutoGsm'), widthExtraIn: num('consAutoWidthExtra'), wastagePct: num('consAutoWastagePct'), orderQty: num('consAutoOrderQty') };
+}
+function updateAutomaticConsumptionResults(){
+  const out = document.getElementById('consAutoResults');
+  if(!out || !consMarkerParsed) return;
+  const inp = readAutomaticInputs();
+  const r = calcAutomaticConsumption(consMarkerParsed, inp.gsm, inp.widthExtraIn, inp.wastagePct, inp.orderQty);
+  out.innerHTML = r ? consumptionResultHtml(r) : emptyState('chart', 'Enter GSM above to see the consumption.');
+}
+async function exportAutomaticConsumptionPdf(){
+  if(!consMarkerParsed){ showToast('Upload a marker PDF first'); return; }
+  const inp = readAutomaticInputs();
+  const r = calcAutomaticConsumption(consMarkerParsed, inp.gsm, inp.widthExtraIn, inp.wastagePct, inp.orderQty);
+  if(!r){ showToast('Enter GSM first'); return; }
+  showToast('Preparing PDF…');
+  const m = consMarkerParsed;
+  const doc = await pdfNewDoc('Fabric Consumption Calculation', 'Read automatically from CAD marker — ' + (m.styleName||'unnamed style'));
+  if(!doc) return;
+  let y = 72;
+  y = pdfSectionTitle(doc, y, 'Marker (read from uploaded PDF)');
+  y = pdfTable(doc, y,
+    ['Style','Material','Sizes','Marker length','Marker width (cuttable)','Sets','Efficiency'],
+    [[
+      m.styleName||'—', m.material||'—', m.sizes||'—',
+      m.unitSystem==='yard' ? m.lengthBig.toFixed(2)+' yd' : m.lengthBig.toFixed(2)+' m',
+      m.unitSystem==='yard' ? m.widthSmall.toFixed(2)+' in' : m.widthSmall.toFixed(2)+' cm',
+      m.sets, m.efficiency!==null ? m.efficiency+'%' : '—',
+    ]],
+    [140,80,120,90,120,50,70]
+  );
+  y += 12;
+  y = pdfSectionTitle(doc, y, 'Inputs');
+  y = pdfTable(doc, y,
+    ['GSM','Width extra allowance (in)','Wastage %','Order qty'],
+    [[inp.gsm, inp.widthExtraIn ?? 0, r.wastage, inp.orderQty ?? '—']],
+    [90,150,90,90]
+  );
+  y += 12;
+  y = pdfSectionTitle(doc, y, 'Calculation');
+  y = pdfTable(doc, y,
+    ['Step','Formula','Result'],
+    [
+      ['Marker length (total)', 'Marker length, as read', r.markerTotalYds.toFixed(4)+' yds'],
+      ['Yds / Pc', 'Marker length ÷ Sets', r.ydsPerPc.toFixed(4)+' yds'],
+      ['Mtr / Pc', 'Yds/Pc × 0.9144', r.mtrPerPc.toFixed(4)+' m'],
+      ['Kg / Pc (no wastage)', '(Mtr/Pc × Full width × GSM) ÷ 39.37 ÷ 1000', r.kgPerPc.toFixed(4)+' kg'],
+      [`Kg / Pc (with ${r.wastage}% wastage)`, `Kg/Pc × (1 + ${r.wastage}%)`, r.kgPerPcWithWastage.toFixed(4)+' kg'],
+      ...(r.totalKg!==null ? [[`Total for ${r.orderQty} pcs`, 'Kg/Pc (with wastage) × Order qty', r.totalKg.toFixed(2)+' kg']] : []),
+    ],
+    [200,320,160]
+  );
+  doc.save('fabric_consumption_auto.pdf');
+}
+function renderAutomaticMarkerBody(){
+  if(!consMarkerParsed){
+    return emptyState('shirt', 'Upload a marker PDF above — the system reads its Length, Width, Material, and Sets (pieces) automatically.');
+  }
+  const m = consMarkerParsed;
+  return `
+    <div class="panel" style="background:var(--green-soft);border-color:var(--green);">
+      <div style="font-weight:600;font-family:'Space Grotesk',sans-serif;margin-bottom:10px;">Marker read successfully — enter GSM below to get the consumption</div>
+      <div class="grid-cols" style="grid-template-columns:repeat(4,1fr);gap:10px;">
+        <div><div class="hint">Style</div><div>${m.styleName||'—'}</div></div>
+        <div><div class="hint">Material</div><div>${m.material||'—'}</div></div>
+        <div><div class="hint">Sizes in marker</div><div>${m.sizes||'—'}</div></div>
+        <div><div class="hint">Pcs in marker (Sets)</div><div class="mono">${m.sets}</div></div>
+        <div><div class="hint">Marker length</div><div class="mono">${m.unitSystem==='yard' ? m.lengthBig.toFixed(2)+' yd' : m.lengthBig.toFixed(2)+' m'}</div></div>
+        <div><div class="hint">Marker width (cuttable)</div><div class="mono">${m.unitSystem==='yard' ? m.widthSmall.toFixed(2)+' in' : m.widthSmall.toFixed(2)+' cm'}</div></div>
+        ${m.efficiency!==null ? `<div><div class="hint">Marker efficiency</div><div class="mono">${m.efficiency}%</div></div>` : ''}
+      </div>
+    </div>
+    <div class="grid-cols" style="grid-template-columns:repeat(4,1fr);">
+      <div class="field"><label>GSM</label><input id="consAutoGsm" type="number" step="0.01" placeholder="e.g. 150"></div>
+      <div class="field"><label>Width extra allowance (inches)</label><input id="consAutoWidthExtra" type="number" step="0.01" value="2"></div>
+      <div class="field">
+        <label>Wastage %</label>
+        <input id="consAutoWastagePct" type="number" step="0.1" placeholder="e.g. 5">
+        <div class="hint" style="margin-top:4px;">
+          <a href="#" class="auto-wastage-preset" data-pct="3">Use 3%</a> · <a href="#" class="auto-wastage-preset" data-pct="5">Use 5%</a>
+        </div>
+      </div>
+      <div class="field"><label>Order qty (optional)</label><input id="consAutoOrderQty" type="number" step="1" placeholder="e.g. 5550"></div>
+    </div>
+    <div class="row-actions" style="margin:14px 0;">
+      <button class="btn ghost small" id="exportAutoConsumptionPdfBtn">Export PDF</button>
+    </div>
+    <div id="consAutoResults">${emptyState('chart', 'Enter GSM above to see the consumption.')}</div>`;
+}
 function renderConsumptionCalculator(){
+  const modeToggle = `
+    <div class="row-actions" style="margin-bottom:16px;">
+      <button class="btn ${consumptionMode==='manual'?'':'ghost'} small" data-cons-mode="manual">Manual</button>
+      <button class="btn ${consumptionMode==='automatic'?'':'ghost'} small" data-cons-mode="automatic">Automatic — from CAD marker</button>
+    </div>`;
+
+  if(consumptionMode==='automatic'){
+    return `
+    <div class="panel">
+      <h2>Fabric Consumption Calculator</h2>
+      <p class="desc">Upload the marker PDF exported from your CAD/marker-making software — Length, Width, Material, and Sets (pieces) are read straight off it, so nothing needs retyping. You'll be asked for GSM right after.</p>
+      ${modeToggle}
+      <div class="field" style="max-width:420px;">
+        <label>Marker PDF</label>
+        <input type="file" id="consMarkerUpload" accept="application/pdf">
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Result</h2>
+      <div id="consAutoBody">${renderAutomaticMarkerBody()}</div>
+    </div>`;
+  }
+
   return `
   <div class="panel">
     <h2>Fabric Consumption Calculator</h2>
     <p class="desc">The same "YY calculation" formula used on the manual worksheet — marker length, fabric width, and GSM in, consumption per piece (and per order, once you add a quantity) out. Updates live as you type.</p>
+    ${modeToggle}
     <div class="grid-cols" style="grid-template-columns:repeat(4,1fr);">
       <div class="field"><label>Fabric width (inches)</label><input id="consWidth" type="number" step="0.01" placeholder="e.g. 66"></div>
       <div class="field"><label>Marker length — yards</label><input id="consMarkerYds" type="number" step="0.01" placeholder="e.g. 6"></div>
@@ -3936,6 +4170,22 @@ function renderConsumptionCalculator(){
     <h2>Result</h2>
     <div id="consResults">${emptyState('chart', 'Fill in the inputs above to see the calculation.')}</div>
   </div>`;
+}
+// Re-wires the Automatic-mode result inputs — called on the normal full-tab render
+// AND after a marker upload replaces just #consAutoBody's innerHTML (which drops any
+// listeners it held), so both paths leave GSM/wastage/qty/export live.
+function attachConsumptionAutoEvents(){
+  document.querySelectorAll('#consAutoGsm, #consAutoWidthExtra, #consAutoWastagePct, #consAutoOrderQty')
+    .forEach(inp => inp.addEventListener('input', updateAutomaticConsumptionResults));
+  document.querySelectorAll('.auto-wastage-preset').forEach(a => {
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      document.getElementById('consAutoWastagePct').value = a.dataset.pct;
+      updateAutomaticConsumptionResults();
+    });
+  });
+  const exportAutoBtn = document.getElementById('exportAutoConsumptionPdfBtn');
+  if(exportAutoBtn) exportAutoBtn.addEventListener('click', exportAutomaticConsumptionPdf);
 }
 
 /* ---------------- Event wiring ---------------- */
@@ -3968,6 +4218,34 @@ function attachTabEvents(){
   if(resetConsBtn) resetConsBtn.addEventListener('click', () => { renderTabContent(); });
   const exportConsBtn = document.getElementById('exportConsumptionPdfBtn');
   if(exportConsBtn) exportConsBtn.addEventListener('click', exportConsumptionPdf);
+
+  document.querySelectorAll('[data-cons-mode]').forEach(btn => {
+    btn.addEventListener('click', () => { consumptionMode = btn.dataset.consMode; renderTabContent(); });
+  });
+  attachConsumptionAutoEvents();
+  const markerUploadInput = document.getElementById('consMarkerUpload');
+  if(markerUploadInput) markerUploadInput.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if(!file) return;
+    showToast('Reading marker…');
+    const text = await extractPdfText(file);
+    if(text === null){
+      showToast('Could not load the PDF reading library — check your internet connection and try again');
+    }else{
+      const parsed = parseMarkerPdfText(text);
+      if(!parsed){
+        consMarkerParsed = null;
+        showToast("Couldn't find marker details in this PDF — try Manual mode instead");
+      }else{
+        consMarkerParsed = parsed;
+        showToast('Marker read — enter GSM to calculate');
+      }
+    }
+    const body = document.getElementById('consAutoBody');
+    if(body){ body.innerHTML = renderAutomaticMarkerBody(); attachConsumptionAutoEvents(); }
+    const gsmEl = document.getElementById('consAutoGsm');
+    if(gsmEl) gsmEl.focus();
+  });
 
   // Dashboard filter bar — Buyer/Person filters re-render immediately (they're selects);
   // text/date fields wait for change (blur/enter) so typing doesn't re-render every keystroke.
