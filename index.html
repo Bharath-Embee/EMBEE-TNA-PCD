@@ -3916,6 +3916,12 @@ function wastageSweepTableHtml(basePerPc, unit){
       <tbody>${rows}</tbody>
     </table>`;
 }
+// Same 0–5% sweep as wastageSweepTableHtml(), as pdfTable() rows instead of HTML —
+// used by every "Export PDF" button so the wastage comparison that's on screen is
+// also in the exported file, not just the live view.
+function wastageSweepPdfRows(basePerPc, unit){
+  return [0,1,2,3,4,5].map(pct => [pct+'%', (basePerPc*(1+pct/100)).toFixed(4)+' '+unit]);
+}
 // Shared by both Manual and Automatic mode so the result presentation — and the
 // exact wording of each formula step — never drifts between the two.
 function consumptionResultHtml(r){
@@ -3973,6 +3979,9 @@ async function exportConsumptionPdf(){
     ],
     [200,320,160]
   );
+  y += 12;
+  y = pdfSectionTitle(doc, y, 'Consumption per piece at each wastage %');
+  y = pdfTable(doc, y, ['Wastage','Consumption / Pc'], wastageSweepPdfRows(r.kgPerPc, 'kg'), [120,160]);
   doc.save('fabric_consumption.pdf');
 }
 
@@ -4132,6 +4141,9 @@ async function exportAutomaticConsumptionPdf(){
       ],
       [200,320,160]
     );
+    y += 12;
+    y = pdfSectionTitle(doc, y, 'Consumption per piece at each wastage %');
+    y = pdfTable(doc, y, ['Wastage','Consumption / Pc'], wastageSweepPdfRows(r.lengthPerPcM, 'm'), [120,160]);
     doc.save('fabric_consumption_auto.pdf');
     return;
   }
@@ -4164,6 +4176,9 @@ async function exportAutomaticConsumptionPdf(){
     ],
     [200,320,160]
   );
+  y += 12;
+  y = pdfSectionTitle(doc, y, 'Consumption per piece at each wastage %');
+  y = pdfTable(doc, y, ['Wastage','Consumption / Pc'], wastageSweepPdfRows(r.kgPerPc, 'kg'), [120,160]);
   doc.save('fabric_consumption_auto.pdf');
 }
 function renderAutomaticMarkerBody(){
