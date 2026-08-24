@@ -2065,6 +2065,9 @@ function renderDashboard(){
     </div>
     <p class="desc">Each person's currently open work, weighted by how many person-days each task actually takes (set per task in Task Templates) rather than a raw task count — a fairer picture to bring to management than "who has the most tasks." Include this panel in <strong>Export PDF</strong> above to share it as-is.</p>
     <div style="position:relative;height:${Math.min(560, Math.max(160, workload.length*32))}px;"><canvas id="dashWorkloadChart"></canvas></div>
+    <div class="divider"></div>
+    <div class="hint" style="margin-bottom:8px;font-weight:600;color:var(--ink-soft);">Workload timeline — every open task plotted by who has it and when it's due. Dot size = effort-days, so a big red dot on the left is exactly what needs attention first.</div>
+    <div style="position:relative;height:${Math.min(560, Math.max(160, workload.length*40))}px;"><canvas id="dashWorkloadTimelineChart"></canvas></div>
   </div>`;
   })()}
 
@@ -2193,6 +2196,32 @@ function dashboardPersonWorkload(all){
     .map(e => ({...e, total: e.overdue+e.dueSoon+e.onTrack}))
     .sort((a,b) => b.total-a.total)
     .slice(0,15);
+}
+// One point per open task, for the "who/how much/when" scatter under the Team
+// workload bar — x is days from today (negative = overdue) rather than a real
+// Chart.js time scale, so this needs no date-adapter library; y is that task's
+// row index in the SAME person list dashboardPersonWorkload() returns, so the two
+// charts always list people in identical top-to-bottom order. Bubble radius carries
+// effort, color carries urgency — so "how much" and "when" both read at a glance
+// without opening a second screen.
+function dashboardWorkloadTimeline(all){
+  const people = dashboardPersonWorkload(all);
+  const rowOf = new Map(people.map((p,i) => [p.userId, i]));
+  const points = [];
+  all.forEach(x => {
+    if(!isOpenTask(x.task) || !x.task.assignedTo) return;
+    const row = rowOf.get(x.task.assignedTo);
+    if(row===undefined) return;
+    const due = opDate(x.task);
+    if(!due) return;
+    const level = taskStatusComputed(x.task)==='Overdue' ? 'overdue' : daysBetween(today(), due)<=3 ? 'dueSoon' : 'onTrack';
+    const effort = x.task.effortDays || 1;
+    points.push({
+      x: daysBetween(today(), due), y: row, r: Math.max(5, Math.min(18, 4 + effort*2.5)),
+      level, effort, taskName: x.task.name, styleNo: x.order.styleNo, dueDate: due,
+    });
+  });
+  return { people, points };
 }
 // Open-task counts bucketed into the next 6 calendar weeks (Mon–Sun, starting this
 // week) — a capacity look-ahead so a heavy week can be spotted before it arrives.
@@ -2392,6 +2421,67 @@ function initDashboardAdvancedCharts(){
         scales: {
           x: { stacked: true, title: { display: true, text: 'Effort-days of open work', font: chartBaseFont(), color: '#6B7385' }, ticks: { precision: 0, font: chartBaseFont(), color: '#6B7385' }, grid: { color: '#EFEBE0' } },
           y: { stacked: true, ticks: { font: chartBaseFont(), color: '#2B3A55' }, grid: { display: false } }
+        }
+      }
+    });
+  }
+
+  // A dashed "today" line on the timeline below, drawn as a tiny inline Chart.js
+  // plugin rather than pulling in the annotation plugin — this is the only thing
+  // that plugin would be used for, and the app otherwise loads no Chart.js add-ons.
+  const todayLinePlugin = {
+    id: 'todayLine',
+    afterDraw(chart){
+      const xScale = chart.scales.x;
+      if(!xScale) return;
+      const xPix = xScale.getPixelForValue(0);
+      const { top, bottom } = chart.chartArea;
+      const ctx = chart.ctx;
+      ctx.save();
+      ctx.strokeStyle = '#2B3A55';
+      ctx.setLineDash([4, 3]);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(xPix, top);
+      ctx.lineTo(xPix, bottom);
+      ctx.stroke();
+      ctx.restore();
+    }
+  };
+  const timelineCanvas = document.getElementById('dashWorkloadTimelineChart');
+  destroyChart('dashWorkloadTimelineChart');
+  if(timelineCanvas){
+    const { people, points } = dashboardWorkloadTimeline(all);
+    const levelFill = { overdue: 'rgba(193,68,60,0.7)', dueSoon: 'rgba(184,134,46,0.7)', onTrack: 'rgba(139,151,175,0.7)' };
+    const levelBorder = { overdue: '#C1443C', dueSoon: '#B8862E', onTrack: '#8B97AF' };
+    chartInstances.dashWorkloadTimelineChart = new Chart(timelineCanvas, {
+      type: 'bubble',
+      data: {
+        datasets: [{
+          label: 'Tasks',
+          data: points,
+          backgroundColor: points.map(p => levelFill[p.level]),
+          borderColor: points.map(p => levelBorder[p.level]),
+          borderWidth: 1.5,
+        }]
+      },
+      plugins: [todayLinePlugin],
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: ctx => { const p = points[ctx.dataIndex]; return [` ${p.taskName} (${p.styleNo})`, ` Due ${fmtDate(p.dueDate)} · ${p.effort} effort-day${p.effort!==1?'s':''}`]; } } }
+        },
+        scales: {
+          x: {
+            title: { display: true, text: 'Days from today (dashed line) — negative means overdue', font: chartBaseFont(), color: '#6B7385' },
+            ticks: { font: chartBaseFont(), color: '#6B7385', callback: v => v===0 ? 'Today' : (v>0?'+':'')+v+'d' },
+            grid: { color: '#EFEBE0' }
+          },
+          y: {
+            type: 'category', labels: people.map(p => userName(p.userId)), offset: true,
+            ticks: { font: chartBaseFont(), color: '#2B3A55' }, grid: { color: '#EFEBE0' }
+          }
         }
       }
     });
