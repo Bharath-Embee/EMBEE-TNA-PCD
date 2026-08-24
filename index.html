@@ -261,8 +261,8 @@ const STORAGE_KEY = 'tna_data_v2';
 const ACTIVE_USER_KEY = 'tna_active_user_id_v2';
 const DEPARTMENTS = ['Merchandising','Purchase','Store','Shipping','PPC'];
 
-// The 6 admin/manager-tier screens. Admin always has all of them; a Manager's set is
-// chosen individually by Admin per person (defaults to all 6 if never configured).
+// The admin/manager-tier screens. Admin always has all of them; a Manager's set is
+// chosen individually by Admin per person (defaults to all of them if never configured).
 const TAB_DEFS = [
   ['dashboard','Dashboard'],
   ['orders','Orders'],
@@ -270,6 +270,7 @@ const TAB_DEFS = [
   ['team','Buyers & Team'],
   ['templates','Task Templates'],
   ['notify','Notifications'],
+  ['consumption','Consumption Calculator'],
 ];
 function defaultTabAccess(){ return TAB_DEFS.map(([id])=>id); }
 function userTabAccess(u){
@@ -1712,6 +1713,7 @@ function renderTabContent(){
     else if(currentTab==='team') el.innerHTML = renderTeam();
     else if(currentTab==='templates') el.innerHTML = renderTemplates();
     else if(currentTab==='notify') el.innerHTML = renderNotify();
+    else if(currentTab==='consumption') el.innerHTML = renderConsumptionCalculator();
     else { el.innerHTML = renderDashboard(); initDashboardCharts(); animateKpiNumbers(); }
     attachTabEvents();
     applyTabFadeIn(el);
@@ -3811,6 +3813,131 @@ function renderNotify(){
   </div>`;
 }
 
+/* ---- Consumption Calculator ----
+   Same "YY calculation" formula merchandising already uses on paper/Excel for fabric
+   consumption per garment piece, moved in-system as a live, reusable tool instead of
+   a spreadsheet someone has to keep re-opening and re-typing into:
+     1. Marker length (yds) = Yards input + (Inches input + extra allowance) / 36
+     2. Yds/Pc  = Marker length (yds) / No. of pieces in the marker
+     3. Mtr/Pc  = Yds/Pc × 0.9144
+     4. Kg/Pc   = (Mtr/Pc × Fabric width (inches) × GSM) / 39.37 / 1000
+     5. Kg/Pc with wastage% = Kg/Pc × (1 + wastage/100)
+     6. Total fabric required = Kg/Pc with wastage × Order qty (when a qty is given)
+   Every step mirrors the manual sheet exactly, so results are checkable line-by-line
+   against what merchandising already trusts — this isn't a different formula, just
+   the same one made instant, reusable across styles, and exportable as a PDF instead
+   of a one-off Excel calculation. */
+function calcFabricConsumption(inputs){
+  const { width, markerYds, markerIn, extraIn, gsm, pcsInMarker, wastagePct, orderQty } = inputs;
+  if([width, markerYds, markerIn, extraIn, gsm, pcsInMarker].some(v => v===null || isNaN(v) || v<=0)){
+    return null;
+  }
+  const markerTotalYds = markerYds + ((markerIn + extraIn) / 36);
+  const ydsPerPc = markerTotalYds / pcsInMarker;
+  const mtrPerPc = ydsPerPc * 0.9144;
+  const kgPerPc = ((mtrPerPc * width * gsm) / 39.37) / 1000;
+  const wastage = (wastagePct===null || isNaN(wastagePct)) ? 0 : wastagePct;
+  const kgPerPcWithWastage = kgPerPc * (1 + wastage/100);
+  const totalKg = (orderQty!==null && !isNaN(orderQty) && orderQty>0) ? kgPerPcWithWastage * orderQty : null;
+  return { markerTotalYds, ydsPerPc, mtrPerPc, kgPerPc, wastage, kgPerPcWithWastage, orderQty, totalKg };
+}
+function readConsumptionInputs(){
+  const num = id => { const el = document.getElementById(id); if(!el || el.value==='') return null; const v = parseFloat(el.value); return isNaN(v) ? null : v; };
+  return {
+    width: num('consWidth'), markerYds: num('consMarkerYds'), markerIn: num('consMarkerIn'),
+    extraIn: num('consExtra'), gsm: num('consGsm'), pcsInMarker: num('consPcsInMarker'),
+    wastagePct: num('consWastagePct'), orderQty: num('consOrderQty'),
+  };
+}
+function fmtKg(n){ return n===null || n===undefined ? '—' : n.toFixed(4); }
+function updateConsumptionResults(){
+  const out = document.getElementById('consResults');
+  if(!out) return;
+  const r = calcFabricConsumption(readConsumptionInputs());
+  if(!r){
+    out.innerHTML = emptyState('chart', 'Fill in Fabric Width, Marker Length (yds + inches), Extra allowance, GSM, and No. of Pcs in Marker to see the calculation.');
+    return;
+  }
+  out.innerHTML = `
+    <div class="kpi-grid" style="margin-bottom:14px;">
+      <div class="stat"><div class="num">${fmtKg(r.kgPerPc)}</div><div class="lbl">Kg / Pc (no wastage)</div></div>
+      <div class="stat alert"><div class="num">${fmtKg(r.kgPerPcWithWastage)}</div><div class="lbl">Kg / Pc (with ${r.wastage}% wastage)</div></div>
+      ${r.totalKg!==null ? `<div class="stat"><div class="num">${r.totalKg.toFixed(2)}</div><div class="lbl">Total Kg for ${r.orderQty} pcs</div></div>` : ''}
+    </div>
+    <table>
+      <thead><tr><th>Step</th><th>Formula</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td>Marker length (total)</td><td class="mono">Yards + (Inches + Extra) / 36</td><td class="mono">${r.markerTotalYds.toFixed(4)} yds</td></tr>
+        <tr><td>Yds / Pc</td><td class="mono">Marker length ÷ Pcs in marker</td><td class="mono">${r.ydsPerPc.toFixed(4)} yds</td></tr>
+        <tr><td>Mtr / Pc</td><td class="mono">Yds/Pc × 0.9144</td><td class="mono">${r.mtrPerPc.toFixed(4)} m</td></tr>
+        <tr><td>Kg / Pc (no wastage)</td><td class="mono">(Mtr/Pc × Width × GSM) ÷ 39.37 ÷ 1000</td><td class="mono">${r.kgPerPc.toFixed(4)} kg</td></tr>
+        <tr><td>Kg / Pc (with wastage)</td><td class="mono">Kg/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.kgPerPcWithWastage.toFixed(4)} kg</td></tr>
+        ${r.totalKg!==null ? `<tr><td>Total for order</td><td class="mono">Kg/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalKg.toFixed(2)} kg</td></tr>` : ''}
+      </tbody>
+    </table>`;
+}
+async function exportConsumptionPdf(){
+  const r = calcFabricConsumption(readConsumptionInputs());
+  if(!r){ showToast('Fill in all the required fields first'); return; }
+  showToast('Preparing PDF…');
+  const doc = await pdfNewDoc('Fabric Consumption Calculation', 'YY Calculation — same formula as the manual worksheet');
+  if(!doc) return;
+  const inputs = readConsumptionInputs();
+  let y = 72;
+  y = pdfSectionTitle(doc, y, 'Inputs');
+  y = pdfTable(doc, y,
+    ['Fabric width (in)','Marker length (yds)','Marker length (in)','Extra allowance (in)','GSM','Pcs in marker','Wastage %','Order qty'],
+    [[inputs.width, inputs.markerYds, inputs.markerIn, inputs.extraIn, inputs.gsm, inputs.pcsInMarker, r.wastage, inputs.orderQty ?? '—']],
+    [110,110,110,110,80,90,80,80]
+  );
+  y += 12;
+  y = pdfSectionTitle(doc, y, 'Calculation');
+  y = pdfTable(doc, y,
+    ['Step','Formula','Result'],
+    [
+      ['Marker length (total)', 'Yards + (Inches + Extra) / 36', r.markerTotalYds.toFixed(4)+' yds'],
+      ['Yds / Pc', 'Marker length ÷ Pcs in marker', r.ydsPerPc.toFixed(4)+' yds'],
+      ['Mtr / Pc', 'Yds/Pc × 0.9144', r.mtrPerPc.toFixed(4)+' m'],
+      ['Kg / Pc (no wastage)', '(Mtr/Pc × Width × GSM) ÷ 39.37 ÷ 1000', r.kgPerPc.toFixed(4)+' kg'],
+      [`Kg / Pc (with ${r.wastage}% wastage)`, `Kg/Pc × (1 + ${r.wastage}%)`, r.kgPerPcWithWastage.toFixed(4)+' kg'],
+      ...(r.totalKg!==null ? [[`Total for ${r.orderQty} pcs`, 'Kg/Pc (with wastage) × Order qty', r.totalKg.toFixed(2)+' kg']] : []),
+    ],
+    [200,320,160]
+  );
+  doc.save('fabric_consumption.pdf');
+}
+function renderConsumptionCalculator(){
+  return `
+  <div class="panel">
+    <h2>Fabric Consumption Calculator</h2>
+    <p class="desc">The same "YY calculation" formula used on the manual worksheet — marker length, fabric width, and GSM in, consumption per piece (and per order, once you add a quantity) out. Updates live as you type.</p>
+    <div class="grid-cols" style="grid-template-columns:repeat(4,1fr);">
+      <div class="field"><label>Fabric width (inches)</label><input id="consWidth" type="number" step="0.01" placeholder="e.g. 66"></div>
+      <div class="field"><label>Marker length — yards</label><input id="consMarkerYds" type="number" step="0.01" placeholder="e.g. 6"></div>
+      <div class="field"><label>Marker length — inches</label><input id="consMarkerIn" type="number" step="0.01" placeholder="e.g. 34.75"></div>
+      <div class="field"><label>Extra allowance (inches)</label><input id="consExtra" type="number" step="0.01" value="2"></div>
+      <div class="field"><label>GSM</label><input id="consGsm" type="number" step="0.01" placeholder="e.g. 150"></div>
+      <div class="field"><label>No. of pcs in marker</label><input id="consPcsInMarker" type="number" step="1" placeholder="e.g. 100"></div>
+      <div class="field">
+        <label>Wastage %</label>
+        <input id="consWastagePct" type="number" step="0.1" placeholder="e.g. 5">
+        <div class="hint" style="margin-top:4px;">
+          <a href="#" class="wastage-preset" data-pct="3">Use 3%</a> · <a href="#" class="wastage-preset" data-pct="5">Use 5%</a>
+        </div>
+      </div>
+      <div class="field"><label>Order qty (optional — for total fabric required)</label><input id="consOrderQty" type="number" step="1" placeholder="e.g. 5550"></div>
+    </div>
+    <div class="row-actions" style="margin:14px 0;">
+      <button class="btn ghost small" id="resetConsumptionBtn">Reset</button>
+      <button class="btn ghost small" id="exportConsumptionPdfBtn">Export PDF</button>
+    </div>
+  </div>
+  <div class="panel">
+    <h2>Result</h2>
+    <div id="consResults">${emptyState('chart', 'Fill in the inputs above to see the calculation.')}</div>
+  </div>`;
+}
+
 /* ---------------- Event wiring ---------------- */
 
 function attachTabEvents(){
@@ -3823,6 +3950,24 @@ function attachTabEvents(){
       el.classList.add('active');
     });
   });
+
+  // Consumption Calculator — recalculates live on every keystroke rather than
+  // waiting for a Save/Calculate click, since this is a scratch-pad tool, not
+  // something that persists to DATA; nothing here is written until "Export PDF".
+  document.querySelectorAll('#consWidth, #consMarkerYds, #consMarkerIn, #consExtra, #consGsm, #consPcsInMarker, #consWastagePct, #consOrderQty')
+    .forEach(inp => inp.addEventListener('input', updateConsumptionResults));
+  document.querySelectorAll('.wastage-preset').forEach(a => {
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      const pctInput = document.getElementById('consWastagePct');
+      pctInput.value = a.dataset.pct;
+      updateConsumptionResults();
+    });
+  });
+  const resetConsBtn = document.getElementById('resetConsumptionBtn');
+  if(resetConsBtn) resetConsBtn.addEventListener('click', () => { renderTabContent(); });
+  const exportConsBtn = document.getElementById('exportConsumptionPdfBtn');
+  if(exportConsBtn) exportConsBtn.addEventListener('click', exportConsumptionPdf);
 
   // Dashboard filter bar — Buyer/Person filters re-render immediately (they're selects);
   // text/date fields wait for change (blur/enter) so typing doesn't re-render every keystroke.
