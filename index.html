@@ -3901,6 +3901,21 @@ function readConsumptionInputs(){
   };
 }
 function fmtKg(n){ return n===null || n===undefined ? '—' : n.toFixed(4); }
+// A fixed 0–5% wastage sweep off the same no-wastage base figure, shown alongside the
+// single wastage% the user actually typed — so the whole range is visible at a glance
+// instead of having to retype the wastage field five times to compare. Used by both
+// the kg-based (Manual/Automatic-yard) and meters-based (Automatic-metric) results.
+function wastageSweepTableHtml(basePerPc, unit){
+  const rows = [0,1,2,3,4,5].map(pct =>
+    `<tr><td>${pct}%</td><td class="mono">${(basePerPc*(1+pct/100)).toFixed(4)} ${unit}</td></tr>`
+  ).join('');
+  return `
+    <div class="hint" style="margin:14px 0 6px;font-weight:600;color:var(--ink-soft);">Consumption per piece at each wastage %</div>
+    <table>
+      <thead><tr><th>Wastage</th><th>Consumption / Pc</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
 // Shared by both Manual and Automatic mode so the result presentation — and the
 // exact wording of each formula step — never drifts between the two.
 function consumptionResultHtml(r){
@@ -3920,7 +3935,8 @@ function consumptionResultHtml(r){
         <tr><td>Kg / Pc (with wastage)</td><td class="mono">Kg/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.kgPerPcWithWastage.toFixed(4)} kg</td></tr>
         ${r.totalKg!==null ? `<tr><td>Total for order</td><td class="mono">Kg/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalKg.toFixed(2)} kg</td></tr>` : ''}
       </tbody>
-    </table>`;
+    </table>
+    ${wastageSweepTableHtml(r.kgPerPc, 'kg')}`;
 }
 function updateConsumptionResults(){
   const out = document.getElementById('consResults');
@@ -4066,7 +4082,8 @@ function metricConsumptionResultHtml(r){
         <tr><td>Required fabric width</td><td class="mono">Cuttable width + 4cm (constant)</td><td class="mono">${r.fullWidthCm.toFixed(2)} cm</td></tr>
       </tbody>
     </table>
-    <p class="hint" style="margin-top:8px;">No GSM needed for a meter-based marker — consumption is calculated directly by length, at the required fabric width above.</p>`;
+    <p class="hint" style="margin-top:8px;">No GSM needed for a meter-based marker — consumption is calculated directly by length, at the required fabric width above.</p>
+    ${wastageSweepTableHtml(r.lengthPerPcM, 'm')}`;
 }
 function readAutomaticInputs(){
   const num = id => { const el = document.getElementById(id); if(!el || el.value==='') return null; const v = parseFloat(el.value); return isNaN(v) ? null : v; };
