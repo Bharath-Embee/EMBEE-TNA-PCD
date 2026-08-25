@@ -507,17 +507,25 @@ async function renderPdfPageToCanvas(file){
 // footer text (Length/Width/Model-Size-Qty/Utilization) confined to a clean white strip
 // along the bottom. Feeding Tesseract the WHOLE image makes it scan all that diagram
 // noise for no benefit and can hurt recognition of the small text that actually matters
-// — so before OCR, crop down to just the bottom band. Falls back to the uncropped
-// source if cropping fails for any reason (never worse than not cropping at all).
-function cropCanvasFooter(canvas, fromFraction){
+// — so before OCR, crop down to just the bottom band AND upscale it. The crop alone
+// isn't enough: a real test upload showed Tesseract dropping/misreading characters
+// (periods read as spaces, "S" as "5", digits and even a trailing "in" unit vanishing
+// outright) because the footer text is only a few pixels tall at typical export
+// resolution — giving the OCR engine more pixels per character (the standard fix for
+// small-text OCR) is what actually addresses that, not just removing the diagram noise.
+function cropCanvasFooter(canvas, fromFraction, scale){
   fromFraction = fromFraction===undefined ? 0.72 : fromFraction;
+  scale = scale===undefined ? 3 : scale;
   const cropTop = Math.floor(canvas.height * fromFraction);
   const cropHeight = canvas.height - cropTop;
   if(cropHeight <= 0) return canvas;
   const out = document.createElement('canvas');
-  out.width = canvas.width;
-  out.height = cropHeight;
-  out.getContext('2d').drawImage(canvas, 0, cropTop, canvas.width, cropHeight, 0, 0, canvas.width, cropHeight);
+  out.width = canvas.width * scale;
+  out.height = cropHeight * scale;
+  const ctx = out.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(canvas, 0, cropTop, canvas.width, cropHeight, 0, 0, out.width, out.height);
   return out;
 }
 async function loadImageFileToCanvas(file){
