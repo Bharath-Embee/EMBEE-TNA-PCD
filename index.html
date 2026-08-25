@@ -322,6 +322,26 @@ let dashboardFilters = { buyerId:'all', personId:'all', style:'', season:'', dat
 let currentOrderExpanded = {};
 let editingPcdOrderId = null;
 let currentSetExpanded = {};
+let consumptionMode = 'manual'; // 'manual' | 'automatic' — Consumption Calculator tab
+// Automatic mode holds a LIST of parsed CAD markers, not just one — CAD teams often
+// split one style/material into multiple mini markers (cutting-table length limits,
+// buyer restrictions, pieces-per-lay caps), and multiple materials (SHELL/RIB/etc.)
+// can be uploaded together in one batch. Markers are grouped by Material+Style for
+// display/calculation (see groupMarkersByMaterial()); groups of 2+ markers get their
+// per-marker results averaged (see calcGroupAverageConsumption()).
+let consMarkersParsed = []; // [{ id, fileName, styleName, sizes, material, sets, efficiency, unitSystem, lengthBig, widthSmall }]
+let consGroupInputs = {}; // groupKey -> { gsm, wastagePct, orderQty }, keyed by Material+Style so values persist as markers are added/removed
+// Image markers can carry the piece count in TWO independent places — the file name's
+// size run (e.g. "(M2 L10 XL5)") and the OCR'd Model/Size/Qty text on the image itself.
+// When both are readable but disagree, the marker is held here (not in consMarkersParsed)
+// until the user confirms/corrects the total — never silently guessed for a number that
+// drives real fabric purchasing. See parseMarkerImageText() and resolvePendingMarker().
+let consPendingMarkers = []; // [{ id, fileName, base (marker fields minus sets), setsFromFileName, setsFromText }]
+// OCR read SOME text off a marker image/PDF but none of the expected fields matched —
+// held here with the raw text so it's visible (not a dead-end "couldn't find details"
+// toast with no way to tell why), and so a real failure can actually be diagnosed.
+let consUnreadableMarkers = []; // [{ id, fileName, rawText }]
+let consMarkerIdSeq = 0;
 let templatePastePreview = null; // {setId: string|null, name?: string, rows:[{name,dept,offset,error}]}
 let editingAccessUserId = null;
 let editingTasksUserId = null;
@@ -346,6 +366,9 @@ const ICONS = {
 };
 function emptyState(icon, text){
   return `<div class="empty">${ICONS[icon]||''}<span>${text}</span></div>`;
+}
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
 /* ---- PDF export (built on core jsPDF only — no autotable plugin dependency, for reliability) ----
@@ -379,6 +402,155 @@ function loadXlsxLib(){
     document.head.appendChild(script);
   });
   return xlsxLoadPromise;
+}
+/* ---- PDF reading (pdf.js) — for the Consumption Calculator's Automatic mode, which
+   extracts marker Length/Width/Sets straight out of an uploaded CAD marker PDF instead
+   of someone retyping them. Pinned to the 2.x line specifically because that's the last
+   major version cdnjs mirrors as a classic global-exposing script (window.pdfjsLib) —
+   3.x+ ships ES-module-only builds there, which a plain <script> tag can't consume the
+   same way jsPDF/xlsx/Chart.js are loaded elsewhere in this file. */
+let pdfJsLoadPromise = null;
+function loadPdfJsLib(){
+  if(window.pdfjsLib) return Promise.resolve(true);
+  if(pdfJsLoadPromise) return pdfJsLoadPromise;
+  pdfJsLoadPromise = new Promise((resolve) => {
+    const timeout = setTimeout(() => { resolve(false); }, 10000);
+    const script = document.createElement('script');
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js';
+    script.onload = () => {
+      clearTimeout(timeout);
+      if(!window.pdfjsLib){ resolve(false); return; }
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+      resolve(true);
+    };
+    script.onerror = () => { clearTimeout(timeout); resolve(false); };
+    document.head.appendChild(script);
+  });
+  return pdfJsLoadPromise;
+}
+// Pulls every page's text out of an uploaded marker PDF, joined into one string for
+// parseMarkerPdfText() to search. Returns null if the library couldn't load — callers
+// show that as "couldn't read this PDF, try Manual mode" rather than crashing.
+async function extractPdfText(file){
+  const ok = await loadPdfJsLib();
+  if(!ok || !window.pdfjsLib) return null;
+  try{
+    const buf = await file.arrayBuffer();
+    const doc = await window.pdfjsLib.getDocument({ data: buf }).promise;
+    let text = '';
+    for(let i=1; i<=doc.numPages; i++){
+      const page = await doc.getPage(i);
+      const content = await page.getTextContent();
+      text += content.items.map(it => it.str).join(' ') + '\n';
+    }
+    return text;
+  }catch(e){
+    console.error('extractPdfText error:', e);
+    return null;
+  }
+}
+// Some CAD/marker-making tools export a flattened raster image (JPG/PNG) instead of a
+// PDF — no text layer to search, so the marker's footer (Length, Width, Model/Size/Qty,
+// Utilization) has to be read via OCR. Tesseract.js, loaded on demand exactly like
+// pdf.js above. OCR is inherently less certain than the exact text-layer read used for
+// PDF markers — every parsed field is still shown on screen (see renderMarkerGroupBody's
+// info card) before it feeds the consumption calc, so a misread is visible, not silent.
+let tesseractLoadPromise = null;
+function loadTesseractLib(){
+  if(window.Tesseract) return Promise.resolve(true);
+  if(tesseractLoadPromise) return tesseractLoadPromise;
+  tesseractLoadPromise = new Promise((resolve) => {
+    const timeout = setTimeout(() => { resolve(false); }, 20000);
+    const script = document.createElement('script');
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/4.1.1/tesseract.min.js';
+    script.onload = () => { clearTimeout(timeout); resolve(!!window.Tesseract); };
+    script.onerror = () => { clearTimeout(timeout); resolve(false); };
+    document.head.appendChild(script);
+  });
+  return tesseractLoadPromise;
+}
+async function extractImageText(fileOrCanvas){
+  const ok = await loadTesseractLib();
+  if(!ok || !window.Tesseract) return null;
+  try{
+    const { data } = await window.Tesseract.recognize(fileOrCanvas, 'eng');
+    return data.text;
+  }catch(e){
+    console.error('extractImageText error:', e);
+    return null;
+  }
+}
+// Some marker-making tools export a PDF that's really just a flattened picture of the
+// page — pdf.js finds no real text layer (extractPdfText comes back empty), so the
+// PDF-format parser has nothing to match. Rather than reject the file outright, render
+// its first page to a canvas and OCR THAT the same way a JPG/PNG upload is read —
+// Tesseract accepts a canvas directly, no need to round-trip through a Blob/File.
+async function renderPdfPageToCanvas(file){
+  const ok = await loadPdfJsLib();
+  if(!ok || !window.pdfjsLib) return null;
+  try{
+    const buf = await file.arrayBuffer();
+    const doc = await window.pdfjsLib.getDocument({ data: buf }).promise;
+    const page = await doc.getPage(1);
+    const viewport = page.getViewport({ scale: 2 }); // upscale for sharper OCR input
+    const canvas = document.createElement('canvas');
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+    return canvas;
+  }catch(e){
+    console.error('renderPdfPageToCanvas error:', e);
+    return null;
+  }
+}
+// A marker export is mostly a busy, multi-colored cutting-plan diagram, with the actual
+// footer text (Length/Width/Model-Size-Qty/Utilization) confined to a clean white strip
+// along the bottom. Feeding Tesseract the WHOLE image makes it scan all that diagram
+// noise for no benefit and can hurt recognition of the small text that actually matters
+// — so before OCR, crop down to just the bottom band AND upscale it. The crop alone
+// isn't enough: a real test upload showed Tesseract dropping/misreading characters
+// (periods read as spaces, "S" as "5", digits and even a trailing "in" unit vanishing
+// outright) because the footer text is only a few pixels tall at typical export
+// resolution — giving the OCR engine more pixels per character (the standard fix for
+// small-text OCR) is what actually addresses that, not just removing the diagram noise.
+function cropCanvasFooter(canvas, fromFraction, scale){
+  fromFraction = fromFraction===undefined ? 0.72 : fromFraction;
+  scale = scale===undefined ? 3 : scale;
+  const cropTop = Math.floor(canvas.height * fromFraction);
+  const cropHeight = canvas.height - cropTop;
+  if(cropHeight <= 0) return canvas;
+  const out = document.createElement('canvas');
+  out.width = canvas.width * scale;
+  out.height = cropHeight * scale;
+  const ctx = out.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(canvas, 0, cropTop, canvas.width, cropHeight, 0, 0, out.width, out.height);
+  return out;
+}
+async function loadImageFileToCanvas(file){
+  try{
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+    const img = await new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = reject;
+      image.src = dataUrl;
+    });
+    const canvas = document.createElement('canvas');
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    canvas.getContext('2d').drawImage(img, 0, 0);
+    return canvas;
+  }catch(e){
+    console.error('loadImageFileToCanvas error:', e);
+    return null;
+  }
 }
 /* ---- Charts (Chart.js) — loaded on demand, same safe pattern as the PDF/Excel libraries ---- */
 let chartJsLoadPromise = null;
@@ -3829,9 +4001,12 @@ function renderNotify(){
    of a one-off Excel calculation. */
 function calcFabricConsumption(inputs){
   const { width, markerYds, markerIn, extraIn, gsm, pcsInMarker, wastagePct, orderQty } = inputs;
-  if([width, markerYds, markerIn, extraIn, gsm, pcsInMarker].some(v => v===null || isNaN(v) || v<=0)){
-    return null;
-  }
+  // Width/marker-yards/GSM/pieces can never legitimately be zero — treat as missing.
+  // markerIn/extraIn CAN legitimately be exactly 0 (a whole-yard marker length, or no
+  // extra allowance) — only reject those if truly missing or negative, not zero, since
+  // Automatic mode (CAD-parsed markers) always passes extraIn 0 deliberately.
+  if([width, markerYds, gsm, pcsInMarker].some(v => v===null || isNaN(v) || v<=0)) return null;
+  if([markerIn, extraIn].some(v => v===null || isNaN(v) || v<0)) return null;
   const markerTotalYds = markerYds + ((markerIn + extraIn) / 36);
   const ydsPerPc = markerTotalYds / pcsInMarker;
   const mtrPerPc = ydsPerPc * 0.9144;
@@ -3850,15 +4025,47 @@ function readConsumptionInputs(){
   };
 }
 function fmtKg(n){ return n===null || n===undefined ? '—' : n.toFixed(4); }
-function updateConsumptionResults(){
-  const out = document.getElementById('consResults');
-  if(!out) return;
-  const r = calcFabricConsumption(readConsumptionInputs());
-  if(!r){
-    out.innerHTML = emptyState('chart', 'Fill in Fabric Width, Marker Length (yds + inches), Extra allowance, GSM, and No. of Pcs in Marker to see the calculation.');
-    return;
-  }
-  out.innerHTML = `
+// A fixed 0–5% wastage sweep off the same no-wastage base figure, shown alongside the
+// single wastage% the user actually typed — so the whole range is visible at a glance
+// instead of having to retype the wastage field five times to compare. Used by both
+// the kg-based (Manual/Automatic-yard) and meters-based (Automatic-metric) results.
+function wastageSweepTableHtml(basePerPc, unit){
+  const rows = [0,1,2,3,4,5].map(pct =>
+    `<tr><td>${pct}%</td><td class="mono">${(basePerPc*(1+pct/100)).toFixed(4)} ${unit}</td></tr>`
+  ).join('');
+  return `
+    <div class="hint" style="margin:14px 0 6px;font-weight:600;color:var(--ink-soft);">Consumption per piece at each wastage %</div>
+    <table>
+      <thead><tr><th>Wastage</th><th>Consumption / Pc</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+// Same 0–5% sweep as wastageSweepTableHtml(), as pdfTable() rows instead of HTML —
+// used by every "Export PDF" button so the wastage comparison that's on screen is
+// also in the exported file, not just the live view.
+function wastageSweepPdfRows(basePerPc, unit){
+  return [0,1,2,3,4,5].map(pct => [pct+'%', (basePerPc*(1+pct/100)).toFixed(4)+' '+unit]);
+}
+// Automatic-yards needs Yds/Pc and Kg/Pc side by side in ONE sweep table (not two
+// stacked tables) so both units at a given wastage % sit on the same row.
+function wastageSweepDualTableHtml(basePerPcYds, basePerPcKg){
+  const rows = [0,1,2,3,4,5].map(pct =>
+    `<tr><td>${pct}%</td><td class="mono">${(basePerPcYds*(1+pct/100)).toFixed(4)} yds</td><td class="mono">${(basePerPcKg*(1+pct/100)).toFixed(4)} kg</td></tr>`
+  ).join('');
+  return `
+    <div class="hint" style="margin:14px 0 6px;font-weight:600;color:var(--ink-soft);">Consumption in Yds / Pc &amp; Consumption in Kg's / Pcs</div>
+    <table>
+      <thead><tr><th>Wastage</th><th>Yds / Pc</th><th>Kg / Pc</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+function wastageSweepDualPdfRows(basePerPcYds, basePerPcKg){
+  return [0,1,2,3,4,5].map(pct => [pct+'%', (basePerPcYds*(1+pct/100)).toFixed(4)+' yds', (basePerPcKg*(1+pct/100)).toFixed(4)+' kg']);
+}
+// Shared by both Manual and Automatic mode so the result presentation — and the
+// exact wording of each formula step — never drifts between the two.
+function consumptionResultHtml(r){
+  return `
     <div class="kpi-grid" style="margin-bottom:14px;">
       <div class="stat"><div class="num">${fmtKg(r.kgPerPc)}</div><div class="lbl">Kg / Pc (no wastage)</div></div>
       <div class="stat alert"><div class="num">${fmtKg(r.kgPerPcWithWastage)}</div><div class="lbl">Kg / Pc (with ${r.wastage}% wastage)</div></div>
@@ -3874,7 +4081,15 @@ function updateConsumptionResults(){
         <tr><td>Kg / Pc (with wastage)</td><td class="mono">Kg/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.kgPerPcWithWastage.toFixed(4)} kg</td></tr>
         ${r.totalKg!==null ? `<tr><td>Total for order</td><td class="mono">Kg/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalKg.toFixed(2)} kg</td></tr>` : ''}
       </tbody>
-    </table>`;
+    </table>
+    ${wastageSweepTableHtml(r.kgPerPc, 'kg')}`;
+}
+function updateConsumptionResults(){
+  const out = document.getElementById('consResults');
+  if(!out) return;
+  const r = calcFabricConsumption(readConsumptionInputs());
+  out.innerHTML = r ? consumptionResultHtml(r)
+    : emptyState('chart', 'Fill in Fabric Width, Marker Length (yds + inches), Extra allowance, GSM, and No. of Pcs in Marker to see the calculation.');
 }
 async function exportConsumptionPdf(){
   const r = calcFabricConsumption(readConsumptionInputs());
@@ -3904,13 +4119,589 @@ async function exportConsumptionPdf(){
     ],
     [200,320,160]
   );
+  y += 12;
+  y = pdfSectionTitle(doc, y, 'Consumption per piece at each wastage %');
+  y = pdfTable(doc, y, ['Wastage','Consumption / Pc'], wastageSweepPdfRows(r.kgPerPc, 'kg'), [120,160]);
   doc.save('fabric_consumption.pdf');
 }
+
+/* ---- Automatic mode — reads Length/Width/Sets straight out of an uploaded CAD marker
+   PDF instead of someone retyping them off a printout. The marker PDFs this reads
+   export a plain-text summary line at the bottom of the page in one of two forms:
+     Length:8yard6.16inch(8.17yard); Width:2yard0inch(72inch); ... Sets:25,...;
+     Length:0m60.34cm(0.6m);         Width:1m2cm(102cm);       ... Sets:22,...;
+   i.e. yard/inch markers or meter/cm markers — both seen in practice. Either way, the
+   parenthesised figure is already the fully-combined decimal (yards, or meters) for
+   Length, and the fully-combined decimal (inches, or cm) for Width, so no manual
+   whole+fraction arithmetic is needed — just pull those two numbers out.
+   Deliberately regex-based rather than routed through an LLM: the source data is
+   already exact, machine-generated text (not a photo or handwriting), so a precise text
+   match is strictly more reliable than a probabilistic reading — and this is a number
+   that drives real fabric purchasing, where "usually right" isn't good enough. */
+function parseMarkerPdfText(text){
+  const clean = text.replace(/\s+/g, ' ');
+  const styleMatch = clean.match(/Style\s*Name\s*:\s*([^;]+);/i);
+  const sizeMatch = clean.match(/\bSize\s*:\s*([^;]+);/i);
+  const materialMatch = clean.match(/Material\s*:\s*([^;]+);/i);
+  const setsMatch = clean.match(/Sets\s*:\s*(\d+)/i);
+  const effMatch = clean.match(/Efficiency\s*:\s*([\d.]+)\s*%/i);
+
+  let unitSystem = null, lengthBig = null, widthSmall = null;
+  const lenYd = clean.match(/Length\s*:\s*[\d.]+\s*yard\s*[\d.]+\s*inch\s*\(\s*([\d.]+)\s*yard\s*\)/i);
+  const widYd = clean.match(/Width\s*:\s*[\d.]+\s*yard\s*[\d.]+\s*inch\s*\(\s*([\d.]+)\s*inch\s*\)/i);
+  if(lenYd && widYd){
+    unitSystem = 'yard';
+    lengthBig = parseFloat(lenYd[1]);
+    widthSmall = parseFloat(widYd[1]);
+  }else{
+    const lenM = clean.match(/Length\s*:\s*[\d.]+\s*m\s*[\d.]+\s*cm\s*\(\s*([\d.]+)\s*m\s*\)/i);
+    const widM = clean.match(/Width\s*:\s*[\d.]+\s*m\s*[\d.]+\s*cm\s*\(\s*([\d.]+)\s*cm\s*\)/i);
+    if(lenM && widM){
+      unitSystem = 'metric';
+      lengthBig = parseFloat(lenM[1]);
+      widthSmall = parseFloat(widM[1]);
+    }
+  }
+  if(!unitSystem || !setsMatch) return null;
+
+  return {
+    styleName: styleMatch ? styleMatch[1].trim() : '',
+    sizes: sizeMatch ? sizeMatch[1].trim() : '',
+    material: materialMatch ? materialMatch[1].trim() : '',
+    sets: parseInt(setsMatch[1], 10),
+    efficiency: effMatch ? parseFloat(effMatch[1]) : null,
+    unitSystem, lengthBig, widthSmall,
+  };
+}
+// Parses whitespace-separated "SizeQty" tokens with no delimiter between the size code
+// and the count — e.g. "M2 L10 XL5" or "S3 M4 L4 XL4 2XL2" (the filename's size-run
+// convention). The non-greedy split keeps extending the size portion until whatever's
+// left is purely digits, which is what correctly resolves a token like "2XL2" into
+// size "2XL" + qty "2" rather than splitting after the leading digit.
+function parseSizeQtyTokens(str){
+  const tokens = str.trim().split(/\s+/).filter(Boolean);
+  if(tokens.length === 0) return null;
+  // A token with no trailing digit at all (e.g. "S", "XL", "2XL") means exactly one
+  // piece of that size — the size run only writes a trailing number when there's more
+  // than one, matching how "S/1 M/2 L/2 XL/1" prints in the OCR'd Model/Size/Qty text.
+  return tokens.map(tok => {
+    const m = tok.match(/^(.+?)(\d+)$/);
+    return m ? { size: m[1], qty: parseInt(m[2], 10) } : { size: tok, qty: 1 };
+  });
+}
+// Image-format markers (JPG/PNG) don't print a "Material:" field the way the PDF
+// report does — the closest equivalent is baked into the uploaded FILE NAME, not the
+// image content, following the convention "{StyleCode}({SizeRun}){Material}" e.g.
+// "308122(M2 L10 XL5)BODY.jpg". The filename is exact (no OCR risk) for Style+Material.
+// The size run in the parentheses ALSO gives an independent second read on the piece
+// count, alongside the OCR'd Model/Size/Qty text — see parseMarkerImageText(), which
+// cross-checks the two rather than trusting either alone. Confirmed with the user
+// against 4 real example filenames.
+function parseMarkerFileName(fileName){
+  const base = fileName.replace(/\.[a-zA-Z0-9]+$/, '');
+  const m = base.match(/^(.*?)\(([^)]*)\)\s*(.*)$/);
+  if(!m) return { styleName: base.trim(), material: '', sizeRunPairs: null };
+  return { styleName: m[1].trim(), material: m[3].trim(), sizeRunPairs: parseSizeQtyTokens(m[2]) };
+}
+// This format has no single "Sets:N" total the way the PDF report does. Two independent
+// sources can each supply it: the OCR'd "Model/Size/Qty" text on the image, and the
+// file name's own size run (see parseMarkerFileName). When only one is readable, that
+// one is used — this is still "calculated from inside the file or the file name", per
+// the user's instruction, whichever is actually available. When BOTH are readable, they
+// must AGREE; if they don't (an OCR misread, a stale filename, a genuinely different
+// marker), sets is left null and needsConfirmation carries both candidates so the
+// caller holds the marker for the user to confirm/correct rather than guessing which
+// one is right for a number that drives real fabric purchasing.
+function parseMarkerImageText(text, fileName){
+  // Two OCR misreads confirmed against real uploads, normalized before matching:
+  // (1) "Length" gets read as "Leggth" (n misread as g) — matched via a fuzzy label
+  //     pattern instead of the literal word. (2) The leading digit before "yd"/"m" can
+  //     be dropped or misread as the letter "S" (classic 5/S confusion, e.g. "5yd" ->
+  //     "Syd") — normalized back to "5" specifically in that position, since a bare "S"
+  //     immediately before "yd"/"m" is never itself a valid reading here.
+  const clean = text.replace(/\s+/g, ' ').replace(/\bS(?=\s*(?:yd|m)\b)/gi, '5');
+  const { styleName, material, sizeRunPairs } = parseMarkerFileName(fileName);
+  const LENGTH_LABEL = 'Le.{0,3}gth';
+
+  let unitSystem = null, lengthBig = null, widthSmall = null;
+  const lenYd = clean.match(new RegExp(LENGTH_LABEL + '\\s*:?\\s*(\\d+)\\s*yd\\s*([\\d.]+)\\s*in', 'i'));
+  const widYd = clean.match(/Width\s*:?\s*([\d.]+)\s*in/i);
+  if(lenYd && widYd){
+    unitSystem = 'yard';
+    lengthBig = parseFloat(lenYd[1]) + parseFloat(lenYd[2])/36;
+    widthSmall = parseFloat(widYd[1]);
+  }else{
+    const lenM = clean.match(new RegExp(LENGTH_LABEL + '\\s*:?\\s*(\\d+)\\s*m\\s*([\\d.]+)\\s*cm', 'i'));
+    const widM = clean.match(/Width\s*:?\s*([\d.]+)\s*cm/i);
+    if(lenM && widM){
+      unitSystem = 'metric';
+      lengthBig = parseFloat(lenM[1]) + parseFloat(lenM[2])/100;
+      widthSmall = parseFloat(widM[1]);
+    }
+  }
+  if(!unitSystem) return null;
+
+  const msqMatch = clean.match(/Model\s*\/\s*Size\s*\/\s*Qty\s*:?\s*(.+?)(?=\s*(?:Unplaced|Utilization|Yield|Print\s*Date|$))/i);
+  const textPairs = msqMatch ? [...msqMatch[1].matchAll(/([A-Za-z0-9]+)\s*\/\s*(\d+)/g)] : [];
+  const setsFromText = textPairs.length ? textPairs.reduce((s,p) => s + parseInt(p[2],10), 0) : null;
+  const sizesFromText = textPairs.length ? textPairs.map(p => p[1]+'/'+p[2]).join(', ') : null;
+  const setsFromFileName = sizeRunPairs ? sizeRunPairs.reduce((s,p) => s + p.qty, 0) : null;
+  const sizesFromFileName = sizeRunPairs ? sizeRunPairs.map(p => p.size+'/'+p.qty).join(', ') : null;
+
+  const effMatch = clean.match(/Utilization\s*:?\s*([\d.]+)\s*%/i);
+  const base = { styleName, material, efficiency: effMatch ? parseFloat(effMatch[1]) : null, unitSystem, lengthBig, widthSmall };
+
+  if(setsFromText!==null && setsFromFileName!==null){
+    if(setsFromText === setsFromFileName){
+      return { ...base, sizes: sizesFromText, sets: setsFromText, setsSource: 'both' };
+    }
+    return { ...base, sizes: sizesFromText || sizesFromFileName, sets: null, needsConfirmation: true, setsFromText, setsFromFileName };
+  }
+  if(setsFromText!==null) return { ...base, sizes: sizesFromText, sets: setsFromText, setsSource: 'image text' };
+  if(setsFromFileName!==null) return { ...base, sizes: sizesFromFileName, sets: setsFromFileName, setsSource: 'file name' };
+  return null; // neither source could establish a piece count — nothing to work with
+}
+// Yard/inch markers: GSM IS required (unlike the meter/cm path below), and both
+// extras are fixed constants per spec, not editable — +2in on the marker length
+// before dividing by Sets, +2in on the cuttable width to get the full fabric width
+// used for the weight calc (a marker's reported width is the CUTTABLE width; real
+// fabric rolls run wider than that). Normalizes onto the exact same (yards, inches)
+// basis calcFabricConsumption() already expects, then calls that same function
+// unchanged — Automatic mode is a different INPUT PATH, not different math — and
+// merges the full width used back onto the result so the UI can display it.
+const YARD_LENGTH_EXTRA_IN = 2; // constant, not editable
+const YARD_WIDTH_EXTRA_IN = 2; // constant, not editable
+function calcAutomaticConsumption(marker, gsm, wastagePct, orderQty){
+  if(!marker || marker.unitSystem!=='yard') return null;
+  const fullWidthIn = marker.widthSmall + YARD_WIDTH_EXTRA_IN;
+  const r = calcFabricConsumption({
+    width: fullWidthIn, markerYds: marker.lengthBig, markerIn: 0, extraIn: YARD_LENGTH_EXTRA_IN,
+    gsm, pcsInMarker: marker.sets, wastagePct, orderQty,
+  });
+  return r ? { ...r, fullWidthIn } : null;
+}
+// Automatic-yards' own result view — distinct from consumptionResultHtml() (Manual
+// mode, unchanged) because the spec for this path differs: no Mtr/Pc shown (yards
+// and kg are what merchandising actually orders by, not meters), and Yds/Pc and
+// Kg/Pc are shown together with a 0-5% wastage sweep for EACH unit.
+function automaticYardResultHtml(r){
+  return `
+    <div class="kpi-grid" style="margin-bottom:14px;">
+      <div class="stat"><div class="num">${r.ydsPerPc.toFixed(4)}</div><div class="lbl">Yds / Pc</div></div>
+      <div class="stat"><div class="num">${fmtKg(r.kgPerPc)}</div><div class="lbl">Kg / Pc (no wastage)</div></div>
+      <div class="stat alert"><div class="num">${fmtKg(r.kgPerPcWithWastage)}</div><div class="lbl">Kg / Pc (with ${r.wastage}% wastage)</div></div>
+      ${r.totalKg!==null ? `<div class="stat"><div class="num">${r.totalKg.toFixed(2)}</div><div class="lbl">Total Kg for ${r.orderQty} pcs</div></div>` : ''}
+    </div>
+    <table>
+      <thead><tr><th>Step</th><th>Formula</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td>Marker length (total)</td><td class="mono">Length + 2in (constant)</td><td class="mono">${r.markerTotalYds.toFixed(4)} yds</td></tr>
+        <tr><td>Yds / Pc</td><td class="mono">Marker length ÷ Sets</td><td class="mono">${r.ydsPerPc.toFixed(4)} yds</td></tr>
+        <tr><td>Kg / Pc (no wastage)</td><td class="mono">(Yds/Pc × 0.9144 × Full width × GSM) ÷ 39.37 ÷ 1000</td><td class="mono">${r.kgPerPc.toFixed(4)} kg</td></tr>
+        <tr><td>Kg / Pc (with wastage)</td><td class="mono">Kg/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.kgPerPcWithWastage.toFixed(4)} kg</td></tr>
+        ${r.totalKg!==null ? `<tr><td>Total for order</td><td class="mono">Kg/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalKg.toFixed(2)} kg</td></tr>` : ''}
+        <tr><td>Required fabric width</td><td class="mono">Cuttable width + 2in (constant)</td><td class="mono">${r.fullWidthIn.toFixed(2)} in</td></tr>
+      </tbody>
+    </table>
+    ${wastageSweepDualTableHtml(r.ydsPerPc, r.kgPerPc)}`;
+}
+// Meter/cm markers get their own rule, distinct from the yard/kg path above: no GSM
+// at all — consumption is the marker LENGTH per piece (in meters), not a weight, since
+// meter-based materials (fusing/interlining, trims) are bought by running length at a
+// given width, not by kg. Both extras here are fixed constants per spec, not editable:
+// +5cm on the marker length before dividing by Sets, +4cm on the cuttable width to get
+// the fabric width actually needed (shown for reference — it doesn't feed the length
+// math, since there's no weight term for it to multiply into).
+const METRIC_LENGTH_EXTRA_M = 0.05; // 5cm, constant
+const METRIC_WIDTH_EXTRA_CM = 4; // constant
+function calcMetricConsumption(marker, wastagePct, orderQty){
+  if(!marker || marker.unitSystem!=='metric') return null;
+  if(marker.lengthBig===null || isNaN(marker.lengthBig) || marker.lengthBig<=0) return null;
+  if(marker.widthSmall===null || isNaN(marker.widthSmall) || marker.widthSmall<=0) return null;
+  if(!marker.sets || marker.sets<=0) return null;
+  const totalLengthM = marker.lengthBig + METRIC_LENGTH_EXTRA_M;
+  const lengthPerPcM = totalLengthM / marker.sets;
+  const fullWidthCm = marker.widthSmall + METRIC_WIDTH_EXTRA_CM;
+  const wastage = (wastagePct===null || isNaN(wastagePct)) ? 0 : wastagePct;
+  const lengthPerPcWithWastageM = lengthPerPcM * (1 + wastage/100);
+  const totalM = (orderQty!==null && !isNaN(orderQty) && orderQty>0) ? lengthPerPcWithWastageM * orderQty : null;
+  return { totalLengthM, lengthPerPcM, fullWidthCm, wastage, lengthPerPcWithWastageM, orderQty, totalM };
+}
+function metricConsumptionResultHtml(r){
+  if(!r) return emptyState('chart', 'Could not calculate — check the marker data.');
+  return `
+    <div class="kpi-grid" style="margin-bottom:14px;">
+      <div class="stat"><div class="num">${r.lengthPerPcM.toFixed(4)}</div><div class="lbl">Meters / Pc (no wastage)</div></div>
+      <div class="stat alert"><div class="num">${r.lengthPerPcWithWastageM.toFixed(4)}</div><div class="lbl">Meters / Pc (with ${r.wastage}% wastage)</div></div>
+      ${r.totalM!==null ? `<div class="stat"><div class="num">${r.totalM.toFixed(2)}</div><div class="lbl">Total Meters for ${r.orderQty} pcs</div></div>` : ''}
+    </div>
+    <table>
+      <thead><tr><th>Step</th><th>Formula</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td>Marker length (total)</td><td class="mono">Length + 5cm (constant)</td><td class="mono">${r.totalLengthM.toFixed(4)} m</td></tr>
+        <tr><td>Meters / Pc</td><td class="mono">Marker length ÷ Sets</td><td class="mono">${r.lengthPerPcM.toFixed(4)} m</td></tr>
+        <tr><td>Meters / Pc (with wastage)</td><td class="mono">Meters/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.lengthPerPcWithWastageM.toFixed(4)} m</td></tr>
+        ${r.totalM!==null ? `<tr><td>Total for order</td><td class="mono">Meters/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalM.toFixed(2)} m</td></tr>` : ''}
+        <tr><td>Required fabric width</td><td class="mono">Cuttable width + 4cm (constant)</td><td class="mono">${r.fullWidthCm.toFixed(2)} cm</td></tr>
+      </tbody>
+    </table>
+    <p class="hint" style="margin-top:8px;">No GSM needed for a meter-based marker — consumption is calculated directly by length, at the required fabric width above.</p>
+    ${wastageSweepTableHtml(r.lengthPerPcM, 'm')}`;
+}
+// ---- Multiple markers per material/style ----
+// CAD teams often split one style+material into several mini markers (a lay/cutting
+// table can't fit every size run, or a buyer restricts pieces-per-lay), and a batch
+// upload may cover several materials (SHELL, RIB, JERSEY...) at once. Markers are
+// grouped by Material + Style Name (+ unit system, so yard and metric markers never
+// get averaged together) into one result per group; a group with 2+ markers has its
+// members' own per-piece results averaged (confirmed with the user: plain arithmetic
+// mean of each marker's own result, not a pieces-weighted pool).
+function slugifyGroupKey(key){ return key.replace(/[^A-Za-z0-9]+/g, '_').slice(0, 60); }
+function groupMarkersByMaterial(markers){
+  const byKey = new Map();
+  markers.forEach(m => {
+    const materialKey = (m.material||'Unspecified').trim().toUpperCase() || 'UNSPECIFIED';
+    const styleKey = (m.styleName||'Unspecified').trim().toUpperCase() || 'UNSPECIFIED';
+    const key = materialKey + '|' + styleKey + '|' + m.unitSystem;
+    if(!byKey.has(key)){
+      byKey.set(key, { key, material: m.material||'Unspecified', styleName: m.styleName||'Unspecified', unitSystem: m.unitSystem, markers: [] });
+    }
+    byKey.get(key).markers.push(m);
+  });
+  return [...byKey.values()].sort((a,b) => a.material.localeCompare(b.material) || a.styleName.localeCompare(b.styleName));
+}
+function getGroupInputs(group){
+  if(!consGroupInputs[group.key]) consGroupInputs[group.key] = { gsm: null, wastagePct: null, orderQty: null };
+  return consGroupInputs[group.key];
+}
+// A single marker in its group is just calcAutomaticConsumption's normal result (tagged
+// markerCount:1) so the well-tested single-marker view/formula table is reused unchanged.
+// 2+ markers: compute each one's OWN Yds/Pc & Kg/Pc independently (no wastage/qty yet),
+// then average those results — wastage % and order qty are applied once, on the average.
+function calcGroupAverageYardConsumption(group, gsm, wastagePct, orderQty){
+  if(group.markers.length === 1){
+    const r = calcAutomaticConsumption(group.markers[0], gsm, wastagePct, orderQty);
+    return r ? { ...r, markerCount: 1, perMarker: [{ fileName: group.markers[0].fileName, ydsPerPc: r.ydsPerPc, kgPerPc: r.kgPerPc }] } : null;
+  }
+  const perMarker = group.markers.map(m => {
+    const mr = calcAutomaticConsumption(m, gsm, null, null);
+    return mr ? { fileName: m.fileName, ydsPerPc: mr.ydsPerPc, kgPerPc: mr.kgPerPc, fullWidthIn: mr.fullWidthIn } : null;
+  });
+  if(perMarker.some(x => x===null)) return null;
+  const n = perMarker.length;
+  const ydsPerPc = perMarker.reduce((s,x)=>s+x.ydsPerPc,0) / n;
+  const kgPerPc = perMarker.reduce((s,x)=>s+x.kgPerPc,0) / n;
+  const fullWidthIn = perMarker.reduce((s,x)=>s+x.fullWidthIn,0) / n;
+  const wastage = (wastagePct===null || isNaN(wastagePct)) ? 0 : wastagePct;
+  const kgPerPcWithWastage = kgPerPc * (1 + wastage/100);
+  const totalKg = (orderQty!==null && !isNaN(orderQty) && orderQty>0) ? kgPerPcWithWastage * orderQty : null;
+  return { perMarker, markerCount: n, ydsPerPc, kgPerPc, fullWidthIn, wastage, kgPerPcWithWastage, orderQty, totalKg };
+}
+function calcGroupAverageMetricConsumption(group, wastagePct, orderQty){
+  if(group.markers.length === 1){
+    const r = calcMetricConsumption(group.markers[0], wastagePct, orderQty);
+    return r ? { ...r, markerCount: 1, perMarker: [{ fileName: group.markers[0].fileName, lengthPerPcM: r.lengthPerPcM }] } : null;
+  }
+  const perMarker = group.markers.map(m => {
+    const mr = calcMetricConsumption(m, null, null);
+    return mr ? { fileName: m.fileName, lengthPerPcM: mr.lengthPerPcM, fullWidthCm: mr.fullWidthCm } : null;
+  });
+  if(perMarker.some(x => x===null)) return null;
+  const n = perMarker.length;
+  const lengthPerPcM = perMarker.reduce((s,x)=>s+x.lengthPerPcM,0) / n;
+  const fullWidthCm = perMarker.reduce((s,x)=>s+x.fullWidthCm,0) / n;
+  const wastage = (wastagePct===null || isNaN(wastagePct)) ? 0 : wastagePct;
+  const lengthPerPcWithWastageM = lengthPerPcM * (1 + wastage/100);
+  const totalM = (orderQty!==null && !isNaN(orderQty) && orderQty>0) ? lengthPerPcWithWastageM * orderQty : null;
+  return { perMarker, markerCount: n, lengthPerPcM, fullWidthCm, wastage, lengthPerPcWithWastageM, orderQty, totalM };
+}
+function groupAuditTableHtml(perMarker, cols){
+  const rows = perMarker.map(x => `<tr><td>${x.fileName}</td>${cols.map(c => `<td class="mono">${c.fmt(x)}</td>`).join('')}</tr>`).join('');
+  return `
+    <table>
+      <thead><tr><th>Marker file</th>${cols.map(c=>`<th>${c.label}</th>`).join('')}</tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+function groupYardResultHtml(group, r){
+  if(r.markerCount === 1) return automaticYardResultHtml(r);
+  return `
+    <p class="hint" style="margin:0 0 10px;font-weight:600;color:var(--ink-soft);">Averaged across ${r.markerCount} markers for ${group.material} / ${group.styleName}</p>
+    ${groupAuditTableHtml(r.perMarker, [
+      {label:'Yds / Pc', fmt:x=>x.ydsPerPc.toFixed(4)},
+      {label:'Kg / Pc', fmt:x=>fmtKg(x.kgPerPc)},
+    ])}
+    <div class="kpi-grid" style="margin:14px 0;">
+      <div class="stat"><div class="num">${r.ydsPerPc.toFixed(4)}</div><div class="lbl">Avg Yds / Pc</div></div>
+      <div class="stat"><div class="num">${fmtKg(r.kgPerPc)}</div><div class="lbl">Avg Kg / Pc (no wastage)</div></div>
+      <div class="stat alert"><div class="num">${fmtKg(r.kgPerPcWithWastage)}</div><div class="lbl">Avg Kg / Pc (with ${r.wastage}% wastage)</div></div>
+      ${r.totalKg!==null ? `<div class="stat"><div class="num">${r.totalKg.toFixed(2)}</div><div class="lbl">Total Kg for ${r.orderQty} pcs</div></div>` : ''}
+    </div>
+    <table>
+      <thead><tr><th>Step</th><th>Formula</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td>Avg Kg / Pc (with wastage)</td><td class="mono">Avg Kg/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.kgPerPcWithWastage.toFixed(4)} kg</td></tr>
+        ${r.totalKg!==null ? `<tr><td>Total for order</td><td class="mono">Avg Kg/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalKg.toFixed(2)} kg</td></tr>` : ''}
+        <tr><td>Avg required fabric width</td><td class="mono">Average of each marker's (cuttable width + 2in)</td><td class="mono">${r.fullWidthIn.toFixed(2)} in</td></tr>
+      </tbody>
+    </table>
+    ${wastageSweepDualTableHtml(r.ydsPerPc, r.kgPerPc)}`;
+}
+function groupMetricResultHtml(group, r){
+  if(r.markerCount === 1) return metricConsumptionResultHtml(r);
+  return `
+    <p class="hint" style="margin:0 0 10px;font-weight:600;color:var(--ink-soft);">Averaged across ${r.markerCount} markers for ${group.material} / ${group.styleName}</p>
+    ${groupAuditTableHtml(r.perMarker, [{label:'Meters / Pc', fmt:x=>x.lengthPerPcM.toFixed(4)}])}
+    <div class="kpi-grid" style="margin:14px 0;">
+      <div class="stat"><div class="num">${r.lengthPerPcM.toFixed(4)}</div><div class="lbl">Avg Meters / Pc (no wastage)</div></div>
+      <div class="stat alert"><div class="num">${r.lengthPerPcWithWastageM.toFixed(4)}</div><div class="lbl">Avg Meters / Pc (with ${r.wastage}% wastage)</div></div>
+      ${r.totalM!==null ? `<div class="stat"><div class="num">${r.totalM.toFixed(2)}</div><div class="lbl">Total Meters for ${r.orderQty} pcs</div></div>` : ''}
+    </div>
+    <table>
+      <thead><tr><th>Step</th><th>Formula</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td>Avg Meters / Pc (with wastage)</td><td class="mono">Avg Meters/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.lengthPerPcWithWastageM.toFixed(4)} m</td></tr>
+        ${r.totalM!==null ? `<tr><td>Total for order</td><td class="mono">Avg Meters/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalM.toFixed(2)} m</td></tr>` : ''}
+        <tr><td>Avg required fabric width</td><td class="mono">Average of each marker's (cuttable width + 4cm)</td><td class="mono">${r.fullWidthCm.toFixed(2)} cm</td></tr>
+      </tbody>
+    </table>
+    <p class="hint" style="margin-top:8px;">No GSM needed for a meter-based marker.</p>
+    ${wastageSweepTableHtml(r.lengthPerPcM, 'm')}`;
+}
+function updateGroupResults(groupKey){
+  const group = groupMarkersByMaterial(consMarkersParsed).find(g => g.key === groupKey);
+  if(!group) return;
+  const out = document.getElementById('consGroupResults_'+slugifyGroupKey(group.key));
+  if(!out) return;
+  const inputs = getGroupInputs(group);
+  if(group.unitSystem==='metric'){
+    const r = calcGroupAverageMetricConsumption(group, inputs.wastagePct, inputs.orderQty);
+    out.innerHTML = r ? groupMetricResultHtml(group, r) : emptyState('chart', 'Could not calculate — check the marker data.');
+    return;
+  }
+  const r = inputs.gsm!==null ? calcGroupAverageYardConsumption(group, inputs.gsm, inputs.wastagePct, inputs.orderQty) : null;
+  out.innerHTML = r ? groupYardResultHtml(group, r) : emptyState('chart', 'Enter GSM above to see the consumption.');
+}
+async function exportGroupConsumptionPdf(groupKey){
+  const group = groupMarkersByMaterial(consMarkersParsed).find(g => g.key === groupKey);
+  if(!group) return;
+  const inputs = getGroupInputs(group);
+  const isMetric = group.unitSystem === 'metric';
+  const subtitle = `${group.material} / ${group.styleName} — ${group.markers.length} marker${group.markers.length>1?'s':''} combined`;
+  const markerRows = group.markers.map(m => [
+    m.fileName, m.sizes||'—',
+    isMetric ? m.lengthBig.toFixed(2)+' m' : m.lengthBig.toFixed(2)+' yd',
+    isMetric ? m.widthSmall.toFixed(2)+' cm' : m.widthSmall.toFixed(2)+' in',
+    m.sets, m.efficiency!==null ? m.efficiency+'%' : '—',
+  ]);
+  if(isMetric){
+    const r = calcGroupAverageMetricConsumption(group, inputs.wastagePct, inputs.orderQty);
+    if(!r){ showToast('Could not calculate — check the marker data'); return; }
+    showToast('Preparing PDF…');
+    const doc = await pdfNewDoc('Fabric Consumption Calculation', subtitle);
+    if(!doc) return;
+    let y = 72;
+    y = pdfSectionTitle(doc, y, 'Markers (read from uploaded PDFs)');
+    y = pdfTable(doc, y, ['File','Sizes','Marker length','Marker width (cuttable)','Sets','Efficiency'], markerRows, [140,110,90,120,50,70]);
+    y += 12;
+    if(r.markerCount>1){
+      y = pdfSectionTitle(doc, y, 'Per-marker Meters / Pc (before averaging)');
+      y = pdfTable(doc, y, ['File','Meters / Pc'], r.perMarker.map(x=>[x.fileName, x.lengthPerPcM.toFixed(4)+' m']), [220,160]);
+      y += 12;
+    }
+    y = pdfSectionTitle(doc, y, (r.markerCount>1?'Averaged calculation':'Calculation') + ' — meter-based, no GSM required');
+    y = pdfTable(doc, y,
+      ['Step','Formula','Result'],
+      [
+        [r.markerCount>1?'Avg Meters / Pc':'Meters / Pc', r.markerCount>1?"Average of each marker's Meters/Pc":'Marker length ÷ Sets', r.lengthPerPcM.toFixed(4)+' m'],
+        [`Meters / Pc (with ${r.wastage}% wastage)`, `Meters/Pc × (1 + ${r.wastage}%)`, r.lengthPerPcWithWastageM.toFixed(4)+' m'],
+        ...(r.totalM!==null ? [[`Total for ${r.orderQty} pcs`, 'Meters/Pc (with wastage) × Order qty', r.totalM.toFixed(2)+' m']] : []),
+        [r.markerCount>1?'Avg required fabric width':'Required fabric width', r.markerCount>1?"Average of each marker's (cuttable width + 4cm)":'Cuttable width + 4cm (constant)', r.fullWidthCm.toFixed(2)+' cm'],
+      ],
+      [200,320,160]
+    );
+    y += 12;
+    y = pdfSectionTitle(doc, y, 'Consumption per piece at each wastage %');
+    y = pdfTable(doc, y, ['Wastage','Consumption / Pc'], wastageSweepPdfRows(r.lengthPerPcM, 'm'), [120,160]);
+    doc.save(`fabric_consumption_${slugifyGroupKey(group.key)}.pdf`);
+    return;
+  }
+  if(inputs.gsm===null){ showToast('Enter GSM first'); return; }
+  const r = calcGroupAverageYardConsumption(group, inputs.gsm, inputs.wastagePct, inputs.orderQty);
+  if(!r){ showToast('Could not calculate — check the marker data'); return; }
+  showToast('Preparing PDF…');
+  const doc = await pdfNewDoc('Fabric Consumption Calculation', subtitle);
+  if(!doc) return;
+  let y = 72;
+  y = pdfSectionTitle(doc, y, 'Markers (read from uploaded PDFs)');
+  y = pdfTable(doc, y, ['File','Sizes','Marker length','Marker width (cuttable)','Sets','Efficiency'], markerRows, [140,110,90,120,50,70]);
+  y += 12;
+  if(r.markerCount>1){
+    y = pdfSectionTitle(doc, y, 'Per-marker Yds/Pc & Kg/Pc (before averaging)');
+    y = pdfTable(doc, y, ['File','Yds / Pc','Kg / Pc'], r.perMarker.map(x=>[x.fileName, x.ydsPerPc.toFixed(4)+' yds', fmtKg(x.kgPerPc)+' kg']), [220,160,160]);
+    y += 12;
+  }
+  y = pdfSectionTitle(doc, y, 'Inputs');
+  y = pdfTable(doc, y, ['GSM','Wastage %','Order qty'], [[inputs.gsm, r.wastage, inputs.orderQty ?? '—']], [90,90,90]);
+  y += 12;
+  y = pdfSectionTitle(doc, y, r.markerCount>1 ? 'Averaged calculation' : 'Calculation');
+  y = pdfTable(doc, y,
+    ['Step','Formula','Result'],
+    [
+      [r.markerCount>1?'Avg Yds / Pc':'Yds / Pc', r.markerCount>1?"Average of each marker's Yds/Pc":'Marker length ÷ Sets', r.ydsPerPc.toFixed(4)+' yds'],
+      [r.markerCount>1?'Avg Kg / Pc (no wastage)':'Kg / Pc (no wastage)', r.markerCount>1?"Average of each marker's Kg/Pc":'(Yds/Pc × 0.9144 × Full width × GSM) ÷ 39.37 ÷ 1000', r.kgPerPc.toFixed(4)+' kg'],
+      [`Kg / Pc (with ${r.wastage}% wastage)`, `Kg/Pc × (1 + ${r.wastage}%)`, r.kgPerPcWithWastage.toFixed(4)+' kg'],
+      ...(r.totalKg!==null ? [[`Total for ${r.orderQty} pcs`, 'Kg/Pc (with wastage) × Order qty', r.totalKg.toFixed(2)+' kg']] : []),
+      [r.markerCount>1?'Avg required fabric width':'Required fabric width', r.markerCount>1?"Average of each marker's (cuttable width + 2in)":'Cuttable width + 2in (constant)', r.fullWidthIn.toFixed(2)+' in'],
+    ],
+    [200,320,160]
+  );
+  y += 12;
+  y = pdfSectionTitle(doc, y, "Consumption in Yds / Pc & Consumption in Kg's / Pcs");
+  y = pdfTable(doc, y, ['Wastage','Yds / Pc','Kg / Pc'], wastageSweepDualPdfRows(r.ydsPerPc, r.kgPerPc), [110,140,140]);
+  doc.save(`fabric_consumption_${slugifyGroupKey(group.key)}.pdf`);
+}
+function renderMarkerGroupBody(group){
+  const slug = slugifyGroupKey(group.key);
+  const inputs = getGroupInputs(group);
+  const isMetric = group.unitSystem === 'metric';
+  const infoCard = `
+    <div class="panel" style="background:var(--green-soft);border-color:var(--green);">
+      <div style="font-weight:600;font-family:'Space Grotesk',sans-serif;margin-bottom:10px;">
+        ${group.material} — ${group.styleName}${group.markers.length>1 ? ` (${group.markers.length} markers combined)` : ''}${isMetric ? ' — meter-based, no GSM needed' : ''}
+      </div>
+      ${group.markers.map(m => `
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid var(--green);padding:8px 0 0;margin-top:8px;">
+          <div><span class="mono">${m.fileName}</span> — ${m.sets} pcs${m.setsSource ? ` <span class="hint">(${m.setsSource})</span>` : ''}, ${isMetric ? m.lengthBig.toFixed(2)+'m × '+m.widthSmall.toFixed(2)+'cm' : m.lengthBig.toFixed(2)+'yd × '+m.widthSmall.toFixed(2)+'in'}, eff ${m.efficiency!==null?m.efficiency+'%':'—'}</div>
+          <a href="#" class="remove-marker-link" data-marker-id="${m.id}" style="color:var(--thread-red);white-space:nowrap;">Remove</a>
+        </div>`).join('')}
+    </div>`;
+
+  const fieldsHtml = isMetric ? `
+    <div class="grid-cols" style="grid-template-columns:repeat(2,1fr);">
+      <div class="field">
+        <label>Wastage %</label>
+        <input id="consGroupWastage_${slug}" data-group-key="${group.key}" type="number" step="0.1" placeholder="e.g. 5" value="${inputs.wastagePct ?? ''}">
+        <div class="hint" style="margin-top:4px;">
+          <a href="#" class="group-wastage-preset" data-group-key="${group.key}" data-pct="3">Use 3%</a> · <a href="#" class="group-wastage-preset" data-group-key="${group.key}" data-pct="5">Use 5%</a>
+        </div>
+      </div>
+      <div class="field"><label>Order qty (optional)</label><input id="consGroupQty_${slug}" data-group-key="${group.key}" type="number" step="1" placeholder="e.g. 5550" value="${inputs.orderQty ?? ''}"></div>
+    </div>` : `
+    <div class="grid-cols" style="grid-template-columns:repeat(3,1fr);">
+      <div class="field"><label>GSM</label><input id="consGroupGsm_${slug}" data-group-key="${group.key}" type="number" step="0.01" placeholder="e.g. 150" value="${inputs.gsm ?? ''}"></div>
+      <div class="field">
+        <label>Wastage %</label>
+        <input id="consGroupWastage_${slug}" data-group-key="${group.key}" type="number" step="0.1" placeholder="e.g. 5" value="${inputs.wastagePct ?? ''}">
+        <div class="hint" style="margin-top:4px;">
+          <a href="#" class="group-wastage-preset" data-group-key="${group.key}" data-pct="3">Use 3%</a> · <a href="#" class="group-wastage-preset" data-group-key="${group.key}" data-pct="5">Use 5%</a>
+        </div>
+      </div>
+      <div class="field"><label>Order qty (optional)</label><input id="consGroupQty_${slug}" data-group-key="${group.key}" type="number" step="1" placeholder="e.g. 5550" value="${inputs.orderQty ?? ''}"></div>
+    </div>
+    <div class="hint" style="margin:6px 0 0;">Fabric width used = marker's cuttable width + 2in (fixed) · marker length used = as read + 2in (fixed) — neither is editable.</div>`;
+
+  let resultsHtml;
+  if(isMetric){
+    const r = calcGroupAverageMetricConsumption(group, inputs.wastagePct, inputs.orderQty);
+    resultsHtml = r ? groupMetricResultHtml(group, r) : emptyState('chart', 'Could not calculate — check the marker data.');
+  }else{
+    const r = inputs.gsm!==null ? calcGroupAverageYardConsumption(group, inputs.gsm, inputs.wastagePct, inputs.orderQty) : null;
+    resultsHtml = r ? groupYardResultHtml(group, r) : emptyState('chart', 'Enter GSM above to see the consumption.');
+  }
+
+  return `
+    ${infoCard}
+    ${fieldsHtml}
+    <div class="row-actions" style="margin:14px 0;">
+      <button class="btn ghost small export-group-pdf-btn" data-group-key="${group.key}">Export PDF</button>
+    </div>
+    <div id="consGroupResults_${slug}">${resultsHtml}</div>`;
+}
+function rerenderAutomaticBody(){
+  const body = document.getElementById('consAutoBody');
+  if(body){ body.innerHTML = renderAutomaticMarkerBody(); attachConsumptionAutoEvents(); }
+}
+// A pending marker's file name and OCR'd image text each gave a different total piece
+// count — never auto-picked, since guessing wrong silently drives a real purchasing
+// number. Both candidates are shown side by side with a source label, plus a field for
+// the user to type the correct total; nothing here is added to consMarkersParsed (and
+// so never enters grouping/averaging) until resolvePendingMarker() confirms it.
+function renderPendingMarkerConfirmations(){
+  const cards = consPendingMarkers.map((m, i) => `
+    <div class="panel" style="background:var(--brass-soft);border-color:var(--brass);${i<consPendingMarkers.length-1?'margin-bottom:12px;':''}">
+      <div style="font-weight:600;font-family:'Space Grotesk',sans-serif;margin-bottom:6px;">${m.fileName} — piece count mismatch</div>
+      <div class="hint" style="margin-bottom:10px;">${m.styleName||'—'} / ${m.material||'Unspecified'} — the file name and the marker's own image text disagree on total pieces. Enter the correct total before this marker is used.</div>
+      <div class="grid-cols" style="grid-template-columns:repeat(3,1fr);gap:10px;align-items:end;">
+        <div><div class="hint">From file name</div><div class="mono">${m.setsFromFileName}</div></div>
+        <div><div class="hint">From image text</div><div class="mono">${m.setsFromText}</div></div>
+        <div class="field"><label>Correct total pieces</label><input id="pendingSets_${m.id}" type="number" step="1" placeholder="e.g. ${m.setsFromFileName}"></div>
+      </div>
+      <div class="row-actions" style="margin-top:12px;">
+        <button class="btn small confirm-pending-marker-btn" data-marker-id="${m.id}">Confirm &amp; add</button>
+        <button class="btn ghost small discard-pending-marker-btn" data-marker-id="${m.id}">Discard this marker</button>
+      </div>
+    </div>`).join('');
+  return `<div class="panel" style="margin-bottom:16px;"><h2 style="margin-bottom:10px;">Needs your confirmation (${consPendingMarkers.length})</h2>${cards}</div>`;
+}
+// OCR (or a flattened-PDF-render-then-OCR) produced text but none of the expected
+// fields matched it — shown with the raw text rather than a dead-end "couldn't find
+// details" toast, so a real read failure is actually diagnosable instead of a guess.
+function renderUnreadableMarkers(){
+  const cards = consUnreadableMarkers.map((m, i) => `
+    <div class="panel" style="background:var(--thread-red-dim);border-color:var(--thread-red);${i<consUnreadableMarkers.length-1?'margin-bottom:12px;':''}">
+      <div style="font-weight:600;font-family:'Space Grotesk',sans-serif;margin-bottom:6px;">${m.fileName} — couldn't find marker details</div>
+      <div class="hint" style="margin-bottom:8px;">The text below is what was actually read off this file. If it looks garbled, try a clearer/higher-resolution image, or enter the details manually in Manual mode.</div>
+      <pre class="mono" style="white-space:pre-wrap;max-height:160px;overflow:auto;background:var(--canvas-panel);border:1px solid var(--line);border-radius:6px;padding:8px;font-size:11px;margin:0;">${escapeHtml(m.rawText.slice(0, 1500))}</pre>
+      <div class="row-actions" style="margin-top:10px;">
+        <button class="btn ghost small dismiss-unreadable-marker-btn" data-marker-id="${m.id}">Dismiss</button>
+      </div>
+    </div>`).join('');
+  return `<div class="panel" style="margin-bottom:16px;"><h2 style="margin-bottom:10px;">Couldn't read (${consUnreadableMarkers.length})</h2>${cards}</div>`;
+}
+function renderAutomaticMarkerBody(){
+  const pendingHtml = consPendingMarkers.length>0 ? renderPendingMarkerConfirmations() : '';
+  const unreadableHtml = consUnreadableMarkers.length>0 ? renderUnreadableMarkers() : '';
+  if(consMarkersParsed.length === 0){
+    return (pendingHtml + unreadableHtml) || emptyState('shirt', 'Upload one or more marker PDFs above — the system reads Length, Width, Material, and Sets automatically, and groups markers by Material + Style so multiple mini markers for the same fabric average together.');
+  }
+  const groups = groupMarkersByMaterial(consMarkersParsed);
+  const clearAllBtn = `<div class="row-actions" style="margin-bottom:14px;"><button class="btn ghost small" id="clearAllMarkersBtn">Clear all markers</button></div>`;
+  const groupSections = groups.map((g, i) => `
+    <div class="panel"${i>0 ? ' style="margin-top:16px;"' : ''}>
+      ${renderMarkerGroupBody(g)}
+    </div>`).join('');
+  return pendingHtml + unreadableHtml + clearAllBtn + groupSections;
+}
 function renderConsumptionCalculator(){
+  const modeToggle = `
+    <div class="row-actions" style="margin-bottom:16px;">
+      <button class="btn ${consumptionMode==='manual'?'':'ghost'} small" data-cons-mode="manual">Manual</button>
+      <button class="btn ${consumptionMode==='automatic'?'':'ghost'} small" data-cons-mode="automatic">Automatic — from CAD marker</button>
+    </div>`;
+
+  if(consumptionMode==='automatic'){
+    return `
+    <div class="panel">
+      <h2>Fabric Consumption Calculator</h2>
+      <p class="desc">Upload the marker file(s) exported from your CAD/marker-making software — PDF or an image (JPG/PNG) both work. Length, Width, Material, and Sets (pieces) are read straight off each one — for images, Material comes from the file name (e.g. "308122(M2 L10 XL5)BODY.jpg") since it isn't printed on the image itself, and Sets is the sum of the Model/Size/Qty breakdown. Select several at once (or upload in batches) when CAD has split a style/material into multiple mini markers, or sent markers for several materials together — they're automatically grouped by Material + Style, and markers sharing both are averaged into one consumption figure.</p>
+      ${modeToggle}
+      <div class="field" style="max-width:420px;">
+        <label>Marker file(s) — PDF or image</label>
+        <input type="file" id="consMarkerUpload" accept="application/pdf,image/jpeg,image/png,image/jpg" multiple>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Result</h2>
+      <div id="consAutoBody">${renderAutomaticMarkerBody()}</div>
+    </div>`;
+  }
+
   return `
   <div class="panel">
     <h2>Fabric Consumption Calculator</h2>
     <p class="desc">The same "YY calculation" formula used on the manual worksheet — marker length, fabric width, and GSM in, consumption per piece (and per order, once you add a quantity) out. Updates live as you type.</p>
+    ${modeToggle}
     <div class="grid-cols" style="grid-template-columns:repeat(4,1fr);">
       <div class="field"><label>Fabric width (inches)</label><input id="consWidth" type="number" step="0.01" placeholder="e.g. 66"></div>
       <div class="field"><label>Marker length — yards</label><input id="consMarkerYds" type="number" step="0.01" placeholder="e.g. 6"></div>
@@ -3936,6 +4727,79 @@ function renderConsumptionCalculator(){
     <h2>Result</h2>
     <div id="consResults">${emptyState('chart', 'Fill in the inputs above to see the calculation.')}</div>
   </div>`;
+}
+// Re-wires the Automatic-mode result inputs — called on the normal full-tab render
+// AND after a marker upload/remove replaces #consAutoBody's innerHTML (which drops any
+// listeners it held). Inputs are per-group now (one GSM/wastage/qty set per Material +
+// Style group), identified by a data-group-key attribute rather than a fixed id.
+function onGroupInputChange(inputEl){
+  const groupKey = inputEl.dataset.groupKey;
+  if(!groupKey) return;
+  if(!consGroupInputs[groupKey]) consGroupInputs[groupKey] = { gsm: null, wastagePct: null, orderQty: null };
+  const v = inputEl.value === '' ? null : parseFloat(inputEl.value);
+  const field = inputEl.id.startsWith('consGroupGsm_') ? 'gsm' : inputEl.id.startsWith('consGroupWastage_') ? 'wastagePct' : 'orderQty';
+  consGroupInputs[groupKey][field] = (v===null || isNaN(v)) ? null : v;
+  updateGroupResults(groupKey);
+}
+function attachConsumptionAutoEvents(){
+  document.querySelectorAll('[id^="consGroupGsm_"], [id^="consGroupWastage_"], [id^="consGroupQty_"]')
+    .forEach(inp => inp.addEventListener('input', () => onGroupInputChange(inp)));
+  document.querySelectorAll('.group-wastage-preset').forEach(a => {
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      const wastageEl = document.getElementById('consGroupWastage_'+slugifyGroupKey(a.dataset.groupKey));
+      if(wastageEl){ wastageEl.value = a.dataset.pct; onGroupInputChange(wastageEl); }
+    });
+  });
+  document.querySelectorAll('.export-group-pdf-btn').forEach(btn => {
+    btn.addEventListener('click', () => exportGroupConsumptionPdf(btn.dataset.groupKey));
+  });
+  document.querySelectorAll('.remove-marker-link').forEach(a => {
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      const id = Number(a.dataset.markerId);
+      consMarkersParsed = consMarkersParsed.filter(m => m.id !== id);
+      rerenderAutomaticBody();
+    });
+  });
+  const clearAllBtn = document.getElementById('clearAllMarkersBtn');
+  if(clearAllBtn) clearAllBtn.addEventListener('click', () => {
+    consMarkersParsed = [];
+    consGroupInputs = {};
+    rerenderAutomaticBody();
+  });
+  document.querySelectorAll('.confirm-pending-marker-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = Number(btn.dataset.markerId);
+      const input = document.getElementById('pendingSets_'+id);
+      const val = input && input.value!=='' ? parseInt(input.value, 10) : NaN;
+      if(isNaN(val) || val<=0){ showToast('Enter the correct total pieces first'); return; }
+      resolvePendingMarker(id, val);
+    });
+  });
+  document.querySelectorAll('.discard-pending-marker-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      consPendingMarkers = consPendingMarkers.filter(m => m.id !== Number(btn.dataset.markerId));
+      rerenderAutomaticBody();
+    });
+  });
+  document.querySelectorAll('.dismiss-unreadable-marker-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      consUnreadableMarkers = consUnreadableMarkers.filter(m => m.id !== Number(btn.dataset.markerId));
+      rerenderAutomaticBody();
+    });
+  });
+}
+// Finalizes a held-back marker once the user has typed the correct piece count —
+// only now does it join consMarkersParsed and become eligible for grouping/averaging.
+function resolvePendingMarker(id, finalSets){
+  const m = consPendingMarkers.find(x => x.id === id);
+  if(!m) return;
+  consPendingMarkers = consPendingMarkers.filter(x => x.id !== id);
+  const { setsFromText, setsFromFileName, needsConfirmation, ...base } = m;
+  consMarkersParsed.push({ ...base, sets: finalSets, setsSource: 'user-confirmed' });
+  showToast('Marker added — enter GSM to calculate');
+  rerenderAutomaticBody();
 }
 
 /* ---------------- Event wiring ---------------- */
@@ -3968,6 +4832,79 @@ function attachTabEvents(){
   if(resetConsBtn) resetConsBtn.addEventListener('click', () => { renderTabContent(); });
   const exportConsBtn = document.getElementById('exportConsumptionPdfBtn');
   if(exportConsBtn) exportConsBtn.addEventListener('click', exportConsumptionPdf);
+
+  document.querySelectorAll('[data-cons-mode]').forEach(btn => {
+    btn.addEventListener('click', () => { consumptionMode = btn.dataset.consMode; renderTabContent(); });
+  });
+  attachConsumptionAutoEvents();
+  const markerUploadInput = document.getElementById('consMarkerUpload');
+  if(markerUploadInput) markerUploadInput.addEventListener('change', async (e) => {
+    const files = Array.from(e.target.files || []);
+    if(files.length === 0) return;
+    const hasImages = files.some(f => f.type.startsWith('image/') || /\.(jpe?g|png)$/i.test(f.name));
+    showToast(files.length>1
+      ? `Reading ${files.length} markers…` + (hasImages ? ' (images take longer — OCR)' : '')
+      : (hasImages ? 'Reading marker (OCR — may take a moment)…' : 'Reading marker…'));
+    let addedCount = 0, failedCount = 0, pendingCount = 0, unreadableCount = 0, pdfLibFailed = false, imageLibFailed = false;
+    // Shared by both the direct-image path and the flattened-PDF-OCR-fallback path below —
+    // a marker whose two piece-count sources disagree is held for confirmation, not added.
+    const commitParsedMarker = (parsed, fileName) => {
+      if(parsed.needsConfirmation){ consPendingMarkers.push({ ...parsed, id: ++consMarkerIdSeq, fileName }); pendingCount++; }
+      else{ consMarkersParsed.push({ ...parsed, id: ++consMarkerIdSeq, fileName }); addedCount++; }
+    };
+    // OCR ran and produced text, but none of it matched — surface the raw text instead
+    // of a dead-end "couldn't find details" with no way to tell what went wrong.
+    const recordUnreadable = (rawText, fileName) => {
+      if(rawText && rawText.trim()){ consUnreadableMarkers.push({ id: ++consMarkerIdSeq, fileName, rawText: rawText.trim() }); unreadableCount++; }
+      else{ failedCount++; }
+    };
+    for(const file of files){
+      const isImage = file.type.startsWith('image/') || /\.(jpe?g|png)$/i.test(file.name);
+      if(isImage){
+        if(imageLibFailed) continue;
+        const rawCanvas = await loadImageFileToCanvas(file);
+        const text = await extractImageText(rawCanvas ? cropCanvasFooter(rawCanvas) : file);
+        if(text === null){ imageLibFailed = true; continue; }
+        const parsed = parseMarkerImageText(text, file.name);
+        if(!parsed){ recordUnreadable(text, file.name); continue; }
+        commitParsedMarker(parsed, file.name);
+      }else{
+        if(pdfLibFailed) continue;
+        const text = await extractPdfText(file);
+        if(text === null){ pdfLibFailed = true; continue; }
+        let parsed = parseMarkerPdfText(text);
+        let ocrText = null;
+        // No real text layer (a flattened/scanned PDF export, not a text-based one) —
+        // render the page as an image and read it via OCR instead of rejecting it.
+        if(!parsed && text.trim().length < 30){
+          const pageCanvas = await renderPdfPageToCanvas(file);
+          if(pageCanvas){
+            ocrText = await extractImageText(cropCanvasFooter(pageCanvas));
+            if(ocrText !== null) parsed = parseMarkerImageText(ocrText, file.name);
+          }
+        }
+        if(!parsed){ recordUnreadable(ocrText || text, file.name); continue; }
+        commitParsedMarker(parsed, file.name);
+      }
+    }
+    const failedLibs = [pdfLibFailed && 'PDF reading', imageLibFailed && 'image OCR'].filter(Boolean);
+    if(failedLibs.length>0 && addedCount===0 && pendingCount===0 && unreadableCount===0){
+      showToast(`Could not load the ${failedLibs.join(' / ')} library — check your internet connection and try again`);
+    }else if(pendingCount>0){
+      showToast(`${pendingCount} marker${pendingCount>1?'s need':' needs'} your confirmation — the file name and the image text disagree on piece count`);
+    }else if(addedCount>0){
+      showToast(addedCount===1 ? 'Marker read — enter GSM to calculate' : `${addedCount} markers read`
+        + (failedCount>0 || unreadableCount>0 ? ` (${failedCount+unreadableCount} skipped)` : ''));
+    }else if(unreadableCount>0){
+      showToast(`Couldn't read ${unreadableCount>1?'these markers':'this marker'} — see the details below`);
+    }else{
+      showToast("Couldn't find marker details in the uploaded file(s) — try Manual mode instead");
+    }
+    e.target.value = ''; // allow re-selecting the same file(s) on a later upload
+    rerenderAutomaticBody();
+    const firstGsm = document.querySelector('[id^="consGroupGsm_"]');
+    if(firstGsm) firstGsm.focus();
+  });
 
   // Dashboard filter bar — Buyer/Person filters re-render immediately (they're selects);
   // text/date fields wait for change (blur/enter) so typing doesn't re-render every keystroke.
