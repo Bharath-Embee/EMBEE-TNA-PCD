@@ -4213,18 +4213,25 @@ function parseMarkerFileName(fileName){
 // caller holds the marker for the user to confirm/correct rather than guessing which
 // one is right for a number that drives real fabric purchasing.
 function parseMarkerImageText(text, fileName){
-  const clean = text.replace(/\s+/g, ' ');
+  // Two OCR misreads confirmed against real uploads, normalized before matching:
+  // (1) "Length" gets read as "Leggth" (n misread as g) — matched via a fuzzy label
+  //     pattern instead of the literal word. (2) The leading digit before "yd"/"m" can
+  //     be dropped or misread as the letter "S" (classic 5/S confusion, e.g. "5yd" ->
+  //     "Syd") — normalized back to "5" specifically in that position, since a bare "S"
+  //     immediately before "yd"/"m" is never itself a valid reading here.
+  const clean = text.replace(/\s+/g, ' ').replace(/\bS(?=\s*(?:yd|m)\b)/gi, '5');
   const { styleName, material, sizeRunPairs } = parseMarkerFileName(fileName);
+  const LENGTH_LABEL = 'Le.{0,3}gth';
 
   let unitSystem = null, lengthBig = null, widthSmall = null;
-  const lenYd = clean.match(/Length\s*:?\s*(\d+)\s*yd\s*([\d.]+)\s*in/i);
+  const lenYd = clean.match(new RegExp(LENGTH_LABEL + '\\s*:?\\s*(\\d+)\\s*yd\\s*([\\d.]+)\\s*in', 'i'));
   const widYd = clean.match(/Width\s*:?\s*([\d.]+)\s*in/i);
   if(lenYd && widYd){
     unitSystem = 'yard';
     lengthBig = parseFloat(lenYd[1]) + parseFloat(lenYd[2])/36;
     widthSmall = parseFloat(widYd[1]);
   }else{
-    const lenM = clean.match(/Length\s*:?\s*(\d+)\s*m\s*([\d.]+)\s*cm/i);
+    const lenM = clean.match(new RegExp(LENGTH_LABEL + '\\s*:?\\s*(\\d+)\\s*m\\s*([\\d.]+)\\s*cm', 'i'));
     const widM = clean.match(/Width\s*:?\s*([\d.]+)\s*cm/i);
     if(lenM && widM){
       unitSystem = 'metric';
