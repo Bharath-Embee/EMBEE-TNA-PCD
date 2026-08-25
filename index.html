@@ -4033,23 +4033,50 @@ function parseMarkerPdfText(text){
     unitSystem, lengthBig, widthSmall,
   };
 }
-// Normalizes a parsed marker (whichever unit system it came in) onto the exact same
-// (yards, inches) basis calcFabricConsumption() already expects, then calls that same
-// function unchanged — Automatic mode is a different INPUT PATH, not different math.
-// Per spec: no extra allowance on the length side here (the CAD length is used as-is,
-// unlike Manual mode's marker-length extra) — only the width gets a user-editable
-// extra, because a marker's reported width is the CUTTABLE width, and real fabric
-// rolls run wider than that (selvage/finishing you can't cut from), so the full
-// fabric width used for the weight calc is the marker's width plus that allowance.
-function calcAutomaticConsumption(marker, gsm, widthExtraIn, wastagePct, orderQty){
-  if(!marker) return null;
-  const markerYds = marker.unitSystem==='yard' ? marker.lengthBig : marker.lengthBig * 1.0936133;
-  const widthInchesCuttable = marker.unitSystem==='yard' ? marker.widthSmall : marker.widthSmall / 2.54;
-  const extra = (widthExtraIn===null || isNaN(widthExtraIn)) ? 0 : widthExtraIn;
-  return calcFabricConsumption({
-    width: widthInchesCuttable + extra, markerYds, markerIn: 0, extraIn: 0,
+// Yard/inch markers: GSM IS required (unlike the meter/cm path below), and both
+// extras are fixed constants per spec, not editable — +2in on the marker length
+// before dividing by Sets, +2in on the cuttable width to get the full fabric width
+// used for the weight calc (a marker's reported width is the CUTTABLE width; real
+// fabric rolls run wider than that). Normalizes onto the exact same (yards, inches)
+// basis calcFabricConsumption() already expects, then calls that same function
+// unchanged — Automatic mode is a different INPUT PATH, not different math — and
+// merges the full width used back onto the result so the UI can display it.
+const YARD_LENGTH_EXTRA_IN = 2; // constant, not editable
+const YARD_WIDTH_EXTRA_IN = 2; // constant, not editable
+function calcAutomaticConsumption(marker, gsm, wastagePct, orderQty){
+  if(!marker || marker.unitSystem!=='yard') return null;
+  const fullWidthIn = marker.widthSmall + YARD_WIDTH_EXTRA_IN;
+  const r = calcFabricConsumption({
+    width: fullWidthIn, markerYds: marker.lengthBig, markerIn: 0, extraIn: YARD_LENGTH_EXTRA_IN,
     gsm, pcsInMarker: marker.sets, wastagePct, orderQty,
   });
+  return r ? { ...r, fullWidthIn } : null;
+}
+// Automatic-yards' own result view — distinct from consumptionResultHtml() (Manual
+// mode, unchanged) because the spec for this path differs: no Mtr/Pc shown (yards
+// and kg are what merchandising actually orders by, not meters), and Yds/Pc and
+// Kg/Pc are shown together with a 0-5% wastage sweep for EACH unit.
+function automaticYardResultHtml(r){
+  return `
+    <div class="kpi-grid" style="margin-bottom:14px;">
+      <div class="stat"><div class="num">${r.ydsPerPc.toFixed(4)}</div><div class="lbl">Yds / Pc</div></div>
+      <div class="stat"><div class="num">${fmtKg(r.kgPerPc)}</div><div class="lbl">Kg / Pc (no wastage)</div></div>
+      <div class="stat alert"><div class="num">${fmtKg(r.kgPerPcWithWastage)}</div><div class="lbl">Kg / Pc (with ${r.wastage}% wastage)</div></div>
+      ${r.totalKg!==null ? `<div class="stat"><div class="num">${r.totalKg.toFixed(2)}</div><div class="lbl">Total Kg for ${r.orderQty} pcs</div></div>` : ''}
+    </div>
+    <table>
+      <thead><tr><th>Step</th><th>Formula</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td>Marker length (total)</td><td class="mono">Length + 2in (constant)</td><td class="mono">${r.markerTotalYds.toFixed(4)} yds</td></tr>
+        <tr><td>Yds / Pc</td><td class="mono">Marker length ÷ Sets</td><td class="mono">${r.ydsPerPc.toFixed(4)} yds</td></tr>
+        <tr><td>Kg / Pc (no wastage)</td><td class="mono">(Yds/Pc × 0.9144 × Full width × GSM) ÷ 39.37 ÷ 1000</td><td class="mono">${r.kgPerPc.toFixed(4)} kg</td></tr>
+        <tr><td>Kg / Pc (with wastage)</td><td class="mono">Kg/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.kgPerPcWithWastage.toFixed(4)} kg</td></tr>
+        ${r.totalKg!==null ? `<tr><td>Total for order</td><td class="mono">Kg/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalKg.toFixed(2)} kg</td></tr>` : ''}
+        <tr><td>Required fabric width</td><td class="mono">Cuttable width + 2in (constant)</td><td class="mono">${r.fullWidthIn.toFixed(2)} in</td></tr>
+      </tbody>
+    </table>
+    ${wastageSweepTableHtml(r.ydsPerPc, 'yds')}
+    ${wastageSweepTableHtml(r.kgPerPc, 'kg')}`;
 }
 // Meter/cm markers get their own rule, distinct from the yard/kg path above: no GSM
 // at all — consumption is the marker LENGTH per piece (in meters), not a weight, since
@@ -4096,7 +4123,7 @@ function metricConsumptionResultHtml(r){
 }
 function readAutomaticInputs(){
   const num = id => { const el = document.getElementById(id); if(!el || el.value==='') return null; const v = parseFloat(el.value); return isNaN(v) ? null : v; };
-  return { gsm: num('consAutoGsm'), widthExtraIn: num('consAutoWidthExtra'), wastagePct: num('consAutoWastagePct'), orderQty: num('consAutoOrderQty') };
+  return { gsm: num('consAutoGsm'), wastagePct: num('consAutoWastagePct'), orderQty: num('consAutoOrderQty') };
 }
 function updateAutomaticConsumptionResults(){
   const out = document.getElementById('consAutoResults');
@@ -4106,8 +4133,8 @@ function updateAutomaticConsumptionResults(){
     out.innerHTML = metricConsumptionResultHtml(calcMetricConsumption(consMarkerParsed, inp.wastagePct, inp.orderQty));
     return;
   }
-  const r = calcAutomaticConsumption(consMarkerParsed, inp.gsm, inp.widthExtraIn, inp.wastagePct, inp.orderQty);
-  out.innerHTML = r ? consumptionResultHtml(r) : emptyState('chart', 'Enter GSM above to see the consumption.');
+  const r = calcAutomaticConsumption(consMarkerParsed, inp.gsm, inp.wastagePct, inp.orderQty);
+  out.innerHTML = r ? automaticYardResultHtml(r) : emptyState('chart', 'Enter GSM above to see the consumption.');
 }
 async function exportAutomaticConsumptionPdf(){
   if(!consMarkerParsed){ showToast('Upload a marker PDF first'); return; }
@@ -4147,7 +4174,7 @@ async function exportAutomaticConsumptionPdf(){
     doc.save('fabric_consumption_auto.pdf');
     return;
   }
-  const r = calcAutomaticConsumption(m, inp.gsm, inp.widthExtraIn, inp.wastagePct, inp.orderQty);
+  const r = calcAutomaticConsumption(m, inp.gsm, inp.wastagePct, inp.orderQty);
   if(!r){ showToast('Enter GSM first'); return; }
   showToast('Preparing PDF…');
   const doc = await pdfNewDoc('Fabric Consumption Calculation', 'Read automatically from CAD marker — ' + (m.styleName||'unnamed style'));
@@ -4157,28 +4184,27 @@ async function exportAutomaticConsumptionPdf(){
   y = pdfTable(doc, y, ['Style','Material','Sizes','Marker length','Marker width (cuttable)','Sets','Efficiency'], [markerRow], [140,80,120,90,120,50,70]);
   y += 12;
   y = pdfSectionTitle(doc, y, 'Inputs');
-  y = pdfTable(doc, y,
-    ['GSM','Width extra allowance (in)','Wastage %','Order qty'],
-    [[inp.gsm, inp.widthExtraIn ?? 0, r.wastage, inp.orderQty ?? '—']],
-    [90,150,90,90]
-  );
+  y = pdfTable(doc, y, ['GSM','Wastage %','Order qty'], [[inp.gsm, r.wastage, inp.orderQty ?? '—']], [90,90,90]);
   y += 12;
   y = pdfSectionTitle(doc, y, 'Calculation');
   y = pdfTable(doc, y,
     ['Step','Formula','Result'],
     [
-      ['Marker length (total)', 'Marker length, as read', r.markerTotalYds.toFixed(4)+' yds'],
+      ['Marker length (total)', 'Length + 2in (constant)', r.markerTotalYds.toFixed(4)+' yds'],
       ['Yds / Pc', 'Marker length ÷ Sets', r.ydsPerPc.toFixed(4)+' yds'],
-      ['Mtr / Pc', 'Yds/Pc × 0.9144', r.mtrPerPc.toFixed(4)+' m'],
-      ['Kg / Pc (no wastage)', '(Mtr/Pc × Full width × GSM) ÷ 39.37 ÷ 1000', r.kgPerPc.toFixed(4)+' kg'],
+      ['Kg / Pc (no wastage)', '(Yds/Pc × 0.9144 × Full width × GSM) ÷ 39.37 ÷ 1000', r.kgPerPc.toFixed(4)+' kg'],
       [`Kg / Pc (with ${r.wastage}% wastage)`, `Kg/Pc × (1 + ${r.wastage}%)`, r.kgPerPcWithWastage.toFixed(4)+' kg'],
       ...(r.totalKg!==null ? [[`Total for ${r.orderQty} pcs`, 'Kg/Pc (with wastage) × Order qty', r.totalKg.toFixed(2)+' kg']] : []),
+      ['Required fabric width', 'Cuttable width + 2in (constant)', r.fullWidthIn.toFixed(2)+' in'],
     ],
     [200,320,160]
   );
   y += 12;
-  y = pdfSectionTitle(doc, y, 'Consumption per piece at each wastage %');
-  y = pdfTable(doc, y, ['Wastage','Consumption / Pc'], wastageSweepPdfRows(r.kgPerPc, 'kg'), [120,160]);
+  y = pdfSectionTitle(doc, y, 'Yds / Pc at each wastage %');
+  y = pdfTable(doc, y, ['Wastage','Yds / Pc'], wastageSweepPdfRows(r.ydsPerPc, 'yds'), [120,160]);
+  y += 12;
+  y = pdfSectionTitle(doc, y, 'Kg / Pc at each wastage %');
+  y = pdfTable(doc, y, ['Wastage','Kg / Pc'], wastageSweepPdfRows(r.kgPerPc, 'kg'), [120,160]);
   doc.save('fabric_consumption_auto.pdf');
 }
 function renderAutomaticMarkerBody(){
@@ -4222,9 +4248,8 @@ function renderAutomaticMarkerBody(){
 
   return `
     ${infoCard}
-    <div class="grid-cols" style="grid-template-columns:repeat(4,1fr);">
+    <div class="grid-cols" style="grid-template-columns:repeat(3,1fr);">
       <div class="field"><label>GSM</label><input id="consAutoGsm" type="number" step="0.01" placeholder="e.g. 150"></div>
-      <div class="field"><label>Width extra allowance (inches)</label><input id="consAutoWidthExtra" type="number" step="0.01" value="2"></div>
       <div class="field">
         <label>Wastage %</label>
         <input id="consAutoWastagePct" type="number" step="0.1" placeholder="e.g. 5">
@@ -4234,6 +4259,7 @@ function renderAutomaticMarkerBody(){
       </div>
       <div class="field"><label>Order qty (optional)</label><input id="consAutoOrderQty" type="number" step="1" placeholder="e.g. 5550"></div>
     </div>
+    <div class="hint" style="margin:6px 0 0;">Fabric width used = marker's cuttable width + 2in (fixed) · marker length used = as read + 2in (fixed) — neither is editable.</div>
     <div class="row-actions" style="margin:14px 0;">
       <button class="btn ghost small" id="exportAutoConsumptionPdfBtn">Export PDF</button>
     </div>
@@ -4298,7 +4324,7 @@ function renderConsumptionCalculator(){
 // AND after a marker upload replaces just #consAutoBody's innerHTML (which drops any
 // listeners it held), so both paths leave GSM/wastage/qty/export live.
 function attachConsumptionAutoEvents(){
-  document.querySelectorAll('#consAutoGsm, #consAutoWidthExtra, #consAutoWastagePct, #consAutoOrderQty')
+  document.querySelectorAll('#consAutoGsm, #consAutoWastagePct, #consAutoOrderQty')
     .forEach(inp => inp.addEventListener('input', updateAutomaticConsumptionResults));
   document.querySelectorAll('.auto-wastage-preset').forEach(a => {
     a.addEventListener('click', e => {
