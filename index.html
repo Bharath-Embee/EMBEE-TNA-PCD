@@ -323,7 +323,15 @@ let currentOrderExpanded = {};
 let editingPcdOrderId = null;
 let currentSetExpanded = {};
 let consumptionMode = 'manual'; // 'manual' | 'automatic' — Consumption Calculator tab
-let consMarkerParsed = null; // last successfully-parsed CAD marker PDF, or null
+// Automatic mode holds a LIST of parsed CAD markers, not just one — CAD teams often
+// split one style/material into multiple mini markers (cutting-table length limits,
+// buyer restrictions, pieces-per-lay caps), and multiple materials (SHELL/RIB/etc.)
+// can be uploaded together in one batch. Markers are grouped by Material+Style for
+// display/calculation (see groupMarkersByMaterial()); groups of 2+ markers get their
+// per-marker results averaged (see calcGroupAverageConsumption()).
+let consMarkersParsed = []; // [{ id, fileName, styleName, sizes, material, sets, efficiency, unitSystem, lengthBig, widthSmall }]
+let consGroupInputs = {}; // groupKey -> { gsm, wastagePct, orderQty }, keyed by Material+Style so values persist as markers are added/removed
+let consMarkerIdSeq = 0;
 let templatePastePreview = null; // {setId: string|null, name?: string, rows:[{name,dept,offset,error}]}
 let editingAccessUserId = null;
 let editingTasksUserId = null;
@@ -4136,146 +4144,291 @@ function metricConsumptionResultHtml(r){
     <p class="hint" style="margin-top:8px;">No GSM needed for a meter-based marker — consumption is calculated directly by length, at the required fabric width above.</p>
     ${wastageSweepTableHtml(r.lengthPerPcM, 'm')}`;
 }
-function readAutomaticInputs(){
-  const num = id => { const el = document.getElementById(id); if(!el || el.value==='') return null; const v = parseFloat(el.value); return isNaN(v) ? null : v; };
-  return { gsm: num('consAutoGsm'), wastagePct: num('consAutoWastagePct'), orderQty: num('consAutoOrderQty') };
+// ---- Multiple markers per material/style ----
+// CAD teams often split one style+material into several mini markers (a lay/cutting
+// table can't fit every size run, or a buyer restricts pieces-per-lay), and a batch
+// upload may cover several materials (SHELL, RIB, JERSEY...) at once. Markers are
+// grouped by Material + Style Name (+ unit system, so yard and metric markers never
+// get averaged together) into one result per group; a group with 2+ markers has its
+// members' own per-piece results averaged (confirmed with the user: plain arithmetic
+// mean of each marker's own result, not a pieces-weighted pool).
+function slugifyGroupKey(key){ return key.replace(/[^A-Za-z0-9]+/g, '_').slice(0, 60); }
+function groupMarkersByMaterial(markers){
+  const byKey = new Map();
+  markers.forEach(m => {
+    const materialKey = (m.material||'Unspecified').trim().toUpperCase() || 'UNSPECIFIED';
+    const styleKey = (m.styleName||'Unspecified').trim().toUpperCase() || 'UNSPECIFIED';
+    const key = materialKey + '|' + styleKey + '|' + m.unitSystem;
+    if(!byKey.has(key)){
+      byKey.set(key, { key, material: m.material||'Unspecified', styleName: m.styleName||'Unspecified', unitSystem: m.unitSystem, markers: [] });
+    }
+    byKey.get(key).markers.push(m);
+  });
+  return [...byKey.values()].sort((a,b) => a.material.localeCompare(b.material) || a.styleName.localeCompare(b.styleName));
 }
-function updateAutomaticConsumptionResults(){
-  const out = document.getElementById('consAutoResults');
-  if(!out || !consMarkerParsed) return;
-  const inp = readAutomaticInputs();
-  if(consMarkerParsed.unitSystem==='metric'){
-    out.innerHTML = metricConsumptionResultHtml(calcMetricConsumption(consMarkerParsed, inp.wastagePct, inp.orderQty));
+function getGroupInputs(group){
+  if(!consGroupInputs[group.key]) consGroupInputs[group.key] = { gsm: null, wastagePct: null, orderQty: null };
+  return consGroupInputs[group.key];
+}
+// A single marker in its group is just calcAutomaticConsumption's normal result (tagged
+// markerCount:1) so the well-tested single-marker view/formula table is reused unchanged.
+// 2+ markers: compute each one's OWN Yds/Pc & Kg/Pc independently (no wastage/qty yet),
+// then average those results — wastage % and order qty are applied once, on the average.
+function calcGroupAverageYardConsumption(group, gsm, wastagePct, orderQty){
+  if(group.markers.length === 1){
+    const r = calcAutomaticConsumption(group.markers[0], gsm, wastagePct, orderQty);
+    return r ? { ...r, markerCount: 1, perMarker: [{ fileName: group.markers[0].fileName, ydsPerPc: r.ydsPerPc, kgPerPc: r.kgPerPc }] } : null;
+  }
+  const perMarker = group.markers.map(m => {
+    const mr = calcAutomaticConsumption(m, gsm, null, null);
+    return mr ? { fileName: m.fileName, ydsPerPc: mr.ydsPerPc, kgPerPc: mr.kgPerPc, fullWidthIn: mr.fullWidthIn } : null;
+  });
+  if(perMarker.some(x => x===null)) return null;
+  const n = perMarker.length;
+  const ydsPerPc = perMarker.reduce((s,x)=>s+x.ydsPerPc,0) / n;
+  const kgPerPc = perMarker.reduce((s,x)=>s+x.kgPerPc,0) / n;
+  const fullWidthIn = perMarker.reduce((s,x)=>s+x.fullWidthIn,0) / n;
+  const wastage = (wastagePct===null || isNaN(wastagePct)) ? 0 : wastagePct;
+  const kgPerPcWithWastage = kgPerPc * (1 + wastage/100);
+  const totalKg = (orderQty!==null && !isNaN(orderQty) && orderQty>0) ? kgPerPcWithWastage * orderQty : null;
+  return { perMarker, markerCount: n, ydsPerPc, kgPerPc, fullWidthIn, wastage, kgPerPcWithWastage, orderQty, totalKg };
+}
+function calcGroupAverageMetricConsumption(group, wastagePct, orderQty){
+  if(group.markers.length === 1){
+    const r = calcMetricConsumption(group.markers[0], wastagePct, orderQty);
+    return r ? { ...r, markerCount: 1, perMarker: [{ fileName: group.markers[0].fileName, lengthPerPcM: r.lengthPerPcM }] } : null;
+  }
+  const perMarker = group.markers.map(m => {
+    const mr = calcMetricConsumption(m, null, null);
+    return mr ? { fileName: m.fileName, lengthPerPcM: mr.lengthPerPcM, fullWidthCm: mr.fullWidthCm } : null;
+  });
+  if(perMarker.some(x => x===null)) return null;
+  const n = perMarker.length;
+  const lengthPerPcM = perMarker.reduce((s,x)=>s+x.lengthPerPcM,0) / n;
+  const fullWidthCm = perMarker.reduce((s,x)=>s+x.fullWidthCm,0) / n;
+  const wastage = (wastagePct===null || isNaN(wastagePct)) ? 0 : wastagePct;
+  const lengthPerPcWithWastageM = lengthPerPcM * (1 + wastage/100);
+  const totalM = (orderQty!==null && !isNaN(orderQty) && orderQty>0) ? lengthPerPcWithWastageM * orderQty : null;
+  return { perMarker, markerCount: n, lengthPerPcM, fullWidthCm, wastage, lengthPerPcWithWastageM, orderQty, totalM };
+}
+function groupAuditTableHtml(perMarker, cols){
+  const rows = perMarker.map(x => `<tr><td>${x.fileName}</td>${cols.map(c => `<td class="mono">${c.fmt(x)}</td>`).join('')}</tr>`).join('');
+  return `
+    <table>
+      <thead><tr><th>Marker file</th>${cols.map(c=>`<th>${c.label}</th>`).join('')}</tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+function groupYardResultHtml(group, r){
+  if(r.markerCount === 1) return automaticYardResultHtml(r);
+  return `
+    <p class="hint" style="margin:0 0 10px;font-weight:600;color:var(--ink-soft);">Averaged across ${r.markerCount} markers for ${group.material} / ${group.styleName}</p>
+    ${groupAuditTableHtml(r.perMarker, [
+      {label:'Yds / Pc', fmt:x=>x.ydsPerPc.toFixed(4)},
+      {label:'Kg / Pc', fmt:x=>fmtKg(x.kgPerPc)},
+    ])}
+    <div class="kpi-grid" style="margin:14px 0;">
+      <div class="stat"><div class="num">${r.ydsPerPc.toFixed(4)}</div><div class="lbl">Avg Yds / Pc</div></div>
+      <div class="stat"><div class="num">${fmtKg(r.kgPerPc)}</div><div class="lbl">Avg Kg / Pc (no wastage)</div></div>
+      <div class="stat alert"><div class="num">${fmtKg(r.kgPerPcWithWastage)}</div><div class="lbl">Avg Kg / Pc (with ${r.wastage}% wastage)</div></div>
+      ${r.totalKg!==null ? `<div class="stat"><div class="num">${r.totalKg.toFixed(2)}</div><div class="lbl">Total Kg for ${r.orderQty} pcs</div></div>` : ''}
+    </div>
+    <table>
+      <thead><tr><th>Step</th><th>Formula</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td>Avg Kg / Pc (with wastage)</td><td class="mono">Avg Kg/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.kgPerPcWithWastage.toFixed(4)} kg</td></tr>
+        ${r.totalKg!==null ? `<tr><td>Total for order</td><td class="mono">Avg Kg/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalKg.toFixed(2)} kg</td></tr>` : ''}
+        <tr><td>Avg required fabric width</td><td class="mono">Average of each marker's (cuttable width + 2in)</td><td class="mono">${r.fullWidthIn.toFixed(2)} in</td></tr>
+      </tbody>
+    </table>
+    ${wastageSweepDualTableHtml(r.ydsPerPc, r.kgPerPc)}`;
+}
+function groupMetricResultHtml(group, r){
+  if(r.markerCount === 1) return metricConsumptionResultHtml(r);
+  return `
+    <p class="hint" style="margin:0 0 10px;font-weight:600;color:var(--ink-soft);">Averaged across ${r.markerCount} markers for ${group.material} / ${group.styleName}</p>
+    ${groupAuditTableHtml(r.perMarker, [{label:'Meters / Pc', fmt:x=>x.lengthPerPcM.toFixed(4)}])}
+    <div class="kpi-grid" style="margin:14px 0;">
+      <div class="stat"><div class="num">${r.lengthPerPcM.toFixed(4)}</div><div class="lbl">Avg Meters / Pc (no wastage)</div></div>
+      <div class="stat alert"><div class="num">${r.lengthPerPcWithWastageM.toFixed(4)}</div><div class="lbl">Avg Meters / Pc (with ${r.wastage}% wastage)</div></div>
+      ${r.totalM!==null ? `<div class="stat"><div class="num">${r.totalM.toFixed(2)}</div><div class="lbl">Total Meters for ${r.orderQty} pcs</div></div>` : ''}
+    </div>
+    <table>
+      <thead><tr><th>Step</th><th>Formula</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td>Avg Meters / Pc (with wastage)</td><td class="mono">Avg Meters/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.lengthPerPcWithWastageM.toFixed(4)} m</td></tr>
+        ${r.totalM!==null ? `<tr><td>Total for order</td><td class="mono">Avg Meters/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalM.toFixed(2)} m</td></tr>` : ''}
+        <tr><td>Avg required fabric width</td><td class="mono">Average of each marker's (cuttable width + 4cm)</td><td class="mono">${r.fullWidthCm.toFixed(2)} cm</td></tr>
+      </tbody>
+    </table>
+    <p class="hint" style="margin-top:8px;">No GSM needed for a meter-based marker.</p>
+    ${wastageSweepTableHtml(r.lengthPerPcM, 'm')}`;
+}
+function updateGroupResults(groupKey){
+  const group = groupMarkersByMaterial(consMarkersParsed).find(g => g.key === groupKey);
+  if(!group) return;
+  const out = document.getElementById('consGroupResults_'+slugifyGroupKey(group.key));
+  if(!out) return;
+  const inputs = getGroupInputs(group);
+  if(group.unitSystem==='metric'){
+    const r = calcGroupAverageMetricConsumption(group, inputs.wastagePct, inputs.orderQty);
+    out.innerHTML = r ? groupMetricResultHtml(group, r) : emptyState('chart', 'Could not calculate — check the marker data.');
     return;
   }
-  const r = calcAutomaticConsumption(consMarkerParsed, inp.gsm, inp.wastagePct, inp.orderQty);
-  out.innerHTML = r ? automaticYardResultHtml(r) : emptyState('chart', 'Enter GSM above to see the consumption.');
+  const r = inputs.gsm!==null ? calcGroupAverageYardConsumption(group, inputs.gsm, inputs.wastagePct, inputs.orderQty) : null;
+  out.innerHTML = r ? groupYardResultHtml(group, r) : emptyState('chart', 'Enter GSM above to see the consumption.');
 }
-async function exportAutomaticConsumptionPdf(){
-  if(!consMarkerParsed){ showToast('Upload a marker PDF first'); return; }
-  const inp = readAutomaticInputs();
-  const m = consMarkerParsed;
-  const markerRow = [
-    m.styleName||'—', m.material||'—', m.sizes||'—',
-    m.unitSystem==='yard' ? m.lengthBig.toFixed(2)+' yd' : m.lengthBig.toFixed(2)+' m',
-    m.unitSystem==='yard' ? m.widthSmall.toFixed(2)+' in' : m.widthSmall.toFixed(2)+' cm',
+async function exportGroupConsumptionPdf(groupKey){
+  const group = groupMarkersByMaterial(consMarkersParsed).find(g => g.key === groupKey);
+  if(!group) return;
+  const inputs = getGroupInputs(group);
+  const isMetric = group.unitSystem === 'metric';
+  const subtitle = `${group.material} / ${group.styleName} — ${group.markers.length} marker${group.markers.length>1?'s':''} combined`;
+  const markerRows = group.markers.map(m => [
+    m.fileName, m.sizes||'—',
+    isMetric ? m.lengthBig.toFixed(2)+' m' : m.lengthBig.toFixed(2)+' yd',
+    isMetric ? m.widthSmall.toFixed(2)+' cm' : m.widthSmall.toFixed(2)+' in',
     m.sets, m.efficiency!==null ? m.efficiency+'%' : '—',
-  ];
-  if(m.unitSystem==='metric'){
-    const r = calcMetricConsumption(m, inp.wastagePct, inp.orderQty);
+  ]);
+  if(isMetric){
+    const r = calcGroupAverageMetricConsumption(group, inputs.wastagePct, inputs.orderQty);
     if(!r){ showToast('Could not calculate — check the marker data'); return; }
     showToast('Preparing PDF…');
-    const doc = await pdfNewDoc('Fabric Consumption Calculation', 'Read automatically from CAD marker — ' + (m.styleName||'unnamed style'));
+    const doc = await pdfNewDoc('Fabric Consumption Calculation', subtitle);
     if(!doc) return;
     let y = 72;
-    y = pdfSectionTitle(doc, y, 'Marker (read from uploaded PDF)');
-    y = pdfTable(doc, y, ['Style','Material','Sizes','Marker length','Marker width (cuttable)','Sets','Efficiency'], [markerRow], [140,80,120,90,120,50,70]);
+    y = pdfSectionTitle(doc, y, 'Markers (read from uploaded PDFs)');
+    y = pdfTable(doc, y, ['File','Sizes','Marker length','Marker width (cuttable)','Sets','Efficiency'], markerRows, [140,110,90,120,50,70]);
     y += 12;
-    y = pdfSectionTitle(doc, y, 'Calculation — meter-based, no GSM required');
+    if(r.markerCount>1){
+      y = pdfSectionTitle(doc, y, 'Per-marker Meters / Pc (before averaging)');
+      y = pdfTable(doc, y, ['File','Meters / Pc'], r.perMarker.map(x=>[x.fileName, x.lengthPerPcM.toFixed(4)+' m']), [220,160]);
+      y += 12;
+    }
+    y = pdfSectionTitle(doc, y, (r.markerCount>1?'Averaged calculation':'Calculation') + ' — meter-based, no GSM required');
     y = pdfTable(doc, y,
       ['Step','Formula','Result'],
       [
-        ['Marker length (total)', 'Length + 5cm (constant)', r.totalLengthM.toFixed(4)+' m'],
-        ['Meters / Pc', 'Marker length ÷ Sets', r.lengthPerPcM.toFixed(4)+' m'],
+        [r.markerCount>1?'Avg Meters / Pc':'Meters / Pc', r.markerCount>1?"Average of each marker's Meters/Pc":'Marker length ÷ Sets', r.lengthPerPcM.toFixed(4)+' m'],
         [`Meters / Pc (with ${r.wastage}% wastage)`, `Meters/Pc × (1 + ${r.wastage}%)`, r.lengthPerPcWithWastageM.toFixed(4)+' m'],
         ...(r.totalM!==null ? [[`Total for ${r.orderQty} pcs`, 'Meters/Pc (with wastage) × Order qty', r.totalM.toFixed(2)+' m']] : []),
-        ['Required fabric width', 'Cuttable width + 4cm (constant)', r.fullWidthCm.toFixed(2)+' cm'],
+        [r.markerCount>1?'Avg required fabric width':'Required fabric width', r.markerCount>1?"Average of each marker's (cuttable width + 4cm)":'Cuttable width + 4cm (constant)', r.fullWidthCm.toFixed(2)+' cm'],
       ],
       [200,320,160]
     );
     y += 12;
     y = pdfSectionTitle(doc, y, 'Consumption per piece at each wastage %');
     y = pdfTable(doc, y, ['Wastage','Consumption / Pc'], wastageSweepPdfRows(r.lengthPerPcM, 'm'), [120,160]);
-    doc.save('fabric_consumption_auto.pdf');
+    doc.save(`fabric_consumption_${slugifyGroupKey(group.key)}.pdf`);
     return;
   }
-  const r = calcAutomaticConsumption(m, inp.gsm, inp.wastagePct, inp.orderQty);
-  if(!r){ showToast('Enter GSM first'); return; }
+  if(inputs.gsm===null){ showToast('Enter GSM first'); return; }
+  const r = calcGroupAverageYardConsumption(group, inputs.gsm, inputs.wastagePct, inputs.orderQty);
+  if(!r){ showToast('Could not calculate — check the marker data'); return; }
   showToast('Preparing PDF…');
-  const doc = await pdfNewDoc('Fabric Consumption Calculation', 'Read automatically from CAD marker — ' + (m.styleName||'unnamed style'));
+  const doc = await pdfNewDoc('Fabric Consumption Calculation', subtitle);
   if(!doc) return;
   let y = 72;
-  y = pdfSectionTitle(doc, y, 'Marker (read from uploaded PDF)');
-  y = pdfTable(doc, y, ['Style','Material','Sizes','Marker length','Marker width (cuttable)','Sets','Efficiency'], [markerRow], [140,80,120,90,120,50,70]);
+  y = pdfSectionTitle(doc, y, 'Markers (read from uploaded PDFs)');
+  y = pdfTable(doc, y, ['File','Sizes','Marker length','Marker width (cuttable)','Sets','Efficiency'], markerRows, [140,110,90,120,50,70]);
   y += 12;
+  if(r.markerCount>1){
+    y = pdfSectionTitle(doc, y, 'Per-marker Yds/Pc & Kg/Pc (before averaging)');
+    y = pdfTable(doc, y, ['File','Yds / Pc','Kg / Pc'], r.perMarker.map(x=>[x.fileName, x.ydsPerPc.toFixed(4)+' yds', fmtKg(x.kgPerPc)+' kg']), [220,160,160]);
+    y += 12;
+  }
   y = pdfSectionTitle(doc, y, 'Inputs');
-  y = pdfTable(doc, y, ['GSM','Wastage %','Order qty'], [[inp.gsm, r.wastage, inp.orderQty ?? '—']], [90,90,90]);
+  y = pdfTable(doc, y, ['GSM','Wastage %','Order qty'], [[inputs.gsm, r.wastage, inputs.orderQty ?? '—']], [90,90,90]);
   y += 12;
-  y = pdfSectionTitle(doc, y, 'Calculation');
+  y = pdfSectionTitle(doc, y, r.markerCount>1 ? 'Averaged calculation' : 'Calculation');
   y = pdfTable(doc, y,
     ['Step','Formula','Result'],
     [
-      ['Marker length (total)', 'Length + 2in (constant)', r.markerTotalYds.toFixed(4)+' yds'],
-      ['Yds / Pc', 'Marker length ÷ Sets', r.ydsPerPc.toFixed(4)+' yds'],
-      ['Kg / Pc (no wastage)', '(Yds/Pc × 0.9144 × Full width × GSM) ÷ 39.37 ÷ 1000', r.kgPerPc.toFixed(4)+' kg'],
+      [r.markerCount>1?'Avg Yds / Pc':'Yds / Pc', r.markerCount>1?"Average of each marker's Yds/Pc":'Marker length ÷ Sets', r.ydsPerPc.toFixed(4)+' yds'],
+      [r.markerCount>1?'Avg Kg / Pc (no wastage)':'Kg / Pc (no wastage)', r.markerCount>1?"Average of each marker's Kg/Pc":'(Yds/Pc × 0.9144 × Full width × GSM) ÷ 39.37 ÷ 1000', r.kgPerPc.toFixed(4)+' kg'],
       [`Kg / Pc (with ${r.wastage}% wastage)`, `Kg/Pc × (1 + ${r.wastage}%)`, r.kgPerPcWithWastage.toFixed(4)+' kg'],
       ...(r.totalKg!==null ? [[`Total for ${r.orderQty} pcs`, 'Kg/Pc (with wastage) × Order qty', r.totalKg.toFixed(2)+' kg']] : []),
-      ['Required fabric width', 'Cuttable width + 2in (constant)', r.fullWidthIn.toFixed(2)+' in'],
+      [r.markerCount>1?'Avg required fabric width':'Required fabric width', r.markerCount>1?"Average of each marker's (cuttable width + 2in)":'Cuttable width + 2in (constant)', r.fullWidthIn.toFixed(2)+' in'],
     ],
     [200,320,160]
   );
   y += 12;
   y = pdfSectionTitle(doc, y, "Consumption in Yds / Pc & Consumption in Kg's / Pcs");
   y = pdfTable(doc, y, ['Wastage','Yds / Pc','Kg / Pc'], wastageSweepDualPdfRows(r.ydsPerPc, r.kgPerPc), [110,140,140]);
-  doc.save('fabric_consumption_auto.pdf');
+  doc.save(`fabric_consumption_${slugifyGroupKey(group.key)}.pdf`);
 }
-function renderAutomaticMarkerBody(){
-  if(!consMarkerParsed){
-    return emptyState('shirt', 'Upload a marker PDF above — the system reads its Length, Width, Material, and Sets (pieces) automatically.');
-  }
-  const m = consMarkerParsed;
-  const isMetric = m.unitSystem==='metric';
+function renderMarkerGroupBody(group){
+  const slug = slugifyGroupKey(group.key);
+  const inputs = getGroupInputs(group);
+  const isMetric = group.unitSystem === 'metric';
   const infoCard = `
     <div class="panel" style="background:var(--green-soft);border-color:var(--green);">
-      <div style="font-weight:600;font-family:'Space Grotesk',sans-serif;margin-bottom:10px;">Marker read successfully${isMetric ? ' — meter-based marker, no GSM needed' : ' — enter GSM below to get the consumption'}</div>
-      <div class="grid-cols" style="grid-template-columns:repeat(4,1fr);gap:10px;">
-        <div><div class="hint">Style</div><div>${m.styleName||'—'}</div></div>
-        <div><div class="hint">Material</div><div>${m.material||'—'}</div></div>
-        <div><div class="hint">Sizes in marker</div><div>${m.sizes||'—'}</div></div>
-        <div><div class="hint">Pcs in marker (Sets)</div><div class="mono">${m.sets}</div></div>
-        <div><div class="hint">Marker length</div><div class="mono">${isMetric ? m.lengthBig.toFixed(2)+' m' : m.lengthBig.toFixed(2)+' yd'}</div></div>
-        <div><div class="hint">Marker width (cuttable)</div><div class="mono">${isMetric ? m.widthSmall.toFixed(2)+' cm' : m.widthSmall.toFixed(2)+' in'}</div></div>
-        ${m.efficiency!==null ? `<div><div class="hint">Marker efficiency</div><div class="mono">${m.efficiency}%</div></div>` : ''}
+      <div style="font-weight:600;font-family:'Space Grotesk',sans-serif;margin-bottom:10px;">
+        ${group.material} — ${group.styleName}${group.markers.length>1 ? ` (${group.markers.length} markers combined)` : ''}${isMetric ? ' — meter-based, no GSM needed' : ''}
       </div>
+      ${group.markers.map(m => `
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid var(--green);padding:8px 0 0;margin-top:8px;">
+          <div><span class="mono">${m.fileName}</span> — ${m.sets} pcs, ${isMetric ? m.lengthBig.toFixed(2)+'m × '+m.widthSmall.toFixed(2)+'cm' : m.lengthBig.toFixed(2)+'yd × '+m.widthSmall.toFixed(2)+'in'}, eff ${m.efficiency!==null?m.efficiency+'%':'—'}</div>
+          <a href="#" class="remove-marker-link" data-marker-id="${m.id}" style="color:var(--red);white-space:nowrap;">Remove</a>
+        </div>`).join('')}
     </div>`;
 
-  if(isMetric){
-    return `
-    ${infoCard}
+  const fieldsHtml = isMetric ? `
     <div class="grid-cols" style="grid-template-columns:repeat(2,1fr);">
       <div class="field">
         <label>Wastage %</label>
-        <input id="consAutoWastagePct" type="number" step="0.1" placeholder="e.g. 5">
+        <input id="consGroupWastage_${slug}" data-group-key="${group.key}" type="number" step="0.1" placeholder="e.g. 5" value="${inputs.wastagePct ?? ''}">
         <div class="hint" style="margin-top:4px;">
-          <a href="#" class="auto-wastage-preset" data-pct="3">Use 3%</a> · <a href="#" class="auto-wastage-preset" data-pct="5">Use 5%</a>
+          <a href="#" class="group-wastage-preset" data-group-key="${group.key}" data-pct="3">Use 3%</a> · <a href="#" class="group-wastage-preset" data-group-key="${group.key}" data-pct="5">Use 5%</a>
         </div>
       </div>
-      <div class="field"><label>Order qty (optional)</label><input id="consAutoOrderQty" type="number" step="1" placeholder="e.g. 5550"></div>
+      <div class="field"><label>Order qty (optional)</label><input id="consGroupQty_${slug}" data-group-key="${group.key}" type="number" step="1" placeholder="e.g. 5550" value="${inputs.orderQty ?? ''}"></div>
+    </div>` : `
+    <div class="grid-cols" style="grid-template-columns:repeat(3,1fr);">
+      <div class="field"><label>GSM</label><input id="consGroupGsm_${slug}" data-group-key="${group.key}" type="number" step="0.01" placeholder="e.g. 150" value="${inputs.gsm ?? ''}"></div>
+      <div class="field">
+        <label>Wastage %</label>
+        <input id="consGroupWastage_${slug}" data-group-key="${group.key}" type="number" step="0.1" placeholder="e.g. 5" value="${inputs.wastagePct ?? ''}">
+        <div class="hint" style="margin-top:4px;">
+          <a href="#" class="group-wastage-preset" data-group-key="${group.key}" data-pct="3">Use 3%</a> · <a href="#" class="group-wastage-preset" data-group-key="${group.key}" data-pct="5">Use 5%</a>
+        </div>
+      </div>
+      <div class="field"><label>Order qty (optional)</label><input id="consGroupQty_${slug}" data-group-key="${group.key}" type="number" step="1" placeholder="e.g. 5550" value="${inputs.orderQty ?? ''}"></div>
     </div>
-    <div class="row-actions" style="margin:14px 0;">
-      <button class="btn ghost small" id="exportAutoConsumptionPdfBtn">Export PDF</button>
-    </div>
-    <div id="consAutoResults">${metricConsumptionResultHtml(calcMetricConsumption(m, null, null))}</div>`;
+    <div class="hint" style="margin:6px 0 0;">Fabric width used = marker's cuttable width + 2in (fixed) · marker length used = as read + 2in (fixed) — neither is editable.</div>`;
+
+  let resultsHtml;
+  if(isMetric){
+    const r = calcGroupAverageMetricConsumption(group, inputs.wastagePct, inputs.orderQty);
+    resultsHtml = r ? groupMetricResultHtml(group, r) : emptyState('chart', 'Could not calculate — check the marker data.');
+  }else{
+    const r = inputs.gsm!==null ? calcGroupAverageYardConsumption(group, inputs.gsm, inputs.wastagePct, inputs.orderQty) : null;
+    resultsHtml = r ? groupYardResultHtml(group, r) : emptyState('chart', 'Enter GSM above to see the consumption.');
   }
 
   return `
     ${infoCard}
-    <div class="grid-cols" style="grid-template-columns:repeat(3,1fr);">
-      <div class="field"><label>GSM</label><input id="consAutoGsm" type="number" step="0.01" placeholder="e.g. 150"></div>
-      <div class="field">
-        <label>Wastage %</label>
-        <input id="consAutoWastagePct" type="number" step="0.1" placeholder="e.g. 5">
-        <div class="hint" style="margin-top:4px;">
-          <a href="#" class="auto-wastage-preset" data-pct="3">Use 3%</a> · <a href="#" class="auto-wastage-preset" data-pct="5">Use 5%</a>
-        </div>
-      </div>
-      <div class="field"><label>Order qty (optional)</label><input id="consAutoOrderQty" type="number" step="1" placeholder="e.g. 5550"></div>
-    </div>
-    <div class="hint" style="margin:6px 0 0;">Fabric width used = marker's cuttable width + 2in (fixed) · marker length used = as read + 2in (fixed) — neither is editable.</div>
+    ${fieldsHtml}
     <div class="row-actions" style="margin:14px 0;">
-      <button class="btn ghost small" id="exportAutoConsumptionPdfBtn">Export PDF</button>
+      <button class="btn ghost small export-group-pdf-btn" data-group-key="${group.key}">Export PDF</button>
     </div>
-    <div id="consAutoResults">${emptyState('chart', 'Enter GSM above to see the consumption.')}</div>`;
+    <div id="consGroupResults_${slug}">${resultsHtml}</div>`;
+}
+function rerenderAutomaticBody(){
+  const body = document.getElementById('consAutoBody');
+  if(body){ body.innerHTML = renderAutomaticMarkerBody(); attachConsumptionAutoEvents(); }
+}
+function renderAutomaticMarkerBody(){
+  if(consMarkersParsed.length === 0){
+    return emptyState('shirt', 'Upload one or more marker PDFs above — the system reads Length, Width, Material, and Sets automatically, and groups markers by Material + Style so multiple mini markers for the same fabric average together.');
+  }
+  const groups = groupMarkersByMaterial(consMarkersParsed);
+  const clearAllBtn = `<div class="row-actions" style="margin-bottom:14px;"><button class="btn ghost small" id="clearAllMarkersBtn">Clear all markers</button></div>`;
+  const groupSections = groups.map((g, i) => `
+    <div class="panel"${i>0 ? ' style="margin-top:16px;"' : ''}>
+      ${renderMarkerGroupBody(g)}
+    </div>`).join('');
+  return clearAllBtn + groupSections;
 }
 function renderConsumptionCalculator(){
   const modeToggle = `
@@ -4288,11 +4441,11 @@ function renderConsumptionCalculator(){
     return `
     <div class="panel">
       <h2>Fabric Consumption Calculator</h2>
-      <p class="desc">Upload the marker PDF exported from your CAD/marker-making software — Length, Width, Material, and Sets (pieces) are read straight off it, so nothing needs retyping. You'll be asked for GSM right after.</p>
+      <p class="desc">Upload the marker PDF(s) exported from your CAD/marker-making software — Length, Width, Material, and Sets (pieces) are read straight off each one. Select several at once (or upload in batches) when CAD has split a style/material into multiple mini markers, or sent markers for several materials together — they're automatically grouped by Material + Style, and markers sharing both are averaged into one consumption figure.</p>
       ${modeToggle}
       <div class="field" style="max-width:420px;">
-        <label>Marker PDF</label>
-        <input type="file" id="consMarkerUpload" accept="application/pdf">
+        <label>Marker PDF(s)</label>
+        <input type="file" id="consMarkerUpload" accept="application/pdf" multiple>
       </div>
     </div>
     <div class="panel">
@@ -4333,20 +4486,45 @@ function renderConsumptionCalculator(){
   </div>`;
 }
 // Re-wires the Automatic-mode result inputs — called on the normal full-tab render
-// AND after a marker upload replaces just #consAutoBody's innerHTML (which drops any
-// listeners it held), so both paths leave GSM/wastage/qty/export live.
+// AND after a marker upload/remove replaces #consAutoBody's innerHTML (which drops any
+// listeners it held). Inputs are per-group now (one GSM/wastage/qty set per Material +
+// Style group), identified by a data-group-key attribute rather than a fixed id.
+function onGroupInputChange(inputEl){
+  const groupKey = inputEl.dataset.groupKey;
+  if(!groupKey) return;
+  if(!consGroupInputs[groupKey]) consGroupInputs[groupKey] = { gsm: null, wastagePct: null, orderQty: null };
+  const v = inputEl.value === '' ? null : parseFloat(inputEl.value);
+  const field = inputEl.id.startsWith('consGroupGsm_') ? 'gsm' : inputEl.id.startsWith('consGroupWastage_') ? 'wastagePct' : 'orderQty';
+  consGroupInputs[groupKey][field] = (v===null || isNaN(v)) ? null : v;
+  updateGroupResults(groupKey);
+}
 function attachConsumptionAutoEvents(){
-  document.querySelectorAll('#consAutoGsm, #consAutoWastagePct, #consAutoOrderQty')
-    .forEach(inp => inp.addEventListener('input', updateAutomaticConsumptionResults));
-  document.querySelectorAll('.auto-wastage-preset').forEach(a => {
+  document.querySelectorAll('[id^="consGroupGsm_"], [id^="consGroupWastage_"], [id^="consGroupQty_"]')
+    .forEach(inp => inp.addEventListener('input', () => onGroupInputChange(inp)));
+  document.querySelectorAll('.group-wastage-preset').forEach(a => {
     a.addEventListener('click', e => {
       e.preventDefault();
-      document.getElementById('consAutoWastagePct').value = a.dataset.pct;
-      updateAutomaticConsumptionResults();
+      const wastageEl = document.getElementById('consGroupWastage_'+slugifyGroupKey(a.dataset.groupKey));
+      if(wastageEl){ wastageEl.value = a.dataset.pct; onGroupInputChange(wastageEl); }
     });
   });
-  const exportAutoBtn = document.getElementById('exportAutoConsumptionPdfBtn');
-  if(exportAutoBtn) exportAutoBtn.addEventListener('click', exportAutomaticConsumptionPdf);
+  document.querySelectorAll('.export-group-pdf-btn').forEach(btn => {
+    btn.addEventListener('click', () => exportGroupConsumptionPdf(btn.dataset.groupKey));
+  });
+  document.querySelectorAll('.remove-marker-link').forEach(a => {
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      const id = Number(a.dataset.markerId);
+      consMarkersParsed = consMarkersParsed.filter(m => m.id !== id);
+      rerenderAutomaticBody();
+    });
+  });
+  const clearAllBtn = document.getElementById('clearAllMarkersBtn');
+  if(clearAllBtn) clearAllBtn.addEventListener('click', () => {
+    consMarkersParsed = [];
+    consGroupInputs = {};
+    rerenderAutomaticBody();
+  });
 }
 
 /* ---------------- Event wiring ---------------- */
@@ -4386,26 +4564,30 @@ function attachTabEvents(){
   attachConsumptionAutoEvents();
   const markerUploadInput = document.getElementById('consMarkerUpload');
   if(markerUploadInput) markerUploadInput.addEventListener('change', async (e) => {
-    const file = e.target.files[0];
-    if(!file) return;
-    showToast('Reading marker…');
-    const text = await extractPdfText(file);
-    if(text === null){
-      showToast('Could not load the PDF reading library — check your internet connection and try again');
-    }else{
+    const files = Array.from(e.target.files || []);
+    if(files.length === 0) return;
+    showToast(files.length>1 ? `Reading ${files.length} markers…` : 'Reading marker…');
+    let addedCount = 0, failedCount = 0, libFailed = false;
+    for(const file of files){
+      const text = await extractPdfText(file);
+      if(text === null){ libFailed = true; break; } // library load failure — same for every remaining file, no point retrying
       const parsed = parseMarkerPdfText(text);
-      if(!parsed){
-        consMarkerParsed = null;
-        showToast("Couldn't find marker details in this PDF — try Manual mode instead");
-      }else{
-        consMarkerParsed = parsed;
-        showToast('Marker read — enter GSM to calculate');
-      }
+      if(!parsed){ failedCount++; continue; }
+      consMarkersParsed.push({ ...parsed, id: ++consMarkerIdSeq, fileName: file.name });
+      addedCount++;
     }
-    const body = document.getElementById('consAutoBody');
-    if(body){ body.innerHTML = renderAutomaticMarkerBody(); attachConsumptionAutoEvents(); }
-    const gsmEl = document.getElementById('consAutoGsm');
-    if(gsmEl) gsmEl.focus();
+    if(libFailed){
+      showToast('Could not load the PDF reading library — check your internet connection and try again');
+    }else if(addedCount>0){
+      showToast(addedCount===1 ? 'Marker read — enter GSM to calculate' : `${addedCount} markers read`
+        + (failedCount>0 ? ` (${failedCount} skipped — no marker details found)` : ''));
+    }else{
+      showToast("Couldn't find marker details in the uploaded PDF(s) — try Manual mode instead");
+    }
+    e.target.value = ''; // allow re-selecting the same file(s) on a later upload
+    rerenderAutomaticBody();
+    const firstGsm = document.querySelector('[id^="consGroupGsm_"]');
+    if(firstGsm) firstGsm.focus();
   });
 
   // Dashboard filter bar — Buyer/Person filters re-render immediately (they're selects);
