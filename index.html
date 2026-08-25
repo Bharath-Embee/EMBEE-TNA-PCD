@@ -3922,6 +3922,22 @@ function wastageSweepTableHtml(basePerPc, unit){
 function wastageSweepPdfRows(basePerPc, unit){
   return [0,1,2,3,4,5].map(pct => [pct+'%', (basePerPc*(1+pct/100)).toFixed(4)+' '+unit]);
 }
+// Automatic-yards needs Yds/Pc and Kg/Pc side by side in ONE sweep table (not two
+// stacked tables) so both units at a given wastage % sit on the same row.
+function wastageSweepDualTableHtml(basePerPcYds, basePerPcKg){
+  const rows = [0,1,2,3,4,5].map(pct =>
+    `<tr><td>${pct}%</td><td class="mono">${(basePerPcYds*(1+pct/100)).toFixed(4)} yds</td><td class="mono">${(basePerPcKg*(1+pct/100)).toFixed(4)} kg</td></tr>`
+  ).join('');
+  return `
+    <div class="hint" style="margin:14px 0 6px;font-weight:600;color:var(--ink-soft);">Consumption in Yds / Pc &amp; Consumption in Kg's / Pcs</div>
+    <table>
+      <thead><tr><th>Wastage</th><th>Yds / Pc</th><th>Kg / Pc</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+function wastageSweepDualPdfRows(basePerPcYds, basePerPcKg){
+  return [0,1,2,3,4,5].map(pct => [pct+'%', (basePerPcYds*(1+pct/100)).toFixed(4)+' yds', (basePerPcKg*(1+pct/100)).toFixed(4)+' kg']);
+}
 // Shared by both Manual and Automatic mode so the result presentation — and the
 // exact wording of each formula step — never drifts between the two.
 function consumptionResultHtml(r){
@@ -4075,8 +4091,7 @@ function automaticYardResultHtml(r){
         <tr><td>Required fabric width</td><td class="mono">Cuttable width + 2in (constant)</td><td class="mono">${r.fullWidthIn.toFixed(2)} in</td></tr>
       </tbody>
     </table>
-    ${wastageSweepTableHtml(r.ydsPerPc, 'yds')}
-    ${wastageSweepTableHtml(r.kgPerPc, 'kg')}`;
+    ${wastageSweepDualTableHtml(r.ydsPerPc, r.kgPerPc)}`;
 }
 // Meter/cm markers get their own rule, distinct from the yard/kg path above: no GSM
 // at all — consumption is the marker LENGTH per piece (in meters), not a weight, since
@@ -4200,11 +4215,8 @@ async function exportAutomaticConsumptionPdf(){
     [200,320,160]
   );
   y += 12;
-  y = pdfSectionTitle(doc, y, 'Yds / Pc at each wastage %');
-  y = pdfTable(doc, y, ['Wastage','Yds / Pc'], wastageSweepPdfRows(r.ydsPerPc, 'yds'), [120,160]);
-  y += 12;
-  y = pdfSectionTitle(doc, y, 'Kg / Pc at each wastage %');
-  y = pdfTable(doc, y, ['Wastage','Kg / Pc'], wastageSweepPdfRows(r.kgPerPc, 'kg'), [120,160]);
+  y = pdfSectionTitle(doc, y, "Consumption in Yds / Pc & Consumption in Kg's / Pcs");
+  y = pdfTable(doc, y, ['Wastage','Yds / Pc','Kg / Pc'], wastageSweepDualPdfRows(r.ydsPerPc, r.kgPerPc), [110,140,140]);
   doc.save('fabric_consumption_auto.pdf');
 }
 function renderAutomaticMarkerBody(){
