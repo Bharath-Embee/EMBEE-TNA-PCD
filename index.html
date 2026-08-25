@@ -462,14 +462,37 @@ function loadTesseractLib(){
   });
   return tesseractLoadPromise;
 }
-async function extractImageText(file){
+async function extractImageText(fileOrCanvas){
   const ok = await loadTesseractLib();
   if(!ok || !window.Tesseract) return null;
   try{
-    const { data } = await window.Tesseract.recognize(file, 'eng');
+    const { data } = await window.Tesseract.recognize(fileOrCanvas, 'eng');
     return data.text;
   }catch(e){
     console.error('extractImageText error:', e);
+    return null;
+  }
+}
+// Some marker-making tools export a PDF that's really just a flattened picture of the
+// page — pdf.js finds no real text layer (extractPdfText comes back empty), so the
+// PDF-format parser has nothing to match. Rather than reject the file outright, render
+// its first page to a canvas and OCR THAT the same way a JPG/PNG upload is read —
+// Tesseract accepts a canvas directly, no need to round-trip through a Blob/File.
+async function renderPdfPageToCanvas(file){
+  const ok = await loadPdfJsLib();
+  if(!ok || !window.pdfjsLib) return null;
+  try{
+    const buf = await file.arrayBuffer();
+    const doc = await window.pdfjsLib.getDocument({ data: buf }).promise;
+    const page = await doc.getPage(1);
+    const viewport = page.getViewport({ scale: 2 }); // upscale for sharper OCR input
+    const canvas = document.createElement('canvas');
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+    return canvas;
+  }catch(e){
+    console.error('renderPdfPageToCanvas error:', e);
     return null;
   }
 }
@@ -4738,6 +4761,12 @@ function attachTabEvents(){
       ? `Reading ${files.length} markers…` + (hasImages ? ' (images take longer — OCR)' : '')
       : (hasImages ? 'Reading marker (OCR — may take a moment)…' : 'Reading marker…'));
     let addedCount = 0, failedCount = 0, pendingCount = 0, pdfLibFailed = false, imageLibFailed = false;
+    // Shared by both the direct-image path and the flattened-PDF-OCR-fallback path below —
+    // a marker whose two piece-count sources disagree is held for confirmation, not added.
+    const commitParsedMarker = (parsed, fileName) => {
+      if(parsed.needsConfirmation){ consPendingMarkers.push({ ...parsed, id: ++consMarkerIdSeq, fileName }); pendingCount++; }
+      else{ consMarkersParsed.push({ ...parsed, id: ++consMarkerIdSeq, fileName }); addedCount++; }
+    };
     for(const file of files){
       const isImage = file.type.startsWith('image/') || /\.(jpe?g|png)$/i.test(file.name);
       if(isImage){
@@ -4746,21 +4775,23 @@ function attachTabEvents(){
         if(text === null){ imageLibFailed = true; continue; }
         const parsed = parseMarkerImageText(text, file.name);
         if(!parsed){ failedCount++; continue; }
-        if(parsed.needsConfirmation){
-          consPendingMarkers.push({ ...parsed, id: ++consMarkerIdSeq, fileName: file.name });
-          pendingCount++;
-        }else{
-          consMarkersParsed.push({ ...parsed, id: ++consMarkerIdSeq, fileName: file.name });
-          addedCount++;
-        }
+        commitParsedMarker(parsed, file.name);
       }else{
         if(pdfLibFailed) continue;
         const text = await extractPdfText(file);
         if(text === null){ pdfLibFailed = true; continue; }
-        const parsed = parseMarkerPdfText(text);
+        let parsed = parseMarkerPdfText(text);
+        // No real text layer (a flattened/scanned PDF export, not a text-based one) —
+        // render the page as an image and read it via OCR instead of rejecting it.
+        if(!parsed && text.trim().length < 30){
+          const canvas = await renderPdfPageToCanvas(file);
+          if(canvas){
+            const ocrText = await extractImageText(canvas);
+            if(ocrText !== null) parsed = parseMarkerImageText(ocrText, file.name);
+          }
+        }
         if(!parsed){ failedCount++; continue; }
-        consMarkersParsed.push({ ...parsed, id: ++consMarkerIdSeq, fileName: file.name });
-        addedCount++;
+        commitParsedMarker(parsed, file.name);
       }
     }
     const failedLibs = [pdfLibFailed && 'PDF reading', imageLibFailed && 'image OCR'].filter(Boolean);
