@@ -436,6 +436,37 @@ async function extractPdfText(file){
     return null;
   }
 }
+// Some CAD/marker-making tools export a flattened raster image (JPG/PNG) instead of a
+// PDF — no text layer to search, so the marker's footer (Length, Width, Model/Size/Qty,
+// Utilization) has to be read via OCR. Tesseract.js, loaded on demand exactly like
+// pdf.js above. OCR is inherently less certain than the exact text-layer read used for
+// PDF markers — every parsed field is still shown on screen (see renderMarkerGroupBody's
+// info card) before it feeds the consumption calc, so a misread is visible, not silent.
+let tesseractLoadPromise = null;
+function loadTesseractLib(){
+  if(window.Tesseract) return Promise.resolve(true);
+  if(tesseractLoadPromise) return tesseractLoadPromise;
+  tesseractLoadPromise = new Promise((resolve) => {
+    const timeout = setTimeout(() => { resolve(false); }, 20000);
+    const script = document.createElement('script');
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/4.1.1/tesseract.min.js';
+    script.onload = () => { clearTimeout(timeout); resolve(!!window.Tesseract); };
+    script.onerror = () => { clearTimeout(timeout); resolve(false); };
+    document.head.appendChild(script);
+  });
+  return tesseractLoadPromise;
+}
+async function extractImageText(file){
+  const ok = await loadTesseractLib();
+  if(!ok || !window.Tesseract) return null;
+  try{
+    const { data } = await window.Tesseract.recognize(file, 'eng');
+    return data.text;
+  }catch(e){
+    console.error('extractImageText error:', e);
+    return null;
+  }
+}
 /* ---- Charts (Chart.js) — loaded on demand, same safe pattern as the PDF/Excel libraries ---- */
 let chartJsLoadPromise = null;
 function loadChartJsLib(){
@@ -4057,6 +4088,56 @@ function parseMarkerPdfText(text){
     unitSystem, lengthBig, widthSmall,
   };
 }
+// Image-format markers (JPG/PNG) don't print a "Material:" field the way the PDF
+// report does — the closest equivalent is baked into the uploaded FILE NAME, not the
+// image content, following the convention "{StyleCode}({SizeRun}){Material}" e.g.
+// "308122(M2 L10 XL5)BODY.jpg". The filename is exact (no OCR risk) for Style+Material;
+// only the footer TEXT printed on the image (Length/Width/Model-Size-Qty/Utilization)
+// needs OCR. Confirmed with the user against 4 real example filenames.
+function parseMarkerFileName(fileName){
+  const base = fileName.replace(/\.[a-zA-Z0-9]+$/, '');
+  const m = base.match(/^(.*?)\(([^)]*)\)\s*(.*)$/);
+  if(!m) return { styleName: base.trim(), material: '' };
+  return { styleName: m[1].trim(), material: m[3].trim() };
+}
+// This format has no single "Sets:N" total the way the PDF report does — the total
+// pieces has to be summed from the Model/Size/Qty breakdown (e.g. "308122 M/2 L/10
+// XL/5" -> 2+10+5=17), per the user's explicit instruction. Length/Width here are
+// already flat decimals in the OCR'd text (no combined-parenthetical form to pull out
+// like the PDF format has), so the whole+fraction pieces are added manually instead.
+function parseMarkerImageText(text, fileName){
+  const clean = text.replace(/\s+/g, ' ');
+  const { styleName, material } = parseMarkerFileName(fileName);
+
+  let unitSystem = null, lengthBig = null, widthSmall = null;
+  const lenYd = clean.match(/Length\s*:?\s*(\d+)\s*yd\s*([\d.]+)\s*in/i);
+  const widYd = clean.match(/Width\s*:?\s*([\d.]+)\s*in/i);
+  if(lenYd && widYd){
+    unitSystem = 'yard';
+    lengthBig = parseFloat(lenYd[1]) + parseFloat(lenYd[2])/36;
+    widthSmall = parseFloat(widYd[1]);
+  }else{
+    const lenM = clean.match(/Length\s*:?\s*(\d+)\s*m\s*([\d.]+)\s*cm/i);
+    const widM = clean.match(/Width\s*:?\s*([\d.]+)\s*cm/i);
+    if(lenM && widM){
+      unitSystem = 'metric';
+      lengthBig = parseFloat(lenM[1]) + parseFloat(lenM[2])/100;
+      widthSmall = parseFloat(widM[1]);
+    }
+  }
+  if(!unitSystem) return null;
+
+  const msqMatch = clean.match(/Model\s*\/\s*Size\s*\/\s*Qty\s*:?\s*(.+?)(?=\s*(?:Unplaced|Utilization|Yield|Print\s*Date|$))/i);
+  if(!msqMatch) return null;
+  const pairs = [...msqMatch[1].matchAll(/([A-Za-z0-9]+)\s*\/\s*(\d+)/g)];
+  if(pairs.length === 0) return null;
+  const sets = pairs.reduce((s,p) => s + parseInt(p[2],10), 0);
+  const sizes = pairs.map(p => p[1]+'/'+p[2]).join(', ');
+
+  const effMatch = clean.match(/Utilization\s*:?\s*([\d.]+)\s*%/i);
+
+  return { styleName, sizes, material, sets, efficiency: effMatch ? parseFloat(effMatch[1]) : null, unitSystem, lengthBig, widthSmall };
+}
 // Yard/inch markers: GSM IS required (unlike the meter/cm path below), and both
 // extras are fixed constants per spec, not editable — +2in on the marker length
 // before dividing by Sets, +2in on the cuttable width to get the full fabric width
@@ -4441,11 +4522,11 @@ function renderConsumptionCalculator(){
     return `
     <div class="panel">
       <h2>Fabric Consumption Calculator</h2>
-      <p class="desc">Upload the marker PDF(s) exported from your CAD/marker-making software — Length, Width, Material, and Sets (pieces) are read straight off each one. Select several at once (or upload in batches) when CAD has split a style/material into multiple mini markers, or sent markers for several materials together — they're automatically grouped by Material + Style, and markers sharing both are averaged into one consumption figure.</p>
+      <p class="desc">Upload the marker file(s) exported from your CAD/marker-making software — PDF or an image (JPG/PNG) both work. Length, Width, Material, and Sets (pieces) are read straight off each one — for images, Material comes from the file name (e.g. "308122(M2 L10 XL5)BODY.jpg") since it isn't printed on the image itself, and Sets is the sum of the Model/Size/Qty breakdown. Select several at once (or upload in batches) when CAD has split a style/material into multiple mini markers, or sent markers for several materials together — they're automatically grouped by Material + Style, and markers sharing both are averaged into one consumption figure.</p>
       ${modeToggle}
       <div class="field" style="max-width:420px;">
-        <label>Marker PDF(s)</label>
-        <input type="file" id="consMarkerUpload" accept="application/pdf" multiple>
+        <label>Marker file(s) — PDF or image</label>
+        <input type="file" id="consMarkerUpload" accept="application/pdf,image/jpeg,image/png,image/jpg" multiple>
       </div>
     </div>
     <div class="panel">
@@ -4566,23 +4647,39 @@ function attachTabEvents(){
   if(markerUploadInput) markerUploadInput.addEventListener('change', async (e) => {
     const files = Array.from(e.target.files || []);
     if(files.length === 0) return;
-    showToast(files.length>1 ? `Reading ${files.length} markers…` : 'Reading marker…');
-    let addedCount = 0, failedCount = 0, libFailed = false;
+    const hasImages = files.some(f => f.type.startsWith('image/') || /\.(jpe?g|png)$/i.test(f.name));
+    showToast(files.length>1
+      ? `Reading ${files.length} markers…` + (hasImages ? ' (images take longer — OCR)' : '')
+      : (hasImages ? 'Reading marker (OCR — may take a moment)…' : 'Reading marker…'));
+    let addedCount = 0, failedCount = 0, pdfLibFailed = false, imageLibFailed = false;
     for(const file of files){
-      const text = await extractPdfText(file);
-      if(text === null){ libFailed = true; break; } // library load failure — same for every remaining file, no point retrying
-      const parsed = parseMarkerPdfText(text);
-      if(!parsed){ failedCount++; continue; }
-      consMarkersParsed.push({ ...parsed, id: ++consMarkerIdSeq, fileName: file.name });
-      addedCount++;
+      const isImage = file.type.startsWith('image/') || /\.(jpe?g|png)$/i.test(file.name);
+      if(isImage){
+        if(imageLibFailed) continue;
+        const text = await extractImageText(file);
+        if(text === null){ imageLibFailed = true; continue; }
+        const parsed = parseMarkerImageText(text, file.name);
+        if(!parsed){ failedCount++; continue; }
+        consMarkersParsed.push({ ...parsed, id: ++consMarkerIdSeq, fileName: file.name });
+        addedCount++;
+      }else{
+        if(pdfLibFailed) continue;
+        const text = await extractPdfText(file);
+        if(text === null){ pdfLibFailed = true; continue; }
+        const parsed = parseMarkerPdfText(text);
+        if(!parsed){ failedCount++; continue; }
+        consMarkersParsed.push({ ...parsed, id: ++consMarkerIdSeq, fileName: file.name });
+        addedCount++;
+      }
     }
-    if(libFailed){
-      showToast('Could not load the PDF reading library — check your internet connection and try again');
+    const failedLibs = [pdfLibFailed && 'PDF reading', imageLibFailed && 'image OCR'].filter(Boolean);
+    if(failedLibs.length>0 && addedCount===0){
+      showToast(`Could not load the ${failedLibs.join(' / ')} library — check your internet connection and try again`);
     }else if(addedCount>0){
       showToast(addedCount===1 ? 'Marker read — enter GSM to calculate' : `${addedCount} markers read`
         + (failedCount>0 ? ` (${failedCount} skipped — no marker details found)` : ''));
     }else{
-      showToast("Couldn't find marker details in the uploaded PDF(s) — try Manual mode instead");
+      showToast("Couldn't find marker details in the uploaded file(s) — try Manual mode instead");
     }
     e.target.value = ''; // allow re-selecting the same file(s) on a later upload
     rerenderAutomaticBody();
