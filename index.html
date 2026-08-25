@@ -331,6 +331,12 @@ let consumptionMode = 'manual'; // 'manual' | 'automatic' — Consumption Calcul
 // per-marker results averaged (see calcGroupAverageConsumption()).
 let consMarkersParsed = []; // [{ id, fileName, styleName, sizes, material, sets, efficiency, unitSystem, lengthBig, widthSmall }]
 let consGroupInputs = {}; // groupKey -> { gsm, wastagePct, orderQty }, keyed by Material+Style so values persist as markers are added/removed
+// Image markers can carry the piece count in TWO independent places — the file name's
+// size run (e.g. "(M2 L10 XL5)") and the OCR'd Model/Size/Qty text on the image itself.
+// When both are readable but disagree, the marker is held here (not in consMarkersParsed)
+// until the user confirms/corrects the total — never silently guessed for a number that
+// drives real fabric purchasing. See parseMarkerImageText() and resolvePendingMarker().
+let consPendingMarkers = []; // [{ id, fileName, base (marker fields minus sets), setsFromFileName, setsFromText }]
 let consMarkerIdSeq = 0;
 let templatePastePreview = null; // {setId: string|null, name?: string, rows:[{name,dept,offset,error}]}
 let editingAccessUserId = null;
@@ -4088,26 +4094,48 @@ function parseMarkerPdfText(text){
     unitSystem, lengthBig, widthSmall,
   };
 }
+// Parses whitespace-separated "SizeQty" tokens with no delimiter between the size code
+// and the count — e.g. "M2 L10 XL5" or "S3 M4 L4 XL4 2XL2" (the filename's size-run
+// convention). The non-greedy split keeps extending the size portion until whatever's
+// left is purely digits, which is what correctly resolves a token like "2XL2" into
+// size "2XL" + qty "2" rather than splitting after the leading digit.
+function parseSizeQtyTokens(str){
+  const tokens = str.trim().split(/\s+/).filter(Boolean);
+  if(tokens.length === 0) return null;
+  // A token with no trailing digit at all (e.g. "S", "XL", "2XL") means exactly one
+  // piece of that size — the size run only writes a trailing number when there's more
+  // than one, matching how "S/1 M/2 L/2 XL/1" prints in the OCR'd Model/Size/Qty text.
+  return tokens.map(tok => {
+    const m = tok.match(/^(.+?)(\d+)$/);
+    return m ? { size: m[1], qty: parseInt(m[2], 10) } : { size: tok, qty: 1 };
+  });
+}
 // Image-format markers (JPG/PNG) don't print a "Material:" field the way the PDF
 // report does — the closest equivalent is baked into the uploaded FILE NAME, not the
 // image content, following the convention "{StyleCode}({SizeRun}){Material}" e.g.
-// "308122(M2 L10 XL5)BODY.jpg". The filename is exact (no OCR risk) for Style+Material;
-// only the footer TEXT printed on the image (Length/Width/Model-Size-Qty/Utilization)
-// needs OCR. Confirmed with the user against 4 real example filenames.
+// "308122(M2 L10 XL5)BODY.jpg". The filename is exact (no OCR risk) for Style+Material.
+// The size run in the parentheses ALSO gives an independent second read on the piece
+// count, alongside the OCR'd Model/Size/Qty text — see parseMarkerImageText(), which
+// cross-checks the two rather than trusting either alone. Confirmed with the user
+// against 4 real example filenames.
 function parseMarkerFileName(fileName){
   const base = fileName.replace(/\.[a-zA-Z0-9]+$/, '');
   const m = base.match(/^(.*?)\(([^)]*)\)\s*(.*)$/);
-  if(!m) return { styleName: base.trim(), material: '' };
-  return { styleName: m[1].trim(), material: m[3].trim() };
+  if(!m) return { styleName: base.trim(), material: '', sizeRunPairs: null };
+  return { styleName: m[1].trim(), material: m[3].trim(), sizeRunPairs: parseSizeQtyTokens(m[2]) };
 }
-// This format has no single "Sets:N" total the way the PDF report does — the total
-// pieces has to be summed from the Model/Size/Qty breakdown (e.g. "308122 M/2 L/10
-// XL/5" -> 2+10+5=17), per the user's explicit instruction. Length/Width here are
-// already flat decimals in the OCR'd text (no combined-parenthetical form to pull out
-// like the PDF format has), so the whole+fraction pieces are added manually instead.
+// This format has no single "Sets:N" total the way the PDF report does. Two independent
+// sources can each supply it: the OCR'd "Model/Size/Qty" text on the image, and the
+// file name's own size run (see parseMarkerFileName). When only one is readable, that
+// one is used — this is still "calculated from inside the file or the file name", per
+// the user's instruction, whichever is actually available. When BOTH are readable, they
+// must AGREE; if they don't (an OCR misread, a stale filename, a genuinely different
+// marker), sets is left null and needsConfirmation carries both candidates so the
+// caller holds the marker for the user to confirm/correct rather than guessing which
+// one is right for a number that drives real fabric purchasing.
 function parseMarkerImageText(text, fileName){
   const clean = text.replace(/\s+/g, ' ');
-  const { styleName, material } = parseMarkerFileName(fileName);
+  const { styleName, material, sizeRunPairs } = parseMarkerFileName(fileName);
 
   let unitSystem = null, lengthBig = null, widthSmall = null;
   const lenYd = clean.match(/Length\s*:?\s*(\d+)\s*yd\s*([\d.]+)\s*in/i);
@@ -4128,15 +4156,24 @@ function parseMarkerImageText(text, fileName){
   if(!unitSystem) return null;
 
   const msqMatch = clean.match(/Model\s*\/\s*Size\s*\/\s*Qty\s*:?\s*(.+?)(?=\s*(?:Unplaced|Utilization|Yield|Print\s*Date|$))/i);
-  if(!msqMatch) return null;
-  const pairs = [...msqMatch[1].matchAll(/([A-Za-z0-9]+)\s*\/\s*(\d+)/g)];
-  if(pairs.length === 0) return null;
-  const sets = pairs.reduce((s,p) => s + parseInt(p[2],10), 0);
-  const sizes = pairs.map(p => p[1]+'/'+p[2]).join(', ');
+  const textPairs = msqMatch ? [...msqMatch[1].matchAll(/([A-Za-z0-9]+)\s*\/\s*(\d+)/g)] : [];
+  const setsFromText = textPairs.length ? textPairs.reduce((s,p) => s + parseInt(p[2],10), 0) : null;
+  const sizesFromText = textPairs.length ? textPairs.map(p => p[1]+'/'+p[2]).join(', ') : null;
+  const setsFromFileName = sizeRunPairs ? sizeRunPairs.reduce((s,p) => s + p.qty, 0) : null;
+  const sizesFromFileName = sizeRunPairs ? sizeRunPairs.map(p => p.size+'/'+p.qty).join(', ') : null;
 
   const effMatch = clean.match(/Utilization\s*:?\s*([\d.]+)\s*%/i);
+  const base = { styleName, material, efficiency: effMatch ? parseFloat(effMatch[1]) : null, unitSystem, lengthBig, widthSmall };
 
-  return { styleName, sizes, material, sets, efficiency: effMatch ? parseFloat(effMatch[1]) : null, unitSystem, lengthBig, widthSmall };
+  if(setsFromText!==null && setsFromFileName!==null){
+    if(setsFromText === setsFromFileName){
+      return { ...base, sizes: sizesFromText, sets: setsFromText, setsSource: 'both' };
+    }
+    return { ...base, sizes: sizesFromText || sizesFromFileName, sets: null, needsConfirmation: true, setsFromText, setsFromFileName };
+  }
+  if(setsFromText!==null) return { ...base, sizes: sizesFromText, sets: setsFromText, setsSource: 'image text' };
+  if(setsFromFileName!==null) return { ...base, sizes: sizesFromFileName, sets: setsFromFileName, setsSource: 'file name' };
+  return null; // neither source could establish a piece count — nothing to work with
 }
 // Yard/inch markers: GSM IS required (unlike the meter/cm path below), and both
 // extras are fixed constants per spec, not editable — +2in on the marker length
@@ -4449,8 +4486,8 @@ function renderMarkerGroupBody(group){
       </div>
       ${group.markers.map(m => `
         <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid var(--green);padding:8px 0 0;margin-top:8px;">
-          <div><span class="mono">${m.fileName}</span> — ${m.sets} pcs, ${isMetric ? m.lengthBig.toFixed(2)+'m × '+m.widthSmall.toFixed(2)+'cm' : m.lengthBig.toFixed(2)+'yd × '+m.widthSmall.toFixed(2)+'in'}, eff ${m.efficiency!==null?m.efficiency+'%':'—'}</div>
-          <a href="#" class="remove-marker-link" data-marker-id="${m.id}" style="color:var(--red);white-space:nowrap;">Remove</a>
+          <div><span class="mono">${m.fileName}</span> — ${m.sets} pcs${m.setsSource ? ` <span class="hint">(${m.setsSource})</span>` : ''}, ${isMetric ? m.lengthBig.toFixed(2)+'m × '+m.widthSmall.toFixed(2)+'cm' : m.lengthBig.toFixed(2)+'yd × '+m.widthSmall.toFixed(2)+'in'}, eff ${m.efficiency!==null?m.efficiency+'%':'—'}</div>
+          <a href="#" class="remove-marker-link" data-marker-id="${m.id}" style="color:var(--thread-red);white-space:nowrap;">Remove</a>
         </div>`).join('')}
     </div>`;
 
@@ -4499,9 +4536,32 @@ function rerenderAutomaticBody(){
   const body = document.getElementById('consAutoBody');
   if(body){ body.innerHTML = renderAutomaticMarkerBody(); attachConsumptionAutoEvents(); }
 }
+// A pending marker's file name and OCR'd image text each gave a different total piece
+// count — never auto-picked, since guessing wrong silently drives a real purchasing
+// number. Both candidates are shown side by side with a source label, plus a field for
+// the user to type the correct total; nothing here is added to consMarkersParsed (and
+// so never enters grouping/averaging) until resolvePendingMarker() confirms it.
+function renderPendingMarkerConfirmations(){
+  const cards = consPendingMarkers.map((m, i) => `
+    <div class="panel" style="background:var(--brass-soft);border-color:var(--brass);${i<consPendingMarkers.length-1?'margin-bottom:12px;':''}">
+      <div style="font-weight:600;font-family:'Space Grotesk',sans-serif;margin-bottom:6px;">${m.fileName} — piece count mismatch</div>
+      <div class="hint" style="margin-bottom:10px;">${m.styleName||'—'} / ${m.material||'Unspecified'} — the file name and the marker's own image text disagree on total pieces. Enter the correct total before this marker is used.</div>
+      <div class="grid-cols" style="grid-template-columns:repeat(3,1fr);gap:10px;align-items:end;">
+        <div><div class="hint">From file name</div><div class="mono">${m.setsFromFileName}</div></div>
+        <div><div class="hint">From image text</div><div class="mono">${m.setsFromText}</div></div>
+        <div class="field"><label>Correct total pieces</label><input id="pendingSets_${m.id}" type="number" step="1" placeholder="e.g. ${m.setsFromFileName}"></div>
+      </div>
+      <div class="row-actions" style="margin-top:12px;">
+        <button class="btn small confirm-pending-marker-btn" data-marker-id="${m.id}">Confirm &amp; add</button>
+        <button class="btn ghost small discard-pending-marker-btn" data-marker-id="${m.id}">Discard this marker</button>
+      </div>
+    </div>`).join('');
+  return `<div class="panel" style="margin-bottom:16px;"><h2 style="margin-bottom:10px;">Needs your confirmation (${consPendingMarkers.length})</h2>${cards}</div>`;
+}
 function renderAutomaticMarkerBody(){
+  const pendingHtml = consPendingMarkers.length>0 ? renderPendingMarkerConfirmations() : '';
   if(consMarkersParsed.length === 0){
-    return emptyState('shirt', 'Upload one or more marker PDFs above — the system reads Length, Width, Material, and Sets automatically, and groups markers by Material + Style so multiple mini markers for the same fabric average together.');
+    return pendingHtml || emptyState('shirt', 'Upload one or more marker PDFs above — the system reads Length, Width, Material, and Sets automatically, and groups markers by Material + Style so multiple mini markers for the same fabric average together.');
   }
   const groups = groupMarkersByMaterial(consMarkersParsed);
   const clearAllBtn = `<div class="row-actions" style="margin-bottom:14px;"><button class="btn ghost small" id="clearAllMarkersBtn">Clear all markers</button></div>`;
@@ -4509,7 +4569,7 @@ function renderAutomaticMarkerBody(){
     <div class="panel"${i>0 ? ' style="margin-top:16px;"' : ''}>
       ${renderMarkerGroupBody(g)}
     </div>`).join('');
-  return clearAllBtn + groupSections;
+  return pendingHtml + clearAllBtn + groupSections;
 }
 function renderConsumptionCalculator(){
   const modeToggle = `
@@ -4606,6 +4666,32 @@ function attachConsumptionAutoEvents(){
     consGroupInputs = {};
     rerenderAutomaticBody();
   });
+  document.querySelectorAll('.confirm-pending-marker-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = Number(btn.dataset.markerId);
+      const input = document.getElementById('pendingSets_'+id);
+      const val = input && input.value!=='' ? parseInt(input.value, 10) : NaN;
+      if(isNaN(val) || val<=0){ showToast('Enter the correct total pieces first'); return; }
+      resolvePendingMarker(id, val);
+    });
+  });
+  document.querySelectorAll('.discard-pending-marker-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      consPendingMarkers = consPendingMarkers.filter(m => m.id !== Number(btn.dataset.markerId));
+      rerenderAutomaticBody();
+    });
+  });
+}
+// Finalizes a held-back marker once the user has typed the correct piece count —
+// only now does it join consMarkersParsed and become eligible for grouping/averaging.
+function resolvePendingMarker(id, finalSets){
+  const m = consPendingMarkers.find(x => x.id === id);
+  if(!m) return;
+  consPendingMarkers = consPendingMarkers.filter(x => x.id !== id);
+  const { setsFromText, setsFromFileName, needsConfirmation, ...base } = m;
+  consMarkersParsed.push({ ...base, sets: finalSets, setsSource: 'user-confirmed' });
+  showToast('Marker added — enter GSM to calculate');
+  rerenderAutomaticBody();
 }
 
 /* ---------------- Event wiring ---------------- */
@@ -4651,7 +4737,7 @@ function attachTabEvents(){
     showToast(files.length>1
       ? `Reading ${files.length} markers…` + (hasImages ? ' (images take longer — OCR)' : '')
       : (hasImages ? 'Reading marker (OCR — may take a moment)…' : 'Reading marker…'));
-    let addedCount = 0, failedCount = 0, pdfLibFailed = false, imageLibFailed = false;
+    let addedCount = 0, failedCount = 0, pendingCount = 0, pdfLibFailed = false, imageLibFailed = false;
     for(const file of files){
       const isImage = file.type.startsWith('image/') || /\.(jpe?g|png)$/i.test(file.name);
       if(isImage){
@@ -4660,8 +4746,13 @@ function attachTabEvents(){
         if(text === null){ imageLibFailed = true; continue; }
         const parsed = parseMarkerImageText(text, file.name);
         if(!parsed){ failedCount++; continue; }
-        consMarkersParsed.push({ ...parsed, id: ++consMarkerIdSeq, fileName: file.name });
-        addedCount++;
+        if(parsed.needsConfirmation){
+          consPendingMarkers.push({ ...parsed, id: ++consMarkerIdSeq, fileName: file.name });
+          pendingCount++;
+        }else{
+          consMarkersParsed.push({ ...parsed, id: ++consMarkerIdSeq, fileName: file.name });
+          addedCount++;
+        }
       }else{
         if(pdfLibFailed) continue;
         const text = await extractPdfText(file);
@@ -4673,8 +4764,10 @@ function attachTabEvents(){
       }
     }
     const failedLibs = [pdfLibFailed && 'PDF reading', imageLibFailed && 'image OCR'].filter(Boolean);
-    if(failedLibs.length>0 && addedCount===0){
+    if(failedLibs.length>0 && addedCount===0 && pendingCount===0){
       showToast(`Could not load the ${failedLibs.join(' / ')} library — check your internet connection and try again`);
+    }else if(pendingCount>0){
+      showToast(`${pendingCount} marker${pendingCount>1?'s need':' needs'} your confirmation — the file name and the image text disagree on piece count`);
     }else if(addedCount>0){
       showToast(addedCount===1 ? 'Marker read — enter GSM to calculate' : `${addedCount} markers read`
         + (failedCount>0 ? ` (${failedCount} skipped — no marker details found)` : ''));
