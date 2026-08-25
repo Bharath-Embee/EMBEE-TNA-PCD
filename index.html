@@ -337,6 +337,10 @@ let consGroupInputs = {}; // groupKey -> { gsm, wastagePct, orderQty }, keyed by
 // until the user confirms/corrects the total — never silently guessed for a number that
 // drives real fabric purchasing. See parseMarkerImageText() and resolvePendingMarker().
 let consPendingMarkers = []; // [{ id, fileName, base (marker fields minus sets), setsFromFileName, setsFromText }]
+// OCR read SOME text off a marker image/PDF but none of the expected fields matched —
+// held here with the raw text so it's visible (not a dead-end "couldn't find details"
+// toast with no way to tell why), and so a real failure can actually be diagnosed.
+let consUnreadableMarkers = []; // [{ id, fileName, rawText }]
 let consMarkerIdSeq = 0;
 let templatePastePreview = null; // {setId: string|null, name?: string, rows:[{name,dept,offset,error}]}
 let editingAccessUserId = null;
@@ -362,6 +366,9 @@ const ICONS = {
 };
 function emptyState(icon, text){
   return `<div class="empty">${ICONS[icon]||''}<span>${text}</span></div>`;
+}
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
 /* ---- PDF export (built on core jsPDF only — no autotable plugin dependency, for reliability) ----
@@ -493,6 +500,47 @@ async function renderPdfPageToCanvas(file){
     return canvas;
   }catch(e){
     console.error('renderPdfPageToCanvas error:', e);
+    return null;
+  }
+}
+// A marker export is mostly a busy, multi-colored cutting-plan diagram, with the actual
+// footer text (Length/Width/Model-Size-Qty/Utilization) confined to a clean white strip
+// along the bottom. Feeding Tesseract the WHOLE image makes it scan all that diagram
+// noise for no benefit and can hurt recognition of the small text that actually matters
+// — so before OCR, crop down to just the bottom band. Falls back to the uncropped
+// source if cropping fails for any reason (never worse than not cropping at all).
+function cropCanvasFooter(canvas, fromFraction){
+  fromFraction = fromFraction===undefined ? 0.72 : fromFraction;
+  const cropTop = Math.floor(canvas.height * fromFraction);
+  const cropHeight = canvas.height - cropTop;
+  if(cropHeight <= 0) return canvas;
+  const out = document.createElement('canvas');
+  out.width = canvas.width;
+  out.height = cropHeight;
+  out.getContext('2d').drawImage(canvas, 0, cropTop, canvas.width, cropHeight, 0, 0, canvas.width, cropHeight);
+  return out;
+}
+async function loadImageFileToCanvas(file){
+  try{
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+    const img = await new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = reject;
+      image.src = dataUrl;
+    });
+    const canvas = document.createElement('canvas');
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    canvas.getContext('2d').drawImage(img, 0, 0);
+    return canvas;
+  }catch(e){
+    console.error('loadImageFileToCanvas error:', e);
     return null;
   }
 }
@@ -4581,10 +4629,26 @@ function renderPendingMarkerConfirmations(){
     </div>`).join('');
   return `<div class="panel" style="margin-bottom:16px;"><h2 style="margin-bottom:10px;">Needs your confirmation (${consPendingMarkers.length})</h2>${cards}</div>`;
 }
+// OCR (or a flattened-PDF-render-then-OCR) produced text but none of the expected
+// fields matched it — shown with the raw text rather than a dead-end "couldn't find
+// details" toast, so a real read failure is actually diagnosable instead of a guess.
+function renderUnreadableMarkers(){
+  const cards = consUnreadableMarkers.map((m, i) => `
+    <div class="panel" style="background:var(--thread-red-dim);border-color:var(--thread-red);${i<consUnreadableMarkers.length-1?'margin-bottom:12px;':''}">
+      <div style="font-weight:600;font-family:'Space Grotesk',sans-serif;margin-bottom:6px;">${m.fileName} — couldn't find marker details</div>
+      <div class="hint" style="margin-bottom:8px;">The text below is what was actually read off this file. If it looks garbled, try a clearer/higher-resolution image, or enter the details manually in Manual mode.</div>
+      <pre class="mono" style="white-space:pre-wrap;max-height:160px;overflow:auto;background:var(--canvas-panel);border:1px solid var(--line);border-radius:6px;padding:8px;font-size:11px;margin:0;">${escapeHtml(m.rawText.slice(0, 1500))}</pre>
+      <div class="row-actions" style="margin-top:10px;">
+        <button class="btn ghost small dismiss-unreadable-marker-btn" data-marker-id="${m.id}">Dismiss</button>
+      </div>
+    </div>`).join('');
+  return `<div class="panel" style="margin-bottom:16px;"><h2 style="margin-bottom:10px;">Couldn't read (${consUnreadableMarkers.length})</h2>${cards}</div>`;
+}
 function renderAutomaticMarkerBody(){
   const pendingHtml = consPendingMarkers.length>0 ? renderPendingMarkerConfirmations() : '';
+  const unreadableHtml = consUnreadableMarkers.length>0 ? renderUnreadableMarkers() : '';
   if(consMarkersParsed.length === 0){
-    return pendingHtml || emptyState('shirt', 'Upload one or more marker PDFs above — the system reads Length, Width, Material, and Sets automatically, and groups markers by Material + Style so multiple mini markers for the same fabric average together.');
+    return (pendingHtml + unreadableHtml) || emptyState('shirt', 'Upload one or more marker PDFs above — the system reads Length, Width, Material, and Sets automatically, and groups markers by Material + Style so multiple mini markers for the same fabric average together.');
   }
   const groups = groupMarkersByMaterial(consMarkersParsed);
   const clearAllBtn = `<div class="row-actions" style="margin-bottom:14px;"><button class="btn ghost small" id="clearAllMarkersBtn">Clear all markers</button></div>`;
@@ -4592,7 +4656,7 @@ function renderAutomaticMarkerBody(){
     <div class="panel"${i>0 ? ' style="margin-top:16px;"' : ''}>
       ${renderMarkerGroupBody(g)}
     </div>`).join('');
-  return pendingHtml + clearAllBtn + groupSections;
+  return pendingHtml + unreadableHtml + clearAllBtn + groupSections;
 }
 function renderConsumptionCalculator(){
   const modeToggle = `
@@ -4704,6 +4768,12 @@ function attachConsumptionAutoEvents(){
       rerenderAutomaticBody();
     });
   });
+  document.querySelectorAll('.dismiss-unreadable-marker-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      consUnreadableMarkers = consUnreadableMarkers.filter(m => m.id !== Number(btn.dataset.markerId));
+      rerenderAutomaticBody();
+    });
+  });
 }
 // Finalizes a held-back marker once the user has typed the correct piece count —
 // only now does it join consMarkersParsed and become eligible for grouping/averaging.
@@ -4760,48 +4830,58 @@ function attachTabEvents(){
     showToast(files.length>1
       ? `Reading ${files.length} markers…` + (hasImages ? ' (images take longer — OCR)' : '')
       : (hasImages ? 'Reading marker (OCR — may take a moment)…' : 'Reading marker…'));
-    let addedCount = 0, failedCount = 0, pendingCount = 0, pdfLibFailed = false, imageLibFailed = false;
+    let addedCount = 0, failedCount = 0, pendingCount = 0, unreadableCount = 0, pdfLibFailed = false, imageLibFailed = false;
     // Shared by both the direct-image path and the flattened-PDF-OCR-fallback path below —
     // a marker whose two piece-count sources disagree is held for confirmation, not added.
     const commitParsedMarker = (parsed, fileName) => {
       if(parsed.needsConfirmation){ consPendingMarkers.push({ ...parsed, id: ++consMarkerIdSeq, fileName }); pendingCount++; }
       else{ consMarkersParsed.push({ ...parsed, id: ++consMarkerIdSeq, fileName }); addedCount++; }
     };
+    // OCR ran and produced text, but none of it matched — surface the raw text instead
+    // of a dead-end "couldn't find details" with no way to tell what went wrong.
+    const recordUnreadable = (rawText, fileName) => {
+      if(rawText && rawText.trim()){ consUnreadableMarkers.push({ id: ++consMarkerIdSeq, fileName, rawText: rawText.trim() }); unreadableCount++; }
+      else{ failedCount++; }
+    };
     for(const file of files){
       const isImage = file.type.startsWith('image/') || /\.(jpe?g|png)$/i.test(file.name);
       if(isImage){
         if(imageLibFailed) continue;
-        const text = await extractImageText(file);
+        const rawCanvas = await loadImageFileToCanvas(file);
+        const text = await extractImageText(rawCanvas ? cropCanvasFooter(rawCanvas) : file);
         if(text === null){ imageLibFailed = true; continue; }
         const parsed = parseMarkerImageText(text, file.name);
-        if(!parsed){ failedCount++; continue; }
+        if(!parsed){ recordUnreadable(text, file.name); continue; }
         commitParsedMarker(parsed, file.name);
       }else{
         if(pdfLibFailed) continue;
         const text = await extractPdfText(file);
         if(text === null){ pdfLibFailed = true; continue; }
         let parsed = parseMarkerPdfText(text);
+        let ocrText = null;
         // No real text layer (a flattened/scanned PDF export, not a text-based one) —
         // render the page as an image and read it via OCR instead of rejecting it.
         if(!parsed && text.trim().length < 30){
-          const canvas = await renderPdfPageToCanvas(file);
-          if(canvas){
-            const ocrText = await extractImageText(canvas);
+          const pageCanvas = await renderPdfPageToCanvas(file);
+          if(pageCanvas){
+            ocrText = await extractImageText(cropCanvasFooter(pageCanvas));
             if(ocrText !== null) parsed = parseMarkerImageText(ocrText, file.name);
           }
         }
-        if(!parsed){ failedCount++; continue; }
+        if(!parsed){ recordUnreadable(ocrText || text, file.name); continue; }
         commitParsedMarker(parsed, file.name);
       }
     }
     const failedLibs = [pdfLibFailed && 'PDF reading', imageLibFailed && 'image OCR'].filter(Boolean);
-    if(failedLibs.length>0 && addedCount===0 && pendingCount===0){
+    if(failedLibs.length>0 && addedCount===0 && pendingCount===0 && unreadableCount===0){
       showToast(`Could not load the ${failedLibs.join(' / ')} library — check your internet connection and try again`);
     }else if(pendingCount>0){
       showToast(`${pendingCount} marker${pendingCount>1?'s need':' needs'} your confirmation — the file name and the image text disagree on piece count`);
     }else if(addedCount>0){
       showToast(addedCount===1 ? 'Marker read — enter GSM to calculate' : `${addedCount} markers read`
-        + (failedCount>0 ? ` (${failedCount} skipped — no marker details found)` : ''));
+        + (failedCount>0 || unreadableCount>0 ? ` (${failedCount+unreadableCount} skipped)` : ''));
+    }else if(unreadableCount>0){
+      showToast(`Couldn't read ${unreadableCount>1?'these markers':'this marker'} — see the details below`);
     }else{
       showToast("Couldn't find marker details in the uploaded file(s) — try Manual mode instead");
     }
