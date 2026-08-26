@@ -545,6 +545,13 @@ function cropCanvasFooter(canvas, fromFraction, scale){
   const ctx = out.getContext('2d');
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
+  // A full-DESKTOP SCREENSHOT's status bar (vs. a CAD tool's own clean footer export)
+  // is small, anti-aliased UI text -- confirmed against a real upload where even the
+  // tighter crop still had the OCR engine reading digits as letters throughout ("64.000"
+  // as "ee000", "82.86%" as "e28e%"). Grayscale + a contrast boost is the standard
+  // pre-OCR step for exactly that kind of soft-edged text: it sharpens the character/
+  // background boundary before Tesseract ever sees it, on top of the upscale above.
+  ctx.filter = 'grayscale(1) contrast(1.6) brightness(1.05)';
   ctx.drawImage(canvas, 0, cropTop, canvas.width, cropHeight, 0, 0, out.width, out.height);
   return out;
 }
@@ -4393,8 +4400,11 @@ function parseMarkerStatusBarText(text, fileName){
 // escalation only happens once a narrower crop has already come back empty-handed.
 async function parseMarkerFromImage(rawCanvasOrFile, fileName){
   const isCanvas = rawCanvasOrFile && typeof rawCanvasOrFile.getContext === 'function';
+  // The tighter 0.9 crop covers a much shorter strip of the source image than the 0.72
+  // one, so it can afford a bigger upscale for the same reason a smaller crop region
+  // always can -- more pixels per character, without the resulting canvas getting huge.
   const attempts = isCanvas
-    ? [cropCanvasFooter(rawCanvasOrFile, 0.72), cropCanvasFooter(rawCanvasOrFile, 0.9), rawCanvasOrFile]
+    ? [cropCanvasFooter(rawCanvasOrFile, 0.72, 3), cropCanvasFooter(rawCanvasOrFile, 0.9, 6), rawCanvasOrFile]
     : [rawCanvasOrFile]; // a bare File (canvas load failed) can only be OCR'd as-is
   let combinedText = '';
   let bestPartial = null;
