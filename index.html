@@ -4065,6 +4065,14 @@ function readConsumptionInputs(){
   };
 }
 function fmtKg(n){ return n===null || n===undefined ? '—' : n.toFixed(4); }
+// The Sets total alone doesn't tell anyone which sizes it's made of or how many of
+// each -- shown next to every "N pcs"/"Sets" figure (on screen and in the exported
+// PDF) so the size/qty breakdown behind that number is never hidden behind a single
+// total, whether it's the admin reading it back or someone else on the team.
+function sizesQtyHintHtml(sizes, sets){
+  if(!sizes) return '';
+  return `<p class="hint" style="margin:0 0 12px;">Sizes / Qty considered: <span class="mono">${escapeHtml(sizes)}</span>${sets!==null && sets!==undefined ? ` — ${sets} pcs total` : ''}</p>`;
+}
 // A fixed 0–5% wastage sweep off the same no-wastage base figure, shown alongside the
 // single wastage% the user actually typed — so the whole range is visible at a glance
 // instead of having to retype the wastage field five times to compare. Used by both
@@ -4329,6 +4337,58 @@ function parseMarkerImageText(text, fileName){
   if(setsFromFileName!==null) return { ...base, sizes: sizesFromFileName, sets: setsFromFileName, setsSource: 'file name' };
   return null; // neither source could establish a piece count — nothing to work with
 }
+// A different CAD tool ("Marker Making" nesting software) prints its data in a status
+// bar instead of a labeled paragraph -- e.g. "MD:324607-BULK LN:8Y 20.543I WI:64.000
+// ... CU:82.86%" -- so it needs its own label set entirely (LN/WI/CU, not Length/
+// Width/Utilization). The per-size piece count only appears on screen if the tool's
+// separate "Marker Properties" dialog happens to be open over the canvas, as a
+// "size(qty): XS[1], S[1], M[2], ..." line -- confirmed with the user that whether
+// that dialog is open varies per upload, so its absence is expected, not a read
+// failure: when missing, this falls back to the file name's own size run exactly like
+// parseMarkerImageText() above, and if that ALSO has nothing, needsSetsEntry says so
+// (Length/Width/Efficiency were still genuinely read) instead of a length/width match
+// being discarded just because sets couldn't be established from the image.
+function parseMarkerStatusBarText(text, fileName){
+  const clean = text.replace(/\s+/g, ' ');
+  const lenMatch = clean.match(/LN\s*:?\s*\|?\s*(\d+)\s*Y\s*([\d.]+)\s*I\b/i);
+  const widMatch = clean.match(/WI\s*:?\s*\|?\s*([\d.]+)/i);
+  if(!lenMatch || !widMatch) return null;
+  const lengthBig = parseInt(lenMatch[1], 10) + parseFloat(lenMatch[2]) / 36;
+  const widthSmall = parseFloat(widMatch[1]);
+  const effMatch = clean.match(/CU\s*:?\s*\|?\s*([\d.]+)\s*%/i);
+  const mdMatch = clean.match(/MD\s*:?\s*\[?\s*([A-Za-z0-9._-]+)/i);
+  const { styleName: fileStyleName, material, sizeRunPairs } = parseMarkerFileName(fileName);
+  const styleName = mdMatch ? mdMatch[1] : fileStyleName;
+
+  const sizeQtyMatch = clean.match(/size\s*\(\s*qty\s*\)\s*:?\s*(.+?)(?=\bOK\b|\bCancel\b|$)/i);
+  const dialogPairs = sizeQtyMatch ? [...sizeQtyMatch[1].matchAll(/([A-Za-z0-9]+)\s*[\[\(]\s*(\d+)\s*[\]\)]/g)] : [];
+  const setsFromDialog = dialogPairs.length ? dialogPairs.reduce((s,p) => s + parseInt(p[2],10), 0) : null;
+  const sizesFromDialog = dialogPairs.length ? dialogPairs.map(p => p[1]+'/'+p[2]).join(', ') : null;
+  const setsFromFileName = sizeRunPairs ? sizeRunPairs.reduce((s,p) => s + p.qty, 0) : null;
+  const sizesFromFileName = sizeRunPairs ? sizeRunPairs.map(p => p.size+'/'+p.qty).join(', ') : null;
+
+  const base = { styleName, material, efficiency: effMatch ? parseFloat(effMatch[1]) : null, unitSystem: 'yard', lengthBig, widthSmall };
+  if(setsFromDialog!==null) return { ...base, sizes: sizesFromDialog, sets: setsFromDialog, setsSource: "Marker Properties dialog" };
+  if(setsFromFileName!==null) return { ...base, sizes: sizesFromFileName, sets: setsFromFileName, setsSource: 'file name' };
+  return { ...base, sizes: null, sets: null, needsSetsEntry: true };
+}
+// Tries the known image/OCR marker formats in order, then -- only when the status-bar
+// format matched but its "Marker Properties" dialog wasn't in the footer crop (so no
+// piece count) -- OCRs the WHOLE image once more (the dialog can sit anywhere over the
+// canvas, not just the bottom strip) before falling back to asking the user to type the
+// count in by hand. The extra OCR pass only runs in that one case, not on every upload.
+async function parseMarkerOcrText(footerText, fileName, getFullImageText){
+  const imgParsed = parseMarkerImageText(footerText, fileName);
+  if(imgParsed) return imgParsed;
+  const barParsed = parseMarkerStatusBarText(footerText, fileName);
+  if(!barParsed || !barParsed.needsSetsEntry) return barParsed;
+  const fullText = await getFullImageText();
+  if(fullText){
+    const retried = parseMarkerStatusBarText(footerText + ' ' + fullText, fileName);
+    if(retried && !retried.needsSetsEntry) return retried;
+  }
+  return barParsed;
+}
 // Yard/inch markers: GSM IS required (unlike the meter/cm path below), and both
 // extras are fixed constants per spec, not editable — +2in on the marker length
 // before dividing by Sets, +2in on the cuttable width to get the full fabric width
@@ -4346,7 +4406,7 @@ function calcAutomaticConsumption(marker, gsm, wastagePct, orderQty){
     width: fullWidthIn, markerYds: marker.lengthBig, markerIn: 0, extraIn: YARD_LENGTH_EXTRA_IN,
     gsm, pcsInMarker: marker.sets, wastagePct, orderQty,
   });
-  return r ? { ...r, fullWidthIn } : null;
+  return r ? { ...r, fullWidthIn, sizes: marker.sizes, sets: marker.sets } : null;
 }
 // Automatic-yards' own result view — distinct from consumptionResultHtml() (Manual
 // mode, unchanged) because the spec for this path differs: no Mtr/Pc shown (yards
@@ -4355,6 +4415,7 @@ function calcAutomaticConsumption(marker, gsm, wastagePct, orderQty){
 function automaticYardResultHtml(r){
   const mtrPerPc = r.ydsPerPc * YD_TO_M;
   return `
+    ${sizesQtyHintHtml(r.sizes, r.sets)}
     <div class="kpi-grid" style="margin-bottom:14px;">
       <div class="stat"><div class="num">${r.ydsPerPc.toFixed(4)}</div><div class="lbl">Yds / Pc</div></div>
       <div class="stat"><div class="num">${mtrPerPc.toFixed(4)}</div><div class="lbl">Mtr / Pc</div></div>
@@ -4396,12 +4457,13 @@ function calcMetricConsumption(marker, wastagePct, orderQty){
   const wastage = (wastagePct===null || isNaN(wastagePct)) ? 0 : wastagePct;
   const lengthPerPcWithWastageM = lengthPerPcM * (1 + wastage/100);
   const totalM = (orderQty!==null && !isNaN(orderQty) && orderQty>0) ? lengthPerPcWithWastageM * orderQty : null;
-  return { totalLengthM, lengthPerPcM, fullWidthCm, wastage, lengthPerPcWithWastageM, orderQty, totalM };
+  return { totalLengthM, lengthPerPcM, fullWidthCm, wastage, lengthPerPcWithWastageM, orderQty, totalM, sizes: marker.sizes, sets: marker.sets };
 }
 function metricConsumptionResultHtml(r){
   if(!r) return emptyState('chart', 'Could not calculate — check the marker data.');
   const ydsPerPc = r.lengthPerPcM * M_TO_YD;
   return `
+    ${sizesQtyHintHtml(r.sizes, r.sets)}
     <div class="kpi-grid" style="margin-bottom:14px;">
       <div class="stat"><div class="num">${r.lengthPerPcM.toFixed(4)}</div><div class="lbl">Meters / Pc (no wastage)</div></div>
       <div class="stat"><div class="num">${ydsPerPc.toFixed(4)}</div><div class="lbl">Yds / Pc (no wastage)</div></div>
@@ -4455,11 +4517,11 @@ function getGroupInputs(group){
 function calcGroupAverageYardConsumption(group, gsm, wastagePct, orderQty){
   if(group.markers.length === 1){
     const r = calcAutomaticConsumption(group.markers[0], gsm, wastagePct, orderQty);
-    return r ? { ...r, markerCount: 1, perMarker: [{ fileName: group.markers[0].fileName, ydsPerPc: r.ydsPerPc, kgPerPc: r.kgPerPc }] } : null;
+    return r ? { ...r, markerCount: 1, perMarker: [{ fileName: group.markers[0].fileName, ydsPerPc: r.ydsPerPc, kgPerPc: r.kgPerPc, sizes: r.sizes, sets: r.sets }] } : null;
   }
   const perMarker = group.markers.map(m => {
     const mr = calcAutomaticConsumption(m, gsm, null, null);
-    return mr ? { fileName: m.fileName, ydsPerPc: mr.ydsPerPc, kgPerPc: mr.kgPerPc, fullWidthIn: mr.fullWidthIn } : null;
+    return mr ? { fileName: m.fileName, ydsPerPc: mr.ydsPerPc, kgPerPc: mr.kgPerPc, fullWidthIn: mr.fullWidthIn, sizes: m.sizes, sets: m.sets } : null;
   });
   if(perMarker.some(x => x===null)) return null;
   const n = perMarker.length;
@@ -4474,11 +4536,11 @@ function calcGroupAverageYardConsumption(group, gsm, wastagePct, orderQty){
 function calcGroupAverageMetricConsumption(group, wastagePct, orderQty){
   if(group.markers.length === 1){
     const r = calcMetricConsumption(group.markers[0], wastagePct, orderQty);
-    return r ? { ...r, markerCount: 1, perMarker: [{ fileName: group.markers[0].fileName, lengthPerPcM: r.lengthPerPcM }] } : null;
+    return r ? { ...r, markerCount: 1, perMarker: [{ fileName: group.markers[0].fileName, lengthPerPcM: r.lengthPerPcM, sizes: r.sizes, sets: r.sets }] } : null;
   }
   const perMarker = group.markers.map(m => {
     const mr = calcMetricConsumption(m, null, null);
-    return mr ? { fileName: m.fileName, lengthPerPcM: mr.lengthPerPcM, fullWidthCm: mr.fullWidthCm } : null;
+    return mr ? { fileName: m.fileName, lengthPerPcM: mr.lengthPerPcM, fullWidthCm: mr.fullWidthCm, sizes: m.sizes, sets: m.sets } : null;
   });
   if(perMarker.some(x => x===null)) return null;
   const n = perMarker.length;
@@ -4503,6 +4565,7 @@ function groupYardResultHtml(group, r){
   return `
     <p class="hint" style="margin:0 0 10px;font-weight:600;color:var(--ink-soft);">Averaged across ${r.markerCount} markers for ${group.material} / ${group.styleName}</p>
     ${groupAuditTableHtml(r.perMarker, [
+      {label:'Sizes / Qty', fmt:x=>escapeHtml(x.sizes||'—')+(x.sets!==null&&x.sets!==undefined?` (${x.sets} pcs)`:'')},
       {label:'Yds / Pc', fmt:x=>x.ydsPerPc.toFixed(4)},
       {label:'Kg / Pc', fmt:x=>fmtKg(x.kgPerPc)},
     ])}
@@ -4529,7 +4592,10 @@ function groupMetricResultHtml(group, r){
   const ydsPerPc = r.lengthPerPcM * M_TO_YD;
   return `
     <p class="hint" style="margin:0 0 10px;font-weight:600;color:var(--ink-soft);">Averaged across ${r.markerCount} markers for ${group.material} / ${group.styleName}</p>
-    ${groupAuditTableHtml(r.perMarker, [{label:'Meters / Pc', fmt:x=>x.lengthPerPcM.toFixed(4)}])}
+    ${groupAuditTableHtml(r.perMarker, [
+      {label:'Sizes / Qty', fmt:x=>escapeHtml(x.sizes||'—')+(x.sets!==null&&x.sets!==undefined?` (${x.sets} pcs)`:'')},
+      {label:'Meters / Pc', fmt:x=>x.lengthPerPcM.toFixed(4)},
+    ])}
     <div class="kpi-grid" style="margin:14px 0;">
       <div class="stat"><div class="num">${r.lengthPerPcM.toFixed(4)}</div><div class="lbl">Avg Meters / Pc (no wastage)</div></div>
       <div class="stat"><div class="num">${ydsPerPc.toFixed(4)}</div><div class="lbl">Avg Yds / Pc (no wastage)</div></div>
@@ -4586,7 +4652,7 @@ async function exportGroupConsumptionPdf(groupKey){
     y += 12;
     if(r.markerCount>1){
       y = pdfSectionTitle(doc, y, 'Per-marker Meters / Pc (before averaging)');
-      y = pdfTable(doc, y, ['File','Meters / Pc'], r.perMarker.map(x=>[x.fileName, x.lengthPerPcM.toFixed(4)+' m']), [220,160]);
+      y = pdfTable(doc, y, ['File','Sizes / Qty','Meters / Pc'], r.perMarker.map(x=>[x.fileName, (x.sizes||'—')+(x.sets!=null?` (${x.sets} pcs)`:''), x.lengthPerPcM.toFixed(4)+' m']), [180,180,120]);
       y += 12;
     }
     const mYdsPerPc = r.lengthPerPcM * M_TO_YD;
@@ -4619,8 +4685,8 @@ async function exportGroupConsumptionPdf(groupKey){
   y = pdfTable(doc, y, ['File','Sizes','Marker length','Marker width (cuttable)','Sets','Efficiency'], markerRows, [140,110,90,120,50,70]);
   y += 12;
   if(r.markerCount>1){
-    y = pdfSectionTitle(doc, y, 'Per-marker Yds/Pc & Kg/Pc (before averaging)');
-    y = pdfTable(doc, y, ['File','Yds / Pc','Kg / Pc'], r.perMarker.map(x=>[x.fileName, x.ydsPerPc.toFixed(4)+' yds', fmtKg(x.kgPerPc)+' kg']), [220,160,160]);
+    y = pdfSectionTitle(doc, y, 'Per-marker Sizes/Qty, Yds/Pc & Kg/Pc (before averaging)');
+    y = pdfTable(doc, y, ['File','Sizes / Qty','Yds / Pc','Kg / Pc'], r.perMarker.map(x=>[x.fileName, (x.sizes||'—')+(x.sets!=null?` (${x.sets} pcs)`:''), x.ydsPerPc.toFixed(4)+' yds', fmtKg(x.kgPerPc)+' kg']), [140,180,110,110]);
     y += 12;
   }
   y = pdfSectionTitle(doc, y, 'Inputs');
@@ -4656,7 +4722,7 @@ function renderMarkerGroupBody(group){
       </div>
       ${group.markers.map(m => `
         <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid var(--green);padding:8px 0 0;margin-top:8px;">
-          <div><span class="mono">${m.fileName}</span> — ${m.sets} pcs${m.setsSource ? ` <span class="hint">(${m.setsSource})</span>` : ''}, ${isMetric ? m.lengthBig.toFixed(2)+'m × '+m.widthSmall.toFixed(2)+'cm' : m.lengthBig.toFixed(2)+'yd × '+m.widthSmall.toFixed(2)+'in'}, eff ${m.efficiency!==null?m.efficiency+'%':'—'}</div>
+          <div><span class="mono">${m.fileName}</span> — ${m.sets} pcs${m.sizes ? ` (${escapeHtml(m.sizes)})` : ''}${m.setsSource ? ` <span class="hint">(${m.setsSource})</span>` : ''}, ${isMetric ? m.lengthBig.toFixed(2)+'m × '+m.widthSmall.toFixed(2)+'cm' : m.lengthBig.toFixed(2)+'yd × '+m.widthSmall.toFixed(2)+'in'}, eff ${m.efficiency!==null?m.efficiency+'%':'—'}</div>
           <a href="#" class="remove-marker-link" data-marker-id="${m.id}" style="color:var(--thread-red);white-space:nowrap;">Remove</a>
         </div>`).join('')}
     </div>`;
@@ -4712,8 +4778,30 @@ function rerenderAutomaticBody(){
 // the user to type the correct total; nothing here is added to consMarkersParsed (and
 // so never enters grouping/averaging) until resolvePendingMarker() confirms it.
 function renderPendingMarkerConfirmations(){
-  const cards = consPendingMarkers.map((m, i) => `
-    <div class="panel" style="background:var(--brass-soft);border-color:var(--brass);${i<consPendingMarkers.length-1?'margin-bottom:12px;':''}">
+  const cards = consPendingMarkers.map((m, i) => {
+    const marginStyle = i<consPendingMarkers.length-1 ? 'margin-bottom:12px;' : '';
+    // Length/Width/Efficiency were still genuinely read for this one (a status-bar
+    // format marker whose "Marker Properties" dialog wasn't visible in the upload) --
+    // only the per-size piece count is missing, so it's asked for on its own rather
+    // than lumping this in with the mismatch case below, which has two real candidates
+    // to show side by side.
+    if(m.needsSetsEntry){
+      return `
+      <div class="panel" style="background:var(--brass-soft);border-color:var(--brass);${marginStyle}">
+        <div style="font-weight:600;font-family:'Space Grotesk',sans-serif;margin-bottom:6px;">${m.fileName} — piece count not found</div>
+        <div class="hint" style="margin-bottom:10px;">${m.styleName||'—'} / ${m.material||'Unspecified'} — ${m.lengthBig.toFixed(2)}yd × ${m.widthSmall.toFixed(2)}in, eff ${m.efficiency!==null?m.efficiency+'%':'—'}. The per-size piece count wasn't visible in this upload (the "Marker Properties" dialog wasn't open) — enter it manually below.</div>
+        <div class="grid-cols" style="grid-template-columns:1fr 1fr;gap:10px;align-items:end;">
+          <div class="field"><label>Sizes / Qty (optional)</label><input id="pendingSizes_${m.id}" type="text" placeholder="e.g. S/2, M/4, L/6"></div>
+          <div class="field"><label>Total pieces</label><input id="pendingSets_${m.id}" type="number" step="1" placeholder="e.g. 12"></div>
+        </div>
+        <div class="row-actions" style="margin-top:12px;">
+          <button class="btn small confirm-pending-marker-btn" data-marker-id="${m.id}">Confirm &amp; add</button>
+          <button class="btn ghost small discard-pending-marker-btn" data-marker-id="${m.id}">Discard this marker</button>
+        </div>
+      </div>`;
+    }
+    return `
+    <div class="panel" style="background:var(--brass-soft);border-color:var(--brass);${marginStyle}">
       <div style="font-weight:600;font-family:'Space Grotesk',sans-serif;margin-bottom:6px;">${m.fileName} — piece count mismatch</div>
       <div class="hint" style="margin-bottom:10px;">${m.styleName||'—'} / ${m.material||'Unspecified'} — the file name and the marker's own image text disagree on total pieces. Enter the correct total before this marker is used.</div>
       <div class="grid-cols" style="grid-template-columns:repeat(3,1fr);gap:10px;align-items:end;">
@@ -4725,7 +4813,8 @@ function renderPendingMarkerConfirmations(){
         <button class="btn small confirm-pending-marker-btn" data-marker-id="${m.id}">Confirm &amp; add</button>
         <button class="btn ghost small discard-pending-marker-btn" data-marker-id="${m.id}">Discard this marker</button>
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
   return `<div class="panel" style="margin-bottom:16px;"><h2 style="margin-bottom:10px;">Needs your confirmation (${consPendingMarkers.length})</h2>${cards}</div>`;
 }
 // OCR (or a flattened-PDF-render-then-OCR) produced text but none of the expected
@@ -4858,7 +4947,8 @@ function attachConsumptionAutoEvents(){
       const input = document.getElementById('pendingSets_'+id);
       const val = input && input.value!=='' ? parseInt(input.value, 10) : NaN;
       if(isNaN(val) || val<=0){ showToast('Enter the correct total pieces first'); return; }
-      resolvePendingMarker(id, val);
+      const sizesInput = document.getElementById('pendingSizes_'+id);
+      resolvePendingMarker(id, val, sizesInput && sizesInput.value.trim() ? sizesInput.value.trim() : null);
     });
   });
   document.querySelectorAll('.discard-pending-marker-btn').forEach(btn => {
@@ -4876,12 +4966,14 @@ function attachConsumptionAutoEvents(){
 }
 // Finalizes a held-back marker once the user has typed the correct piece count —
 // only now does it join consMarkersParsed and become eligible for grouping/averaging.
-function resolvePendingMarker(id, finalSets){
+// finalSizes is optional (the mismatch-confirmation flow doesn't collect it, since it
+// already has a sizes breakdown from whichever of its two candidates gets picked).
+function resolvePendingMarker(id, finalSets, finalSizes){
   const m = consPendingMarkers.find(x => x.id === id);
   if(!m) return;
   consPendingMarkers = consPendingMarkers.filter(x => x.id !== id);
-  const { setsFromText, setsFromFileName, needsConfirmation, ...base } = m;
-  consMarkersParsed.push({ ...base, sets: finalSets, setsSource: 'user-confirmed' });
+  const { setsFromText, setsFromFileName, needsConfirmation, needsSetsEntry, ...base } = m;
+  consMarkersParsed.push({ ...base, sizes: finalSizes || base.sizes, sets: finalSets, setsSource: 'user-confirmed' });
   showToast('Marker added — enter GSM to calculate');
   rerenderAutomaticBody();
 }
@@ -4933,7 +5025,7 @@ function attachTabEvents(){
     // Shared by both the direct-image path and the flattened-PDF-OCR-fallback path below —
     // a marker whose two piece-count sources disagree is held for confirmation, not added.
     const commitParsedMarker = (parsed, fileName) => {
-      if(parsed.needsConfirmation){ consPendingMarkers.push({ ...parsed, id: ++consMarkerIdSeq, fileName }); pendingCount++; }
+      if(parsed.needsConfirmation || parsed.needsSetsEntry){ consPendingMarkers.push({ ...parsed, id: ++consMarkerIdSeq, fileName }); pendingCount++; }
       else{ consMarkersParsed.push({ ...parsed, id: ++consMarkerIdSeq, fileName }); addedCount++; }
     };
     // OCR ran and produced text, but none of it matched — surface the raw text instead
@@ -4949,7 +5041,7 @@ function attachTabEvents(){
         const rawCanvas = await loadImageFileToCanvas(file);
         const text = await extractImageText(rawCanvas ? cropCanvasFooter(rawCanvas) : file);
         if(text === null){ imageLibFailed = true; continue; }
-        const parsed = parseMarkerImageText(text, file.name);
+        const parsed = await parseMarkerOcrText(text, file.name, () => extractImageText(rawCanvas || file));
         if(!parsed){ recordUnreadable(text, file.name); continue; }
         commitParsedMarker(parsed, file.name);
       }else{
@@ -4964,7 +5056,7 @@ function attachTabEvents(){
           const pageCanvas = await renderPdfPageToCanvas(file);
           if(pageCanvas){
             ocrText = await extractImageText(cropCanvasFooter(pageCanvas));
-            if(ocrText !== null) parsed = parseMarkerImageText(ocrText, file.name);
+            if(ocrText !== null) parsed = await parseMarkerOcrText(ocrText, file.name, () => extractImageText(pageCanvas));
           }
         }
         if(!parsed){ recordUnreadable(ocrText || text, file.name); continue; }
