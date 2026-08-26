@@ -4350,17 +4350,23 @@ function parseMarkerImageText(text, fileName){
 // being discarded just because sets couldn't be established from the image.
 function parseMarkerStatusBarText(text, fileName){
   const clean = text.replace(/\s+/g, ' ');
-  const lenMatch = clean.match(/LN\s*:?\s*\|?\s*(\d+)\s*Y\s*([\d.]+)\s*I\b/i);
-  const widMatch = clean.match(/WI\s*:?\s*\|?\s*([\d.]+)/i);
+  // \b alone isn't enough to anchor a 2-letter field code like "LN"/"WI"/"CU"/"MD" --
+  // garbled OCR noise routinely contains those two letters inside a longer word (e.g.
+  // "laamd" for one real upload), which \b happily matches the tail of. Requiring the
+  // ":" or "|" (a colon OCR sometimes misreads as a pipe) separator immediately after
+  // is what actually distinguishes a real field label from that kind of noise, so
+  // unlike the paragraph-format regexes elsewhere, it's mandatory here, not optional.
+  const lenMatch = clean.match(/\bLN\s*[:|]\s*(\d+)\s*Y\s*([\d.]+)\s*I\b/i);
+  const widMatch = clean.match(/\bWI\s*[:|]\s*([\d.]+)/i);
   if(!lenMatch || !widMatch) return null;
   const lengthBig = parseInt(lenMatch[1], 10) + parseFloat(lenMatch[2]) / 36;
   const widthSmall = parseFloat(widMatch[1]);
-  const effMatch = clean.match(/CU\s*:?\s*\|?\s*([\d.]+)\s*%/i);
-  const mdMatch = clean.match(/MD\s*:?\s*\[?\s*([A-Za-z0-9._-]+)/i);
+  const effMatch = clean.match(/\bCU\s*[:|]\s*([\d.]+)\s*%/i);
+  const mdMatch = clean.match(/\bMD\s*[:|]\s*\[?\s*([A-Za-z0-9._-]+)/i);
   const { styleName: fileStyleName, material, sizeRunPairs } = parseMarkerFileName(fileName);
   const styleName = mdMatch ? mdMatch[1] : fileStyleName;
 
-  const sizeQtyMatch = clean.match(/size\s*\(\s*qty\s*\)\s*:?\s*(.+?)(?=\bOK\b|\bCancel\b|$)/i);
+  const sizeQtyMatch = clean.match(/size\s*\(\s*qty\s*\)\s*:\s*(.+?)(?=\bOK\b|\bCancel\b|$)/i);
   const dialogPairs = sizeQtyMatch ? [...sizeQtyMatch[1].matchAll(/([A-Za-z0-9]+)\s*[\[\(]\s*(\d+)\s*[\]\)]/g)] : [];
   const setsFromDialog = dialogPairs.length ? dialogPairs.reduce((s,p) => s + parseInt(p[2],10), 0) : null;
   const sizesFromDialog = dialogPairs.length ? dialogPairs.map(p => p[1]+'/'+p[2]).join(', ') : null;
@@ -4372,22 +4378,37 @@ function parseMarkerStatusBarText(text, fileName){
   if(setsFromFileName!==null) return { ...base, sizes: sizesFromFileName, sets: setsFromFileName, setsSource: 'file name' };
   return { ...base, sizes: null, sets: null, needsSetsEntry: true };
 }
-// Tries the known image/OCR marker formats in order, then -- only when the status-bar
-// format matched but its "Marker Properties" dialog wasn't in the footer crop (so no
-// piece count) -- OCRs the WHOLE image once more (the dialog can sit anywhere over the
-// canvas, not just the bottom strip) before falling back to asking the user to type the
-// count in by hand. The extra OCR pass only runs in that one case, not on every upload.
-async function parseMarkerOcrText(footerText, fileName, getFullImageText){
-  const imgParsed = parseMarkerImageText(footerText, fileName);
-  if(imgParsed) return imgParsed;
-  const barParsed = parseMarkerStatusBarText(footerText, fileName);
-  if(!barParsed || !barParsed.needsSetsEntry) return barParsed;
-  const fullText = await getFullImageText();
-  if(fullText){
-    const retried = parseMarkerStatusBarText(footerText + ' ' + fullText, fileName);
-    if(retried && !retried.needsSetsEntry) return retried;
+// Tries progressively wider OCR crops until a marker format is recognized. The default
+// bottom-28% footer crop is right for a clean CAD export whose only content down there
+// is one printed summary line -- but a full-DESKTOP SCREENSHOT of a nesting tool
+// (confirmed as a real upload source) has its real status bar as a much thinner strip
+// near the very bottom, with everything above it in that same 28% -- the cutting
+// canvas, a percentage ruler, even the Windows taskbar -- competing for the OCR
+// engine's attention and garbling the result past any label match. So a footer crop
+// that reads as neither known format escalates to a tighter bottom-10% crop, then to
+// the whole frame uncropped (which also doubles as the place to find a "Marker
+// Properties" dialog that can sit anywhere on screen) -- each crop's text accumulates
+// with the ones before it, so a field one pass read cleanly isn't lost if a wider pass
+// reads it more noisily. The common case (one clean crop, one OCR pass) is unaffected:
+// escalation only happens once a narrower crop has already come back empty-handed.
+async function parseMarkerFromImage(rawCanvasOrFile, fileName){
+  const isCanvas = rawCanvasOrFile && typeof rawCanvasOrFile.getContext === 'function';
+  const attempts = isCanvas
+    ? [cropCanvasFooter(rawCanvasOrFile, 0.72), cropCanvasFooter(rawCanvasOrFile, 0.9), rawCanvasOrFile]
+    : [rawCanvasOrFile]; // a bare File (canvas load failed) can only be OCR'd as-is
+  let combinedText = '';
+  let bestPartial = null;
+  for(const target of attempts){
+    const text = await extractImageText(target);
+    if(text === null) return { ocrFailed: true, rawText: combinedText || null, parsed: null };
+    combinedText = combinedText ? combinedText + ' ' + text : text;
+    const imgParsed = parseMarkerImageText(text, fileName);
+    if(imgParsed) return { ocrFailed: false, rawText: combinedText, parsed: imgParsed };
+    const barParsed = parseMarkerStatusBarText(combinedText, fileName);
+    if(barParsed && !barParsed.needsSetsEntry) return { ocrFailed: false, rawText: combinedText, parsed: barParsed };
+    if(barParsed) bestPartial = barParsed;
   }
-  return barParsed;
+  return { ocrFailed: false, rawText: combinedText, parsed: bestPartial };
 }
 // Yard/inch markers: GSM IS required (unlike the meter/cm path below), and both
 // extras are fixed constants per spec, not editable — +2in on the marker length
@@ -5039,10 +5060,9 @@ function attachTabEvents(){
       if(isImage){
         if(imageLibFailed) continue;
         const rawCanvas = await loadImageFileToCanvas(file);
-        const text = await extractImageText(rawCanvas ? cropCanvasFooter(rawCanvas) : file);
-        if(text === null){ imageLibFailed = true; continue; }
-        const parsed = await parseMarkerOcrText(text, file.name, () => extractImageText(rawCanvas || file));
-        if(!parsed){ recordUnreadable(text, file.name); continue; }
+        const { ocrFailed, rawText, parsed } = await parseMarkerFromImage(rawCanvas || file, file.name);
+        if(ocrFailed){ imageLibFailed = true; continue; }
+        if(!parsed){ recordUnreadable(rawText, file.name); continue; }
         commitParsedMarker(parsed, file.name);
       }else{
         if(pdfLibFailed) continue;
@@ -5055,8 +5075,9 @@ function attachTabEvents(){
         if(!parsed && text.trim().length < 30){
           const pageCanvas = await renderPdfPageToCanvas(file);
           if(pageCanvas){
-            ocrText = await extractImageText(cropCanvasFooter(pageCanvas));
-            if(ocrText !== null) parsed = await parseMarkerOcrText(ocrText, file.name, () => extractImageText(pageCanvas));
+            const result = await parseMarkerFromImage(pageCanvas, file.name);
+            ocrText = result.rawText;
+            if(!result.ocrFailed) parsed = result.parsed;
           }
         }
         if(!parsed){ recordUnreadable(ocrText || text, file.name); continue; }
@@ -5067,7 +5088,7 @@ function attachTabEvents(){
     if(failedLibs.length>0 && addedCount===0 && pendingCount===0 && unreadableCount===0){
       showToast(`Could not load the ${failedLibs.join(' / ')} library — check your internet connection and try again`);
     }else if(pendingCount>0){
-      showToast(`${pendingCount} marker${pendingCount>1?'s need':' needs'} your confirmation — the file name and the image text disagree on piece count`);
+      showToast(`${pendingCount} marker${pendingCount>1?'s need':' needs'} your confirmation — see the details below`);
     }else if(addedCount>0){
       showToast(addedCount===1 ? 'Marker read — enter GSM to calculate' : `${addedCount} markers read`
         + (failedCount>0 || unreadableCount>0 ? ` (${failedCount+unreadableCount} skipped)` : ''));
