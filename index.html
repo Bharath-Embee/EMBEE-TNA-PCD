@@ -4385,6 +4385,58 @@ function parseMarkerStatusBarText(text, fileName){
   if(setsFromFileName!==null) return { ...base, sizes: sizesFromFileName, sets: setsFromFileName, setsSource: 'file name' };
   return { ...base, sizes: null, sets: null, needsSetsEntry: true };
 }
+// A real vision model has an effective resolution ceiling -- sending it a source image
+// far bigger than that just costs more per call without reading any better -- so this
+// downscales to at most ~1568px on the longest side before base64-encoding.
+function canvasToBase64Jpeg(canvas, maxSide){
+  maxSide = maxSide===undefined ? 1568 : maxSide;
+  const scale = Math.min(1, maxSide / Math.max(canvas.width, canvas.height));
+  let src = canvas;
+  if(scale < 1){
+    const small = document.createElement('canvas');
+    small.width = Math.round(canvas.width * scale);
+    small.height = Math.round(canvas.height * scale);
+    small.getContext('2d').drawImage(canvas, 0, 0, small.width, small.height);
+    src = small;
+  }
+  const dataUrl = src.toDataURL('image/jpeg', 0.85);
+  return dataUrl.slice(dataUrl.indexOf(',') + 1);
+}
+// AI-assisted fallback for markers Tesseract's pattern-matching OCR couldn't read
+// cleanly even after the crop/contrast escalation below -- confirmed against a real
+// upload where the OCR engine was reading digits as unrelated letters throughout
+// ("64.000" as "ee000"), not just picking up background noise, which is a genuine
+// image-quality problem no amount of regex tolerance can safely recover (guessing at
+// which letter stands for which digit isn't safe for a number that drives real fabric
+// purchasing). A real vision model reads small, anti-aliased screenshot text far more
+// reliably than character-pattern OCR -- at the cost of a real per-call API charge,
+// which is why this only runs once Tesseract has already given up on every crop, not
+// on every marker upload. Silently returns null (falling through to the existing
+// "couldn't read" / "needs your confirmation" flow) if the API isn't configured or the
+// call fails for any reason -- this is a best-effort enhancement, never a hard dependency.
+async function readMarkerWithVisionApi(canvas, fileName){
+  try{
+    const imageBase64 = canvasToBase64Jpeg(canvas);
+    const resp = await fetch('/api/read-marker', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ imageBase64, mimeType: 'image/jpeg', fileName }),
+    });
+    if(!resp.ok) return null;
+    const data = await resp.json();
+    if(!data || !data.unitSystem || data.lengthBig==null || data.widthSmall==null) return null;
+    return {
+      styleName: data.styleName || '', material: data.material || '',
+      unitSystem: data.unitSystem, lengthBig: data.lengthBig, widthSmall: data.widthSmall,
+      efficiency: data.efficiency ?? null, sizes: data.sizes || null,
+      sets: data.sets ?? null, setsSource: 'AI-assisted reading',
+      needsSetsEntry: data.sets == null,
+    };
+  }catch(e){
+    console.error('readMarkerWithVisionApi error:', e);
+    return null;
+  }
+}
 // Tries progressively wider OCR crops until a marker format is recognized. The default
 // bottom-28% footer crop is right for a clean CAD export whose only content down there
 // is one printed summary line -- but a full-DESKTOP SCREENSHOT of a nesting tool
@@ -4398,6 +4450,8 @@ function parseMarkerStatusBarText(text, fileName){
 // with the ones before it, so a field one pass read cleanly isn't lost if a wider pass
 // reads it more noisily. The common case (one clean crop, one OCR pass) is unaffected:
 // escalation only happens once a narrower crop has already come back empty-handed.
+// If ALL of that still doesn't produce a full read, readMarkerWithVisionApi() above is
+// tried once as a final resort before giving up.
 async function parseMarkerFromImage(rawCanvasOrFile, fileName){
   const isCanvas = rawCanvasOrFile && typeof rawCanvasOrFile.getContext === 'function';
   // The tighter 0.9 crop covers a much shorter strip of the source image than the 0.72
@@ -4417,6 +4471,10 @@ async function parseMarkerFromImage(rawCanvasOrFile, fileName){
     const barParsed = parseMarkerStatusBarText(combinedText, fileName);
     if(barParsed && !barParsed.needsSetsEntry) return { ocrFailed: false, rawText: combinedText, parsed: barParsed };
     if(barParsed) bestPartial = barParsed;
+  }
+  if(isCanvas){
+    const visionResult = await readMarkerWithVisionApi(rawCanvasOrFile, fileName);
+    if(visionResult) return { ocrFailed: false, rawText: combinedText, parsed: visionResult };
   }
   return { ocrFailed: false, rawText: combinedText, parsed: bestPartial };
 }
