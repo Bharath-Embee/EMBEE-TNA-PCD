@@ -4681,6 +4681,7 @@ async function exportGroupConsumptionPdf(groupKey){
     y = pdfTable(doc, y,
       ['Step','Formula','Result'],
       [
+        ...(r.markerCount===1 ? [['Marker length (total)', 'Length + 5cm (constant)', r.totalLengthM.toFixed(4)+' m']] : []),
         [r.markerCount>1?'Avg Meters / Pc':'Meters / Pc', r.markerCount>1?"Average of each marker's Meters/Pc":'Marker length ÷ Sets', r.lengthPerPcM.toFixed(4)+' m'],
         [r.markerCount>1?'Avg Yds / Pc':'Yds / Pc', 'Meters/Pc × 1.09361', mYdsPerPc.toFixed(4)+' yds'],
         [`Meters / Pc (with ${r.wastage}% wastage)`, `Meters/Pc × (1 + ${r.wastage}%)`, r.lengthPerPcWithWastageM.toFixed(4)+' m'],
@@ -4718,6 +4719,7 @@ async function exportGroupConsumptionPdf(groupKey){
   y = pdfTable(doc, y,
     ['Step','Formula','Result'],
     [
+      ...(r.markerCount===1 ? [['Marker length (total)', 'Length + 2in (constant)', r.markerTotalYds.toFixed(4)+' yds']] : []),
       [r.markerCount>1?'Avg Yds / Pc':'Yds / Pc', r.markerCount>1?"Average of each marker's Yds/Pc":'Marker length ÷ Sets', r.ydsPerPc.toFixed(4)+' yds'],
       [r.markerCount>1?'Avg Mtr / Pc':'Mtr / Pc', 'Yds/Pc × 0.9144', yMtrPerPc.toFixed(4)+' m'],
       [r.markerCount>1?'Avg Kg / Pc (no wastage)':'Kg / Pc (no wastage)', r.markerCount>1?"Average of each marker's Kg/Pc":'(Yds/Pc × 0.9144 × Full width × GSM) ÷ 39.37 ÷ 1000', r.kgPerPc.toFixed(4)+' kg'],
