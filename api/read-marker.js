@@ -1,17 +1,21 @@
 // Vision-assisted fallback for CAD marker images Tesseract's pattern-matching OCR
 // couldn't read cleanly, even after the client-side crop/contrast escalation (see
 // parseMarkerFromImage in index.html). A real vision model reads small, anti-aliased
-// screenshot text far more reliably than character-pattern OCR -- at the cost of a
-// per-call API charge, which is why the client only calls this once Tesseract has
-// already given up, not on every marker upload.
+// screenshot text far more reliably than character-pattern OCR. Uses Google's Gemini
+// API specifically because it has a genuinely free tier (no card required) -- this is
+// a rare fallback path (Tesseract already handles the common case), so free-tier rate
+// limits are fine; the client only calls this once Tesseract has already given up on
+// every crop, never on every marker upload.
+const GEMINI_MODEL = 'gemini-2.5-flash';
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Method not allowed' });
     return;
   }
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    res.status(503).json({ error: 'AI-assisted marker reading is not configured (missing ANTHROPIC_API_KEY)' });
+    res.status(503).json({ error: 'AI-assisted marker reading is not configured (missing GEMINI_API_KEY)' });
     return;
   }
   const { imageBase64, mimeType, fileName } = req.body || {};
@@ -47,32 +51,30 @@ Rules:
 - File name, for context only -- do not treat it as more reliable than what you actually read in the image: ${fileName || 'unknown'}`;
 
   try {
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 500,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'image', source: { type: 'base64', media_type: mimeType, data: imageBase64 } },
-            { type: 'text', text: prompt },
-          ],
-        }],
-      }),
-    });
+    const resp = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{
+            parts: [
+              { text: prompt },
+              { inline_data: { mime_type: mimeType, data: imageBase64 } },
+            ],
+          }],
+          generationConfig: { temperature: 0, maxOutputTokens: 500 },
+        }),
+      }
+    );
     if (!resp.ok) {
       const errText = await resp.text();
       res.status(502).json({ error: `Vision API error: ${resp.status} ${errText.slice(0, 300)}` });
       return;
     }
     const data = await resp.json();
-    const text = (data.content || []).map((b) => b.text || '').join('').trim();
+    const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+    const text = parts.map((p) => p.text || '').join('').trim();
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
       res.status(502).json({ error: 'Vision API did not return parseable JSON' });
