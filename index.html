@@ -4086,21 +4086,41 @@ function wastageSweepTableHtml(basePerPc, unit){
 function wastageSweepPdfRows(basePerPc, unit){
   return [0,1,2,3,4,5].map(pct => [pct+'%', (basePerPc*(1+pct/100)).toFixed(4)+' '+unit]);
 }
-// Automatic-yards needs Yds/Pc and Kg/Pc side by side in ONE sweep table (not two
-// stacked tables) so both units at a given wastage % sit on the same row.
+// Yards and meters are the same physical length in two units — every marker read as
+// one is automatically shown in the other, so nobody has to convert by hand.
+const YD_TO_M = 0.9144;
+const M_TO_YD = 1.09361;
+// Automatic-yards needs Yds/Pc, Mtr/Pc, and Kg/Pc side by side in ONE sweep table (not
+// stacked tables) so all three units at a given wastage % sit on the same row.
 function wastageSweepDualTableHtml(basePerPcYds, basePerPcKg){
   const rows = [0,1,2,3,4,5].map(pct =>
-    `<tr><td>${pct}%</td><td class="mono">${(basePerPcYds*(1+pct/100)).toFixed(4)} yds</td><td class="mono">${(basePerPcKg*(1+pct/100)).toFixed(4)} kg</td></tr>`
+    `<tr><td>${pct}%</td><td class="mono">${(basePerPcYds*(1+pct/100)).toFixed(4)} yds</td><td class="mono">${(basePerPcYds*YD_TO_M*(1+pct/100)).toFixed(4)} m</td><td class="mono">${(basePerPcKg*(1+pct/100)).toFixed(4)} kg</td></tr>`
   ).join('');
   return `
-    <div class="hint" style="margin:14px 0 6px;font-weight:600;color:var(--ink-soft);">Consumption in Yds / Pc &amp; Consumption in Kg's / Pcs</div>
+    <div class="hint" style="margin:14px 0 6px;font-weight:600;color:var(--ink-soft);">Consumption in Yds / Pc, Meters / Pc &amp; Kg's / Pcs</div>
     <table>
-      <thead><tr><th>Wastage</th><th>Yds / Pc</th><th>Kg / Pc</th></tr></thead>
+      <thead><tr><th>Wastage</th><th>Yds / Pc</th><th>Mtr / Pc</th><th>Kg / Pc</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
 }
 function wastageSweepDualPdfRows(basePerPcYds, basePerPcKg){
-  return [0,1,2,3,4,5].map(pct => [pct+'%', (basePerPcYds*(1+pct/100)).toFixed(4)+' yds', (basePerPcKg*(1+pct/100)).toFixed(4)+' kg']);
+  return [0,1,2,3,4,5].map(pct => [pct+'%', (basePerPcYds*(1+pct/100)).toFixed(4)+' yds', (basePerPcYds*YD_TO_M*(1+pct/100)).toFixed(4)+' m', (basePerPcKg*(1+pct/100)).toFixed(4)+' kg']);
+}
+// Metric automatic markers get the same Yds/Pc <-> Mtr/Pc pairing as the yard path,
+// just without the Kg column (meter-based materials aren't bought by weight).
+function wastageSweepMetricTableHtml(basePerPcM){
+  const rows = [0,1,2,3,4,5].map(pct =>
+    `<tr><td>${pct}%</td><td class="mono">${(basePerPcM*(1+pct/100)).toFixed(4)} m</td><td class="mono">${(basePerPcM*M_TO_YD*(1+pct/100)).toFixed(4)} yds</td></tr>`
+  ).join('');
+  return `
+    <div class="hint" style="margin:14px 0 6px;font-weight:600;color:var(--ink-soft);">Consumption in Meters / Pc &amp; Yds / Pc</div>
+    <table>
+      <thead><tr><th>Wastage</th><th>Meters / Pc</th><th>Yds / Pc</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+function wastageSweepMetricPdfRows(basePerPcM){
+  return [0,1,2,3,4,5].map(pct => [pct+'%', (basePerPcM*(1+pct/100)).toFixed(4)+' m', (basePerPcM*M_TO_YD*(1+pct/100)).toFixed(4)+' yds']);
 }
 // Shared by both Manual and Automatic mode so the result presentation — and the
 // exact wording of each formula step — never drifts between the two.
@@ -4333,9 +4353,11 @@ function calcAutomaticConsumption(marker, gsm, wastagePct, orderQty){
 // and kg are what merchandising actually orders by, not meters), and Yds/Pc and
 // Kg/Pc are shown together with a 0-5% wastage sweep for EACH unit.
 function automaticYardResultHtml(r){
+  const mtrPerPc = r.ydsPerPc * YD_TO_M;
   return `
     <div class="kpi-grid" style="margin-bottom:14px;">
       <div class="stat"><div class="num">${r.ydsPerPc.toFixed(4)}</div><div class="lbl">Yds / Pc</div></div>
+      <div class="stat"><div class="num">${mtrPerPc.toFixed(4)}</div><div class="lbl">Mtr / Pc</div></div>
       <div class="stat"><div class="num">${fmtKg(r.kgPerPc)}</div><div class="lbl">Kg / Pc (no wastage)</div></div>
       <div class="stat alert"><div class="num">${fmtKg(r.kgPerPcWithWastage)}</div><div class="lbl">Kg / Pc (with ${r.wastage}% wastage)</div></div>
       ${r.totalKg!==null ? `<div class="stat"><div class="num">${r.totalKg.toFixed(2)}</div><div class="lbl">Total Kg for ${r.orderQty} pcs</div></div>` : ''}
@@ -4345,6 +4367,7 @@ function automaticYardResultHtml(r){
       <tbody>
         <tr><td>Marker length (total)</td><td class="mono">Length + 2in (constant)</td><td class="mono">${r.markerTotalYds.toFixed(4)} yds</td></tr>
         <tr><td>Yds / Pc</td><td class="mono">Marker length ÷ Sets</td><td class="mono">${r.ydsPerPc.toFixed(4)} yds</td></tr>
+        <tr><td>Mtr / Pc</td><td class="mono">Yds/Pc × 0.9144</td><td class="mono">${mtrPerPc.toFixed(4)} m</td></tr>
         <tr><td>Kg / Pc (no wastage)</td><td class="mono">(Yds/Pc × 0.9144 × Full width × GSM) ÷ 39.37 ÷ 1000</td><td class="mono">${r.kgPerPc.toFixed(4)} kg</td></tr>
         <tr><td>Kg / Pc (with wastage)</td><td class="mono">Kg/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.kgPerPcWithWastage.toFixed(4)} kg</td></tr>
         ${r.totalKg!==null ? `<tr><td>Total for order</td><td class="mono">Kg/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalKg.toFixed(2)} kg</td></tr>` : ''}
@@ -4377,9 +4400,11 @@ function calcMetricConsumption(marker, wastagePct, orderQty){
 }
 function metricConsumptionResultHtml(r){
   if(!r) return emptyState('chart', 'Could not calculate — check the marker data.');
+  const ydsPerPc = r.lengthPerPcM * M_TO_YD;
   return `
     <div class="kpi-grid" style="margin-bottom:14px;">
       <div class="stat"><div class="num">${r.lengthPerPcM.toFixed(4)}</div><div class="lbl">Meters / Pc (no wastage)</div></div>
+      <div class="stat"><div class="num">${ydsPerPc.toFixed(4)}</div><div class="lbl">Yds / Pc (no wastage)</div></div>
       <div class="stat alert"><div class="num">${r.lengthPerPcWithWastageM.toFixed(4)}</div><div class="lbl">Meters / Pc (with ${r.wastage}% wastage)</div></div>
       ${r.totalM!==null ? `<div class="stat"><div class="num">${r.totalM.toFixed(2)}</div><div class="lbl">Total Meters for ${r.orderQty} pcs</div></div>` : ''}
     </div>
@@ -4388,13 +4413,14 @@ function metricConsumptionResultHtml(r){
       <tbody>
         <tr><td>Marker length (total)</td><td class="mono">Length + 5cm (constant)</td><td class="mono">${r.totalLengthM.toFixed(4)} m</td></tr>
         <tr><td>Meters / Pc</td><td class="mono">Marker length ÷ Sets</td><td class="mono">${r.lengthPerPcM.toFixed(4)} m</td></tr>
+        <tr><td>Yds / Pc</td><td class="mono">Meters/Pc × 1.09361</td><td class="mono">${ydsPerPc.toFixed(4)} yds</td></tr>
         <tr><td>Meters / Pc (with wastage)</td><td class="mono">Meters/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.lengthPerPcWithWastageM.toFixed(4)} m</td></tr>
         ${r.totalM!==null ? `<tr><td>Total for order</td><td class="mono">Meters/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalM.toFixed(2)} m</td></tr>` : ''}
         <tr><td>Required fabric width</td><td class="mono">Cuttable width + 4cm (constant)</td><td class="mono">${r.fullWidthCm.toFixed(2)} cm</td></tr>
       </tbody>
     </table>
     <p class="hint" style="margin-top:8px;">No GSM needed for a meter-based marker — consumption is calculated directly by length, at the required fabric width above.</p>
-    ${wastageSweepTableHtml(r.lengthPerPcM, 'm')}`;
+    ${wastageSweepMetricTableHtml(r.lengthPerPcM)}`;
 }
 // ---- Multiple markers per material/style ----
 // CAD teams often split one style+material into several mini markers (a lay/cutting
@@ -4473,6 +4499,7 @@ function groupAuditTableHtml(perMarker, cols){
 }
 function groupYardResultHtml(group, r){
   if(r.markerCount === 1) return automaticYardResultHtml(r);
+  const mtrPerPc = r.ydsPerPc * YD_TO_M;
   return `
     <p class="hint" style="margin:0 0 10px;font-weight:600;color:var(--ink-soft);">Averaged across ${r.markerCount} markers for ${group.material} / ${group.styleName}</p>
     ${groupAuditTableHtml(r.perMarker, [
@@ -4481,6 +4508,7 @@ function groupYardResultHtml(group, r){
     ])}
     <div class="kpi-grid" style="margin:14px 0;">
       <div class="stat"><div class="num">${r.ydsPerPc.toFixed(4)}</div><div class="lbl">Avg Yds / Pc</div></div>
+      <div class="stat"><div class="num">${mtrPerPc.toFixed(4)}</div><div class="lbl">Avg Mtr / Pc</div></div>
       <div class="stat"><div class="num">${fmtKg(r.kgPerPc)}</div><div class="lbl">Avg Kg / Pc (no wastage)</div></div>
       <div class="stat alert"><div class="num">${fmtKg(r.kgPerPcWithWastage)}</div><div class="lbl">Avg Kg / Pc (with ${r.wastage}% wastage)</div></div>
       ${r.totalKg!==null ? `<div class="stat"><div class="num">${r.totalKg.toFixed(2)}</div><div class="lbl">Total Kg for ${r.orderQty} pcs</div></div>` : ''}
@@ -4488,6 +4516,7 @@ function groupYardResultHtml(group, r){
     <table>
       <thead><tr><th>Step</th><th>Formula</th><th>Result</th></tr></thead>
       <tbody>
+        <tr><td>Avg Mtr / Pc</td><td class="mono">Avg Yds/Pc × 0.9144</td><td class="mono">${mtrPerPc.toFixed(4)} m</td></tr>
         <tr><td>Avg Kg / Pc (with wastage)</td><td class="mono">Avg Kg/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.kgPerPcWithWastage.toFixed(4)} kg</td></tr>
         ${r.totalKg!==null ? `<tr><td>Total for order</td><td class="mono">Avg Kg/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalKg.toFixed(2)} kg</td></tr>` : ''}
         <tr><td>Avg required fabric width</td><td class="mono">Average of each marker's (cuttable width + 2in)</td><td class="mono">${r.fullWidthIn.toFixed(2)} in</td></tr>
@@ -4497,24 +4526,27 @@ function groupYardResultHtml(group, r){
 }
 function groupMetricResultHtml(group, r){
   if(r.markerCount === 1) return metricConsumptionResultHtml(r);
+  const ydsPerPc = r.lengthPerPcM * M_TO_YD;
   return `
     <p class="hint" style="margin:0 0 10px;font-weight:600;color:var(--ink-soft);">Averaged across ${r.markerCount} markers for ${group.material} / ${group.styleName}</p>
     ${groupAuditTableHtml(r.perMarker, [{label:'Meters / Pc', fmt:x=>x.lengthPerPcM.toFixed(4)}])}
     <div class="kpi-grid" style="margin:14px 0;">
       <div class="stat"><div class="num">${r.lengthPerPcM.toFixed(4)}</div><div class="lbl">Avg Meters / Pc (no wastage)</div></div>
+      <div class="stat"><div class="num">${ydsPerPc.toFixed(4)}</div><div class="lbl">Avg Yds / Pc (no wastage)</div></div>
       <div class="stat alert"><div class="num">${r.lengthPerPcWithWastageM.toFixed(4)}</div><div class="lbl">Avg Meters / Pc (with ${r.wastage}% wastage)</div></div>
       ${r.totalM!==null ? `<div class="stat"><div class="num">${r.totalM.toFixed(2)}</div><div class="lbl">Total Meters for ${r.orderQty} pcs</div></div>` : ''}
     </div>
     <table>
       <thead><tr><th>Step</th><th>Formula</th><th>Result</th></tr></thead>
       <tbody>
+        <tr><td>Avg Yds / Pc</td><td class="mono">Avg Meters/Pc × 1.09361</td><td class="mono">${ydsPerPc.toFixed(4)} yds</td></tr>
         <tr><td>Avg Meters / Pc (with wastage)</td><td class="mono">Avg Meters/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.lengthPerPcWithWastageM.toFixed(4)} m</td></tr>
         ${r.totalM!==null ? `<tr><td>Total for order</td><td class="mono">Avg Meters/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalM.toFixed(2)} m</td></tr>` : ''}
         <tr><td>Avg required fabric width</td><td class="mono">Average of each marker's (cuttable width + 4cm)</td><td class="mono">${r.fullWidthCm.toFixed(2)} cm</td></tr>
       </tbody>
     </table>
     <p class="hint" style="margin-top:8px;">No GSM needed for a meter-based marker.</p>
-    ${wastageSweepTableHtml(r.lengthPerPcM, 'm')}`;
+    ${wastageSweepMetricTableHtml(r.lengthPerPcM)}`;
 }
 function updateGroupResults(groupKey){
   const group = groupMarkersByMaterial(consMarkersParsed).find(g => g.key === groupKey);
@@ -4557,11 +4589,13 @@ async function exportGroupConsumptionPdf(groupKey){
       y = pdfTable(doc, y, ['File','Meters / Pc'], r.perMarker.map(x=>[x.fileName, x.lengthPerPcM.toFixed(4)+' m']), [220,160]);
       y += 12;
     }
+    const mYdsPerPc = r.lengthPerPcM * M_TO_YD;
     y = pdfSectionTitle(doc, y, (r.markerCount>1?'Averaged calculation':'Calculation') + ' — meter-based, no GSM required');
     y = pdfTable(doc, y,
       ['Step','Formula','Result'],
       [
         [r.markerCount>1?'Avg Meters / Pc':'Meters / Pc', r.markerCount>1?"Average of each marker's Meters/Pc":'Marker length ÷ Sets', r.lengthPerPcM.toFixed(4)+' m'],
+        [r.markerCount>1?'Avg Yds / Pc':'Yds / Pc', 'Meters/Pc × 1.09361', mYdsPerPc.toFixed(4)+' yds'],
         [`Meters / Pc (with ${r.wastage}% wastage)`, `Meters/Pc × (1 + ${r.wastage}%)`, r.lengthPerPcWithWastageM.toFixed(4)+' m'],
         ...(r.totalM!==null ? [[`Total for ${r.orderQty} pcs`, 'Meters/Pc (with wastage) × Order qty', r.totalM.toFixed(2)+' m']] : []),
         [r.markerCount>1?'Avg required fabric width':'Required fabric width', r.markerCount>1?"Average of each marker's (cuttable width + 4cm)":'Cuttable width + 4cm (constant)', r.fullWidthCm.toFixed(2)+' cm'],
@@ -4570,7 +4604,7 @@ async function exportGroupConsumptionPdf(groupKey){
     );
     y += 12;
     y = pdfSectionTitle(doc, y, 'Consumption per piece at each wastage %');
-    y = pdfTable(doc, y, ['Wastage','Consumption / Pc'], wastageSweepPdfRows(r.lengthPerPcM, 'm'), [120,160]);
+    y = pdfTable(doc, y, ['Wastage','Meters / Pc','Yds / Pc'], wastageSweepMetricPdfRows(r.lengthPerPcM), [110,140,140]);
     doc.save(`fabric_consumption_${slugifyGroupKey(group.key)}.pdf`);
     return;
   }
@@ -4592,11 +4626,13 @@ async function exportGroupConsumptionPdf(groupKey){
   y = pdfSectionTitle(doc, y, 'Inputs');
   y = pdfTable(doc, y, ['GSM','Wastage %','Order qty'], [[inputs.gsm, r.wastage, inputs.orderQty ?? '—']], [90,90,90]);
   y += 12;
+  const yMtrPerPc = r.ydsPerPc * YD_TO_M;
   y = pdfSectionTitle(doc, y, r.markerCount>1 ? 'Averaged calculation' : 'Calculation');
   y = pdfTable(doc, y,
     ['Step','Formula','Result'],
     [
       [r.markerCount>1?'Avg Yds / Pc':'Yds / Pc', r.markerCount>1?"Average of each marker's Yds/Pc":'Marker length ÷ Sets', r.ydsPerPc.toFixed(4)+' yds'],
+      [r.markerCount>1?'Avg Mtr / Pc':'Mtr / Pc', 'Yds/Pc × 0.9144', yMtrPerPc.toFixed(4)+' m'],
       [r.markerCount>1?'Avg Kg / Pc (no wastage)':'Kg / Pc (no wastage)', r.markerCount>1?"Average of each marker's Kg/Pc":'(Yds/Pc × 0.9144 × Full width × GSM) ÷ 39.37 ÷ 1000', r.kgPerPc.toFixed(4)+' kg'],
       [`Kg / Pc (with ${r.wastage}% wastage)`, `Kg/Pc × (1 + ${r.wastage}%)`, r.kgPerPcWithWastage.toFixed(4)+' kg'],
       ...(r.totalKg!==null ? [[`Total for ${r.orderQty} pcs`, 'Kg/Pc (with wastage) × Order qty', r.totalKg.toFixed(2)+' kg']] : []),
@@ -4605,8 +4641,8 @@ async function exportGroupConsumptionPdf(groupKey){
     [200,320,160]
   );
   y += 12;
-  y = pdfSectionTitle(doc, y, "Consumption in Yds / Pc & Consumption in Kg's / Pcs");
-  y = pdfTable(doc, y, ['Wastage','Yds / Pc','Kg / Pc'], wastageSweepDualPdfRows(r.ydsPerPc, r.kgPerPc), [110,140,140]);
+  y = pdfSectionTitle(doc, y, "Consumption in Yds / Pc, Meters / Pc & Kg's / Pcs");
+  y = pdfTable(doc, y, ['Wastage','Yds / Pc','Mtr / Pc','Kg / Pc'], wastageSweepDualPdfRows(r.ydsPerPc, r.kgPerPc), [90,120,120,120]);
   doc.save(`fabric_consumption_${slugifyGroupKey(group.key)}.pdf`);
 }
 function renderMarkerGroupBody(group){
