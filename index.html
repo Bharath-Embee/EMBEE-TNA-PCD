@@ -335,6 +335,7 @@ let currentOrderExpanded = {};
 let editingPcdOrderId = null;
 let currentSetExpanded = {};
 let consumptionMode = 'manual'; // 'manual' | 'automatic' — Consumption Calculator tab
+let consManualUnit = 'yard'; // 'yard' | 'metric' — which worksheet Manual mode shows
 // Automatic mode holds a LIST of parsed CAD markers, not just one — CAD teams often
 // split one style/material into multiple mini markers (cutting-table length limits,
 // buyer restrictions, pieces-per-lay caps), and multiple materials (SHELL/RIB/etc.)
@@ -4180,7 +4181,7 @@ function updateConsumptionResults(){
   if(!out) return;
   const r = calcFabricConsumption(readConsumptionInputs());
   out.innerHTML = r ? consumptionResultHtml(r)
-    : emptyState('chart', 'Fill in Fabric Width, Marker Length (yds + inches), Extra allowance, GSM, and No. of Pcs in Marker to see the calculation.');
+    : emptyState('chart', 'Fill in Fabric Full Width, Marker Length (yds + inches), GSM, and No. of Pcs in Marker to see the calculation.');
 }
 async function exportConsumptionPdf(){
   const r = calcFabricConsumption(readConsumptionInputs());
@@ -4192,7 +4193,7 @@ async function exportConsumptionPdf(){
   let y = 72;
   y = pdfSectionTitle(doc, y, 'Inputs');
   y = pdfTable(doc, y,
-    ['Fabric width (in)','Marker length (yds)','Marker length (in)','Extra allowance (in)','GSM','Pcs in marker','Wastage %','Order qty'],
+    ['Fabric Full width (in)','Marker length (yds)','Marker length (in)','Length wise Extra allowance (in)','GSM','Pcs in marker','Wastage %','Order qty'],
     [[inputs.width, inputs.markerYds, inputs.markerIn, inputs.extraIn, inputs.gsm, inputs.pcsInMarker, r.wastage, inputs.orderQty ?? '—']],
     [110,110,110,110,80,90,80,80]
   );
@@ -4214,6 +4215,106 @@ async function exportConsumptionPdf(){
   y = pdfSectionTitle(doc, y, 'Consumption per piece at each wastage %');
   y = pdfTable(doc, y, ['Wastage','Consumption / Pc'], wastageSweepPdfRows(r.kgPerPc, 'kg'), [120,160]);
   doc.save('fabric_consumption.pdf');
+}
+// Manual worksheet's meter-marker counterpart to calcFabricConsumption() above -- same
+// shape (Extra allowance is a user-editable field here, unlike Automatic mode's fixed
+// CAD-spec constant), just in metric units, and with GSM optional: Meters/Pc and Yds/Pc
+// always compute from the marker length alone; GSM only adds a Kg's figure on top,
+// matching the Automatic-mode meter-marker path (weight(kg) = length(m) × width(m) ×
+// GSM(g/m²) ÷ 1000, using the entered width converted from cm to meters).
+function calcFabricConsumptionMetric(inputs){
+  const { width, markerM, markerCm, extraCm, gsm, pcsInMarker, wastagePct, orderQty } = inputs;
+  if([width, markerM, pcsInMarker].some(v => v===null || isNaN(v) || v<=0)) return null;
+  if([markerCm, extraCm].some(v => v===null || isNaN(v) || v<0)) return null;
+  const markerTotalM = markerM + ((markerCm + extraCm) / 100);
+  const mPerPc = markerTotalM / pcsInMarker;
+  const ydsPerPc = mPerPc * M_TO_YD;
+  const wastage = (wastagePct===null || isNaN(wastagePct)) ? 0 : wastagePct;
+  const hasGsm = gsm!==null && gsm!==undefined && !isNaN(gsm) && gsm>0;
+  const kgPerPc = hasGsm ? (mPerPc * (width/100) * gsm) / 1000 : null;
+  const kgPerPcWithWastage = hasGsm ? kgPerPc * (1 + wastage/100) : null;
+  const totalKg = (hasGsm && orderQty!==null && !isNaN(orderQty) && orderQty>0) ? kgPerPcWithWastage * orderQty : null;
+  return { markerTotalM, mPerPc, ydsPerPc, wastage, gsm: hasGsm ? gsm : null, kgPerPc, kgPerPcWithWastage, orderQty, totalKg };
+}
+function readConsumptionInputsMetric(){
+  const num = id => { const el = document.getElementById(id); if(!el || el.value==='') return null; const v = parseFloat(el.value); return isNaN(v) ? null : v; };
+  return {
+    width: num('consWidthM'), markerM: num('consMarkerM'), markerCm: num('consMarkerCm'),
+    extraCm: num('consExtraM'), gsm: num('consGsmM'), pcsInMarker: num('consPcsInMarkerM'),
+    wastagePct: num('consWastagePctM'), orderQty: num('consOrderQtyM'),
+  };
+}
+function consumptionResultMetricHtml(r){
+  const hasGsm = r.gsm!==null;
+  return `
+    <div class="kpi-grid" style="margin-bottom:14px;">
+      <div class="stat"><div class="num">${r.mPerPc.toFixed(4)}</div><div class="lbl">Meters / Pc</div></div>
+      <div class="stat"><div class="num">${r.ydsPerPc.toFixed(4)}</div><div class="lbl">Yds / Pc</div></div>
+      ${hasGsm ? `<div class="stat"><div class="num">${fmtKg(r.kgPerPc)}</div><div class="lbl">Kg / Pc (no wastage)</div></div>` : ''}
+      ${hasGsm ? `<div class="stat alert"><div class="num">${fmtKg(r.kgPerPcWithWastage)}</div><div class="lbl">Kg / Pc (with ${r.wastage}% wastage)</div></div>` : ''}
+      ${hasGsm && r.totalKg!==null ? `<div class="stat"><div class="num">${r.totalKg.toFixed(2)}</div><div class="lbl">Total Kg for ${r.orderQty} pcs</div></div>` : ''}
+    </div>
+    <table>
+      <thead><tr><th>Step</th><th>Formula</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td>Marker length (total)</td><td class="mono">Meters + (Cm + Extra) / 100</td><td class="mono">${r.markerTotalM.toFixed(4)} m</td></tr>
+        <tr><td>Meters / Pc</td><td class="mono">Marker length ÷ Pcs in marker</td><td class="mono">${r.mPerPc.toFixed(4)} m</td></tr>
+        <tr><td>Yds / Pc</td><td class="mono">Meters/Pc × 1.09361</td><td class="mono">${r.ydsPerPc.toFixed(4)} yds</td></tr>
+        ${hasGsm ? `<tr><td>Kg / Pc (no wastage)</td><td class="mono">(Meters/Pc × Width(m) × GSM) ÷ 1000</td><td class="mono">${r.kgPerPc.toFixed(4)} kg</td></tr>` : ''}
+        ${hasGsm ? `<tr><td>Kg / Pc (with ${r.wastage}% wastage)</td><td class="mono">Kg/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.kgPerPcWithWastage.toFixed(4)} kg</td></tr>` : ''}
+        ${hasGsm && r.totalKg!==null ? `<tr><td>Total for order</td><td class="mono">Kg/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalKg.toFixed(2)} kg</td></tr>` : ''}
+      </tbody>
+    </table>
+    ${hasGsm
+      ? `<p class="hint" style="margin-top:8px;">GSM entered — Kg's consumption shown above alongside the length-based figures.</p>`
+      : `<p class="hint" style="margin-top:8px;">GSM is optional — enter one above if you also want a Kg's figure.</p>`}
+    ${hasGsm ? wastageSweepDualTableHtml(r.ydsPerPc, r.kgPerPc) : wastageSweepYardTableHtml(r.ydsPerPc)}`;
+}
+function updateConsumptionResultsMetric(){
+  const out = document.getElementById('consResultsMetric');
+  if(!out) return;
+  const r = calcFabricConsumptionMetric(readConsumptionInputsMetric());
+  out.innerHTML = r ? consumptionResultMetricHtml(r)
+    : emptyState('chart', 'Fill in Fabric Full Width, Marker Length (m + cm), and No. of Pcs in Marker to see the calculation.');
+}
+async function exportConsumptionPdfMetric(){
+  const r = calcFabricConsumptionMetric(readConsumptionInputsMetric());
+  if(!r){ showToast('Fill in all the required fields first'); return; }
+  const hasGsm = r.gsm!==null;
+  showToast('Preparing PDF…');
+  const doc = await pdfNewDoc('Fabric Consumption Calculation', 'YY Calculation — meter-marker worksheet');
+  if(!doc) return;
+  const inputs = readConsumptionInputsMetric();
+  let y = 72;
+  y = pdfSectionTitle(doc, y, 'Inputs');
+  y = pdfTable(doc, y,
+    ['Fabric Full width (cm)','Marker length (m)','Marker length (cm)','Length wise Extra allowance (cm)','GSM','Pcs in marker','Wastage %','Order qty'],
+    [[inputs.width, inputs.markerM, inputs.markerCm, inputs.extraCm, inputs.gsm ?? '—', inputs.pcsInMarker, r.wastage, inputs.orderQty ?? '—']],
+    [110,110,110,110,80,90,80,80]
+  );
+  y += 12;
+  y = pdfSectionTitle(doc, y, 'Calculation');
+  y = pdfTable(doc, y,
+    ['Step','Formula','Result'],
+    [
+      ['Marker length (total)', 'Meters + (Cm + Extra) / 100', r.markerTotalM.toFixed(4)+' m'],
+      ['Meters / Pc', 'Marker length ÷ Pcs in marker', r.mPerPc.toFixed(4)+' m'],
+      ['Yds / Pc', 'Meters/Pc × 1.09361', r.ydsPerPc.toFixed(4)+' yds'],
+      ...(hasGsm ? [['Kg / Pc (no wastage)', '(Meters/Pc × Width(m) × GSM) ÷ 1000', r.kgPerPc.toFixed(4)+' kg']] : []),
+      ...(hasGsm ? [[`Kg / Pc (with ${r.wastage}% wastage)`, `Kg/Pc × (1 + ${r.wastage}%)`, r.kgPerPcWithWastage.toFixed(4)+' kg']] : []),
+      ...(hasGsm && r.totalKg!==null ? [[`Total for ${r.orderQty} pcs`, 'Kg/Pc (with wastage) × Order qty', r.totalKg.toFixed(2)+' kg']] : []),
+    ],
+    [200,320,160]
+  );
+  y += 12;
+  if(hasGsm){
+    y = pdfSectionTitle(doc, y, "Consumption in Yds / Pc, Meters / Pc & Kg's / Pcs");
+    y = pdfTable(doc, y, ['Wastage','Yds / Pc','Mtr / Pc','Kg / Pc'], wastageSweepDualPdfRows(r.ydsPerPc, r.kgPerPc), [90,120,120,120]);
+  }else{
+    y = pdfSectionTitle(doc, y, 'Consumption per piece at each wastage %');
+    y = pdfTable(doc, y, ['Wastage','Yds / Pc','Mtr / Pc'], wastageSweepYardPdfRows(r.ydsPerPc), [110,140,140]);
+  }
+  doc.save('fabric_consumption_metric.pdf');
 }
 
 /* ---- Automatic mode — reads Length/Width/Sets straight out of an uploaded CAD marker
@@ -5071,16 +5172,57 @@ function renderConsumptionCalculator(){
     </div>`;
   }
 
+  const manualUnitToggle = `
+    <div class="row-actions" style="margin-bottom:16px;">
+      <button class="btn ${consManualUnit==='yard'?'':'ghost'} small" data-cons-manual-unit="yard">Yards marker</button>
+      <button class="btn ${consManualUnit==='metric'?'':'ghost'} small" data-cons-manual-unit="metric">Meter marker</button>
+    </div>`;
+
+  if(consManualUnit==='metric'){
+    return `
+    <div class="panel">
+      <h2>Fabric Consumption Calculator</h2>
+      <p class="desc">The same "YY calculation" formula, for a meter-based marker — marker length and fabric width in, Meters/Pc and Yds/Pc out immediately. GSM is optional: add one if you also want a Kg's figure (and per-order total, once you add a quantity). Updates live as you type.</p>
+      ${modeToggle}
+      ${manualUnitToggle}
+      <div class="grid-cols" style="grid-template-columns:repeat(4,1fr);">
+        <div class="field"><label>Fabric Full width (cm)</label><input id="consWidthM" type="number" step="0.01" placeholder="e.g. 150"></div>
+        <div class="field"><label>Marker length — meters</label><input id="consMarkerM" type="number" step="0.01" placeholder="e.g. 8"></div>
+        <div class="field"><label>Marker length — cm</label><input id="consMarkerCm" type="number" step="0.01" placeholder="e.g. 45"></div>
+        <div class="field"><label>Length wise Extra allowance (cm)</label><input id="consExtraM" type="number" step="0.01" value="5" disabled></div>
+        <div class="field"><label>GSM (optional)</label><input id="consGsmM" type="number" step="0.01" placeholder="e.g. 150"></div>
+        <div class="field"><label>No. of pcs in marker</label><input id="consPcsInMarkerM" type="number" step="1" placeholder="e.g. 100"></div>
+        <div class="field">
+          <label>Wastage %</label>
+          <input id="consWastagePctM" type="number" step="0.1" placeholder="e.g. 5">
+          <div class="hint" style="margin-top:4px;">
+            <a href="#" class="wastage-preset-metric" data-pct="3">Use 3%</a> · <a href="#" class="wastage-preset-metric" data-pct="5">Use 5%</a>
+          </div>
+        </div>
+        <div class="field"><label>Order qty (optional — for total fabric required)</label><input id="consOrderQtyM" type="number" step="1" placeholder="e.g. 5550"></div>
+      </div>
+      <div class="row-actions" style="margin:14px 0;">
+        <button class="btn ghost small" id="resetConsumptionBtnM">Reset</button>
+        <button class="btn ghost small" id="exportConsumptionPdfBtnM">Export PDF</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Result</h2>
+      <div id="consResultsMetric">${emptyState('chart', 'Fill in Fabric Full Width, Marker Length (m + cm), and No. of Pcs in Marker to see the calculation.')}</div>
+    </div>`;
+  }
+
   return `
   <div class="panel">
     <h2>Fabric Consumption Calculator</h2>
     <p class="desc">The same "YY calculation" formula used on the manual worksheet — marker length, fabric width, and GSM in, consumption per piece (and per order, once you add a quantity) out. Updates live as you type.</p>
     ${modeToggle}
+    ${manualUnitToggle}
     <div class="grid-cols" style="grid-template-columns:repeat(4,1fr);">
-      <div class="field"><label>Fabric width (inches)</label><input id="consWidth" type="number" step="0.01" placeholder="e.g. 66"></div>
+      <div class="field"><label>Fabric Full width (inches)</label><input id="consWidth" type="number" step="0.01" placeholder="e.g. 66"></div>
       <div class="field"><label>Marker length — yards</label><input id="consMarkerYds" type="number" step="0.01" placeholder="e.g. 6"></div>
       <div class="field"><label>Marker length — inches</label><input id="consMarkerIn" type="number" step="0.01" placeholder="e.g. 34.75"></div>
-      <div class="field"><label>Extra allowance (inches)</label><input id="consExtra" type="number" step="0.01" value="2"></div>
+      <div class="field"><label>Length wise Extra allowance (inches)</label><input id="consExtra" type="number" step="0.01" value="2" disabled></div>
       <div class="field"><label>GSM</label><input id="consGsm" type="number" step="0.01" placeholder="e.g. 150"></div>
       <div class="field"><label>No. of pcs in marker</label><input id="consPcsInMarker" type="number" step="1" placeholder="e.g. 100"></div>
       <div class="field">
@@ -5210,8 +5352,28 @@ function attachTabEvents(){
   const exportConsBtn = document.getElementById('exportConsumptionPdfBtn');
   if(exportConsBtn) exportConsBtn.addEventListener('click', exportConsumptionPdf);
 
+  // Manual mode's meter-marker worksheet — same live-recalc pattern as the yard
+  // worksheet above, wired separately since the two sub-views never render at once.
+  document.querySelectorAll('#consWidthM, #consMarkerM, #consMarkerCm, #consExtraM, #consGsmM, #consPcsInMarkerM, #consWastagePctM, #consOrderQtyM')
+    .forEach(inp => inp.addEventListener('input', updateConsumptionResultsMetric));
+  document.querySelectorAll('.wastage-preset-metric').forEach(a => {
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      const pctInput = document.getElementById('consWastagePctM');
+      pctInput.value = a.dataset.pct;
+      updateConsumptionResultsMetric();
+    });
+  });
+  const resetConsBtnM = document.getElementById('resetConsumptionBtnM');
+  if(resetConsBtnM) resetConsBtnM.addEventListener('click', () => { renderTabContent(); });
+  const exportConsBtnM = document.getElementById('exportConsumptionPdfBtnM');
+  if(exportConsBtnM) exportConsBtnM.addEventListener('click', exportConsumptionPdfMetric);
+
   document.querySelectorAll('[data-cons-mode]').forEach(btn => {
     btn.addEventListener('click', () => { consumptionMode = btn.dataset.consMode; renderTabContent(); });
+  });
+  document.querySelectorAll('[data-cons-manual-unit]').forEach(btn => {
+    btn.addEventListener('click', () => { consManualUnit = btn.dataset.consManualUnit; renderTabContent(); });
   });
   attachConsumptionAutoEvents();
   const markerUploadInput = document.getElementById('consMarkerUpload');
