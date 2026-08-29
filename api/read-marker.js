@@ -10,6 +10,11 @@
 // with Google's own error message naming this replacement directly -- confirmed via
 // Vercel runtime error logs against the real API key, not guessed.
 const GEMINI_MODEL = 'gemini-3.6-flash';
+// gemini-3.6-flash spends part of maxOutputTokens on an internal "thinking" pass before
+// writing the answer -- confirmed via Vercel logs showing finishReason "MAX_TOKENS" with
+// thoughtsTokenCount 477 out of a 500 budget, truncating the JSON mid-string. Disabling
+// thinking (not needed for a fixed-schema extraction task) and raising the budget avoids
+// truncation without changing the actual response content.
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -66,7 +71,7 @@ Rules:
               { inline_data: { mime_type: mimeType, data: imageBase64 } },
             ],
           }],
-          generationConfig: { temperature: 0, maxOutputTokens: 500 },
+          generationConfig: { temperature: 0, maxOutputTokens: 2048, thinkingConfig: { thinkingBudget: 0 } },
         }),
       }
     );
