@@ -6,7 +6,10 @@
 // a rare fallback path (Tesseract already handles the common case), so free-tier rate
 // limits are fine; the client only calls this once Tesseract has already given up on
 // every crop, never on every marker upload.
-const GEMINI_MODEL = 'gemini-2.5-flash';
+// gemini-2.5-flash returned a 404 in production ("no longer available to new users")
+// with Google's own error message naming this replacement directly -- confirmed via
+// Vercel runtime error logs against the real API key, not guessed.
+const GEMINI_MODEL = 'gemini-3.6-flash';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
