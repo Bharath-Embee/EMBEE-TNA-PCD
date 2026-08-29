@@ -12,9 +12,11 @@
 const GEMINI_MODEL = 'gemini-3.6-flash';
 // gemini-3.6-flash spends part of maxOutputTokens on an internal "thinking" pass before
 // writing the answer -- confirmed via Vercel logs showing finishReason "MAX_TOKENS" with
-// thoughtsTokenCount 477 out of a 500 budget, truncating the JSON mid-string. Disabling
-// thinking (not needed for a fixed-schema extraction task) and raising the budget avoids
-// truncation without changing the actual response content.
+// thoughtsTokenCount 477 out of a 500 budget, truncating the JSON mid-string. Gemini 3.x
+// replaced the old thinkingBudget field with thinkingLevel ("low"/"medium"/"high") --
+// sending thinkingBudget here throws a 400 INVALID_ARGUMENT (confirmed via Vercel logs),
+// so use thinkingLevel:"low" plus a generous maxOutputTokens to avoid truncation while
+// keeping the fallback fast/cheap for a fixed-schema extraction task.
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -71,7 +73,7 @@ Rules:
               { inline_data: { mime_type: mimeType, data: imageBase64 } },
             ],
           }],
-          generationConfig: { temperature: 0, maxOutputTokens: 2048, thinkingConfig: { thinkingBudget: 0 } },
+          generationConfig: { temperature: 0, maxOutputTokens: 2048, thinkingConfig: { thinkingLevel: 'low' } },
         }),
       }
     );
