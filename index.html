@@ -4181,7 +4181,7 @@ function updateConsumptionResults(){
   if(!out) return;
   const r = calcFabricConsumption(readConsumptionInputs());
   out.innerHTML = r ? consumptionResultHtml(r)
-    : emptyState('chart', 'Fill in Fabric Width, Marker Length (yds + inches), Extra allowance, GSM, and No. of Pcs in Marker to see the calculation.');
+    : emptyState('chart', 'Fill in Fabric Full Width, Marker Length (yds + inches), GSM, and No. of Pcs in Marker to see the calculation.');
 }
 async function exportConsumptionPdf(){
   const r = calcFabricConsumption(readConsumptionInputs());
@@ -4193,7 +4193,7 @@ async function exportConsumptionPdf(){
   let y = 72;
   y = pdfSectionTitle(doc, y, 'Inputs');
   y = pdfTable(doc, y,
-    ['Fabric width (in)','Marker length (yds)','Marker length (in)','Extra allowance (in)','GSM','Pcs in marker','Wastage %','Order qty'],
+    ['Fabric Full width (in)','Marker length (yds)','Marker length (in)','Length wise Extra allowance (in)','GSM','Pcs in marker','Wastage %','Order qty'],
     [[inputs.width, inputs.markerYds, inputs.markerIn, inputs.extraIn, inputs.gsm, inputs.pcsInMarker, r.wastage, inputs.orderQty ?? '—']],
     [110,110,110,110,80,90,80,80]
   );
@@ -4275,7 +4275,7 @@ function updateConsumptionResultsMetric(){
   if(!out) return;
   const r = calcFabricConsumptionMetric(readConsumptionInputsMetric());
   out.innerHTML = r ? consumptionResultMetricHtml(r)
-    : emptyState('chart', 'Fill in Fabric Width, Marker Length (m + cm), Extra allowance, and No. of Pcs in Marker to see the calculation.');
+    : emptyState('chart', 'Fill in Fabric Full Width, Marker Length (m + cm), and No. of Pcs in Marker to see the calculation.');
 }
 async function exportConsumptionPdfMetric(){
   const r = calcFabricConsumptionMetric(readConsumptionInputsMetric());
@@ -4288,7 +4288,7 @@ async function exportConsumptionPdfMetric(){
   let y = 72;
   y = pdfSectionTitle(doc, y, 'Inputs');
   y = pdfTable(doc, y,
-    ['Fabric width (cm)','Marker length (m)','Marker length (cm)','Extra allowance (cm)','GSM','Pcs in marker','Wastage %','Order qty'],
+    ['Fabric Full width (cm)','Marker length (m)','Marker length (cm)','Length wise Extra allowance (cm)','GSM','Pcs in marker','Wastage %','Order qty'],
     [[inputs.width, inputs.markerM, inputs.markerCm, inputs.extraCm, inputs.gsm ?? '—', inputs.pcsInMarker, r.wastage, inputs.orderQty ?? '—']],
     [110,110,110,110,80,90,80,80]
   );
@@ -5186,10 +5186,10 @@ function renderConsumptionCalculator(){
       ${modeToggle}
       ${manualUnitToggle}
       <div class="grid-cols" style="grid-template-columns:repeat(4,1fr);">
-        <div class="field"><label>Fabric width (cm)</label><input id="consWidthM" type="number" step="0.01" placeholder="e.g. 150"></div>
+        <div class="field"><label>Fabric Full width (cm)</label><input id="consWidthM" type="number" step="0.01" placeholder="e.g. 150"></div>
         <div class="field"><label>Marker length — meters</label><input id="consMarkerM" type="number" step="0.01" placeholder="e.g. 8"></div>
         <div class="field"><label>Marker length — cm</label><input id="consMarkerCm" type="number" step="0.01" placeholder="e.g. 45"></div>
-        <div class="field"><label>Extra allowance (cm)</label><input id="consExtraM" type="number" step="0.01" value="5"></div>
+        <div class="field"><label>Length wise Extra allowance (cm)</label><input id="consExtraM" type="number" step="0.01" value="5" disabled></div>
         <div class="field"><label>GSM (optional)</label><input id="consGsmM" type="number" step="0.01" placeholder="e.g. 150"></div>
         <div class="field"><label>No. of pcs in marker</label><input id="consPcsInMarkerM" type="number" step="1" placeholder="e.g. 100"></div>
         <div class="field">
@@ -5208,7 +5208,7 @@ function renderConsumptionCalculator(){
     </div>
     <div class="panel">
       <h2>Result</h2>
-      <div id="consResultsMetric">${emptyState('chart', 'Fill in Fabric Width, Marker Length (m + cm), Extra allowance, and No. of Pcs in Marker to see the calculation.')}</div>
+      <div id="consResultsMetric">${emptyState('chart', 'Fill in Fabric Full Width, Marker Length (m + cm), and No. of Pcs in Marker to see the calculation.')}</div>
     </div>`;
   }
 
@@ -5219,10 +5219,10 @@ function renderConsumptionCalculator(){
     ${modeToggle}
     ${manualUnitToggle}
     <div class="grid-cols" style="grid-template-columns:repeat(4,1fr);">
-      <div class="field"><label>Fabric width (inches)</label><input id="consWidth" type="number" step="0.01" placeholder="e.g. 66"></div>
+      <div class="field"><label>Fabric Full width (inches)</label><input id="consWidth" type="number" step="0.01" placeholder="e.g. 66"></div>
       <div class="field"><label>Marker length — yards</label><input id="consMarkerYds" type="number" step="0.01" placeholder="e.g. 6"></div>
       <div class="field"><label>Marker length — inches</label><input id="consMarkerIn" type="number" step="0.01" placeholder="e.g. 34.75"></div>
-      <div class="field"><label>Extra allowance (inches)</label><input id="consExtra" type="number" step="0.01" value="2"></div>
+      <div class="field"><label>Length wise Extra allowance (inches)</label><input id="consExtra" type="number" step="0.01" value="2" disabled></div>
       <div class="field"><label>GSM</label><input id="consGsm" type="number" step="0.01" placeholder="e.g. 150"></div>
       <div class="field"><label>No. of pcs in marker</label><input id="consPcsInMarker" type="number" step="1" placeholder="e.g. 100"></div>
       <div class="field">
