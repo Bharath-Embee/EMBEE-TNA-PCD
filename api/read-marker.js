@@ -69,6 +69,11 @@ Rules:
     );
     if (!resp.ok) {
       const errText = await resp.text();
+      // Logged in full server-side (Vercel runtime logs) even though the client only
+      // gets a truncated message -- the 502 alone doesn't say WHY Gemini rejected the
+      // call (bad key, quota, unsupported model, malformed request, etc.), and that
+      // reason only exists in this response body.
+      console.error('read-marker: Gemini API error', resp.status, errText);
       res.status(502).json({ error: `Vision API error: ${resp.status} ${errText.slice(0, 300)}` });
       return;
     }
@@ -77,12 +82,14 @@ Rules:
     const text = parts.map((p) => p.text || '').join('').trim();
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
+      console.error('read-marker: no parseable JSON in Gemini response', JSON.stringify(data).slice(0, 2000));
       res.status(502).json({ error: 'Vision API did not return parseable JSON' });
       return;
     }
     const parsed = JSON.parse(jsonMatch[0]);
     res.status(200).json(parsed);
   } catch (e) {
+    console.error('read-marker: unexpected error', e);
     res.status(500).json({ error: String((e && e.message) || e) });
   }
 }
