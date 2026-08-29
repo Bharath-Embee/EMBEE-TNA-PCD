@@ -4137,6 +4137,22 @@ function wastageSweepMetricTableHtml(basePerPcM){
 function wastageSweepMetricPdfRows(basePerPcM){
   return [0,1,2,3,4,5].map(pct => [pct+'%', (basePerPcM*(1+pct/100)).toFixed(4)+' m', (basePerPcM*M_TO_YD*(1+pct/100)).toFixed(4)+' yds']);
 }
+// Yard automatic markers with no GSM yet: same Yds/Pc <-> Mtr/Pc pairing as the metric
+// path above, just built from a yards base instead of a meters one.
+function wastageSweepYardTableHtml(basePerPcYds){
+  const rows = [0,1,2,3,4,5].map(pct =>
+    `<tr><td>${pct}%</td><td class="mono">${(basePerPcYds*(1+pct/100)).toFixed(4)} yds</td><td class="mono">${(basePerPcYds*YD_TO_M*(1+pct/100)).toFixed(4)} m</td></tr>`
+  ).join('');
+  return `
+    <div class="hint" style="margin:14px 0 6px;font-weight:600;color:var(--ink-soft);">Consumption in Yds / Pc &amp; Meters / Pc</div>
+    <table>
+      <thead><tr><th>Wastage</th><th>Yds / Pc</th><th>Mtr / Pc</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+function wastageSweepYardPdfRows(basePerPcYds){
+  return [0,1,2,3,4,5].map(pct => [pct+'%', (basePerPcYds*(1+pct/100)).toFixed(4)+' yds', (basePerPcYds*YD_TO_M*(1+pct/100)).toFixed(4)+' m']);
+}
 // Shared by both Manual and Automatic mode so the result presentation — and the
 // exact wording of each formula step — never drifts between the two.
 function consumptionResultHtml(r){
@@ -4478,24 +4494,35 @@ async function parseMarkerFromImage(rawCanvasOrFile, fileName){
   }
   return { ocrFailed: false, rawText: combinedText, parsed: bestPartial };
 }
-// Yard/inch markers: GSM IS required (unlike the meter/cm path below), and both
-// extras are fixed constants per spec, not editable — +2in on the marker length
-// before dividing by Sets, +2in on the cuttable width to get the full fabric width
-// used for the weight calc (a marker's reported width is the CUTTABLE width; real
-// fabric rolls run wider than that). Normalizes onto the exact same (yards, inches)
-// basis calcFabricConsumption() already expects, then calls that same function
-// unchanged — Automatic mode is a different INPUT PATH, not different math — and
-// merges the full width used back onto the result so the UI can display it.
+// Yard/inch markers: Yds/Mtr per piece come straight from the marker's own length —
+// GSM is optional (same as the meter/cm path below), only needed on top for a Kg's
+// figure. Both extras here are fixed constants per spec, not editable — +2in on the
+// marker length before dividing by Sets, +2in on the cuttable width to get the full
+// fabric width used for the weight calc (a marker's reported width is the CUTTABLE
+// width; real fabric rolls run wider than that). Computed directly (not via
+// calcFabricConsumption, which backs the Manual worksheet and still treats GSM as
+// mandatory there) so the length-only figures are available even with no GSM typed.
 const YARD_LENGTH_EXTRA_IN = 2; // constant, not editable
 const YARD_WIDTH_EXTRA_IN = 2; // constant, not editable
 function calcAutomaticConsumption(marker, gsm, wastagePct, orderQty){
   if(!marker || marker.unitSystem!=='yard') return null;
+  if(marker.lengthBig===null || isNaN(marker.lengthBig) || marker.lengthBig<=0) return null;
+  if(marker.widthSmall===null || isNaN(marker.widthSmall) || marker.widthSmall<=0) return null;
+  if(!marker.sets || marker.sets<=0) return null;
   const fullWidthIn = marker.widthSmall + YARD_WIDTH_EXTRA_IN;
-  const r = calcFabricConsumption({
-    width: fullWidthIn, markerYds: marker.lengthBig, markerIn: 0, extraIn: YARD_LENGTH_EXTRA_IN,
-    gsm, pcsInMarker: marker.sets, wastagePct, orderQty,
-  });
-  return r ? { ...r, fullWidthIn, sizes: marker.sizes, sets: marker.sets } : null;
+  const markerTotalYds = marker.lengthBig + (YARD_LENGTH_EXTRA_IN / 36);
+  const ydsPerPc = markerTotalYds / marker.sets;
+  const wastage = (wastagePct===null || isNaN(wastagePct)) ? 0 : wastagePct;
+  const hasGsm = gsm!==null && gsm!==undefined && !isNaN(gsm) && gsm>0;
+  const mtrPerPc = ydsPerPc * YD_TO_M;
+  const kgPerPc = hasGsm ? ((mtrPerPc * fullWidthIn * gsm) / 39.37) / 1000 : null;
+  const kgPerPcWithWastage = hasGsm ? kgPerPc * (1 + wastage/100) : null;
+  const totalKg = (hasGsm && orderQty!==null && !isNaN(orderQty) && orderQty>0) ? kgPerPcWithWastage * orderQty : null;
+  return {
+    markerTotalYds, ydsPerPc, fullWidthIn, wastage, orderQty, totalKg,
+    gsm: hasGsm ? gsm : null, kgPerPc, kgPerPcWithWastage,
+    sizes: marker.sizes, sets: marker.sets,
+  };
 }
 // Automatic-yards' own result view — distinct from consumptionResultHtml() (Manual
 // mode, unchanged) because the spec for this path differs: no Mtr/Pc shown (yards
@@ -4503,14 +4530,15 @@ function calcAutomaticConsumption(marker, gsm, wastagePct, orderQty){
 // Kg/Pc are shown together with a 0-5% wastage sweep for EACH unit.
 function automaticYardResultHtml(r){
   const mtrPerPc = r.ydsPerPc * YD_TO_M;
+  const hasGsm = r.gsm!==null;
   return `
     ${sizesQtyHintHtml(r.sizes, r.sets)}
     <div class="kpi-grid" style="margin-bottom:14px;">
       <div class="stat"><div class="num">${r.ydsPerPc.toFixed(4)}</div><div class="lbl">Yds / Pc</div></div>
       <div class="stat"><div class="num">${mtrPerPc.toFixed(4)}</div><div class="lbl">Mtr / Pc</div></div>
-      <div class="stat"><div class="num">${fmtKg(r.kgPerPc)}</div><div class="lbl">Kg / Pc (no wastage)</div></div>
-      <div class="stat alert"><div class="num">${fmtKg(r.kgPerPcWithWastage)}</div><div class="lbl">Kg / Pc (with ${r.wastage}% wastage)</div></div>
-      ${r.totalKg!==null ? `<div class="stat"><div class="num">${r.totalKg.toFixed(2)}</div><div class="lbl">Total Kg for ${r.orderQty} pcs</div></div>` : ''}
+      ${hasGsm ? `<div class="stat"><div class="num">${fmtKg(r.kgPerPc)}</div><div class="lbl">Kg / Pc (no wastage)</div></div>` : ''}
+      ${hasGsm ? `<div class="stat alert"><div class="num">${fmtKg(r.kgPerPcWithWastage)}</div><div class="lbl">Kg / Pc (with ${r.wastage}% wastage)</div></div>` : ''}
+      ${hasGsm && r.totalKg!==null ? `<div class="stat"><div class="num">${r.totalKg.toFixed(2)}</div><div class="lbl">Total Kg for ${r.orderQty} pcs</div></div>` : ''}
     </div>
     <table>
       <thead><tr><th>Step</th><th>Formula</th><th>Result</th></tr></thead>
@@ -4518,24 +4546,29 @@ function automaticYardResultHtml(r){
         <tr><td>Marker length (total)</td><td class="mono">Length + 2in (constant)</td><td class="mono">${r.markerTotalYds.toFixed(4)} yds</td></tr>
         <tr><td>Yds / Pc</td><td class="mono">Marker length ÷ Sets</td><td class="mono">${r.ydsPerPc.toFixed(4)} yds</td></tr>
         <tr><td>Mtr / Pc</td><td class="mono">Yds/Pc × 0.9144</td><td class="mono">${mtrPerPc.toFixed(4)} m</td></tr>
-        <tr><td>Kg / Pc (no wastage)</td><td class="mono">(Yds/Pc × 0.9144 × Full width × GSM) ÷ 39.37 ÷ 1000</td><td class="mono">${r.kgPerPc.toFixed(4)} kg</td></tr>
-        <tr><td>Kg / Pc (with wastage)</td><td class="mono">Kg/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.kgPerPcWithWastage.toFixed(4)} kg</td></tr>
-        ${r.totalKg!==null ? `<tr><td>Total for order</td><td class="mono">Kg/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalKg.toFixed(2)} kg</td></tr>` : ''}
+        ${hasGsm ? `<tr><td>Kg / Pc (no wastage)</td><td class="mono">(Yds/Pc × 0.9144 × Full width × GSM) ÷ 39.37 ÷ 1000</td><td class="mono">${r.kgPerPc.toFixed(4)} kg</td></tr>` : ''}
+        ${hasGsm ? `<tr><td>Kg / Pc (with wastage)</td><td class="mono">Kg/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.kgPerPcWithWastage.toFixed(4)} kg</td></tr>` : ''}
+        ${hasGsm && r.totalKg!==null ? `<tr><td>Total for order</td><td class="mono">Kg/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalKg.toFixed(2)} kg</td></tr>` : ''}
         <tr><td>Required fabric width</td><td class="mono">Cuttable width + 2in (constant)</td><td class="mono">${r.fullWidthIn.toFixed(2)} in</td></tr>
       </tbody>
     </table>
-    ${wastageSweepDualTableHtml(r.ydsPerPc, r.kgPerPc)}`;
+    ${hasGsm
+      ? `<p class="hint" style="margin-top:8px;">GSM entered — Kg's consumption shown above alongside the length-based figures.</p>`
+      : `<p class="hint" style="margin-top:8px;">GSM is optional — enter one above if you also want a Kg's figure.</p>`}
+    ${hasGsm ? wastageSweepDualTableHtml(r.ydsPerPc, r.kgPerPc) : wastageSweepYardTableHtml(r.ydsPerPc)}`;
 }
-// Meter/cm markers get their own rule, distinct from the yard/kg path above: no GSM
-// at all — consumption is the marker LENGTH per piece (in meters), not a weight, since
-// meter-based materials (fusing/interlining, trims) are bought by running length at a
-// given width, not by kg. Both extras here are fixed constants per spec, not editable:
-// +5cm on the marker length before dividing by Sets, +4cm on the cuttable width to get
-// the fabric width actually needed (shown for reference — it doesn't feed the length
-// math, since there's no weight term for it to multiply into).
+// Meter/cm markers' primary figure is running LENGTH per piece (in meters), not a
+// weight, since meter-based materials (fusing/interlining, trims) are bought by
+// running length at a given width. GSM is optional here (unlike the yard path, where
+// it's required) — when a user supplies it anyway, we can still derive a Kg's figure
+// from the same length: weight(kg) = length(m) × width(m) × GSM(g/m²) ÷ 1000, using
+// the fabric width converted from cm to meters (÷100) instead of the yard path's
+// inches-based ÷39.37, since everything here is already metric. Both extras here are
+// fixed constants per spec, not editable: +5cm on the marker length before dividing by
+// Sets, +4cm on the cuttable width to get the fabric width actually needed.
 const METRIC_LENGTH_EXTRA_M = 0.05; // 5cm, constant
 const METRIC_WIDTH_EXTRA_CM = 4; // constant
-function calcMetricConsumption(marker, wastagePct, orderQty){
+function calcMetricConsumption(marker, gsm, wastagePct, orderQty){
   if(!marker || marker.unitSystem!=='metric') return null;
   if(marker.lengthBig===null || isNaN(marker.lengthBig) || marker.lengthBig<=0) return null;
   if(marker.widthSmall===null || isNaN(marker.widthSmall) || marker.widthSmall<=0) return null;
@@ -4546,11 +4579,20 @@ function calcMetricConsumption(marker, wastagePct, orderQty){
   const wastage = (wastagePct===null || isNaN(wastagePct)) ? 0 : wastagePct;
   const lengthPerPcWithWastageM = lengthPerPcM * (1 + wastage/100);
   const totalM = (orderQty!==null && !isNaN(orderQty) && orderQty>0) ? lengthPerPcWithWastageM * orderQty : null;
-  return { totalLengthM, lengthPerPcM, fullWidthCm, wastage, lengthPerPcWithWastageM, orderQty, totalM, sizes: marker.sizes, sets: marker.sets };
+  const hasGsm = gsm!==null && gsm!==undefined && !isNaN(gsm) && gsm>0;
+  const kgPerPc = hasGsm ? (lengthPerPcM * (fullWidthCm/100) * gsm) / 1000 : null;
+  const kgPerPcWithWastage = hasGsm ? kgPerPc * (1 + wastage/100) : null;
+  const totalKg = (hasGsm && orderQty!==null && !isNaN(orderQty) && orderQty>0) ? kgPerPcWithWastage * orderQty : null;
+  return {
+    totalLengthM, lengthPerPcM, fullWidthCm, wastage, lengthPerPcWithWastageM, orderQty, totalM,
+    sizes: marker.sizes, sets: marker.sets,
+    gsm: hasGsm ? gsm : null, kgPerPc, kgPerPcWithWastage, totalKg,
+  };
 }
 function metricConsumptionResultHtml(r){
   if(!r) return emptyState('chart', 'Could not calculate — check the marker data.');
   const ydsPerPc = r.lengthPerPcM * M_TO_YD;
+  const hasGsm = r.gsm!==null;
   return `
     ${sizesQtyHintHtml(r.sizes, r.sets)}
     <div class="kpi-grid" style="margin-bottom:14px;">
@@ -4558,6 +4600,9 @@ function metricConsumptionResultHtml(r){
       <div class="stat"><div class="num">${ydsPerPc.toFixed(4)}</div><div class="lbl">Yds / Pc (no wastage)</div></div>
       <div class="stat alert"><div class="num">${r.lengthPerPcWithWastageM.toFixed(4)}</div><div class="lbl">Meters / Pc (with ${r.wastage}% wastage)</div></div>
       ${r.totalM!==null ? `<div class="stat"><div class="num">${r.totalM.toFixed(2)}</div><div class="lbl">Total Meters for ${r.orderQty} pcs</div></div>` : ''}
+      ${hasGsm ? `<div class="stat"><div class="num">${fmtKg(r.kgPerPc)}</div><div class="lbl">Kg / Pc (no wastage)</div></div>` : ''}
+      ${hasGsm ? `<div class="stat alert"><div class="num">${fmtKg(r.kgPerPcWithWastage)}</div><div class="lbl">Kg / Pc (with ${r.wastage}% wastage)</div></div>` : ''}
+      ${hasGsm && r.totalKg!==null ? `<div class="stat"><div class="num">${r.totalKg.toFixed(2)}</div><div class="lbl">Total Kg for ${r.orderQty} pcs</div></div>` : ''}
     </div>
     <table>
       <thead><tr><th>Step</th><th>Formula</th><th>Result</th></tr></thead>
@@ -4568,10 +4613,15 @@ function metricConsumptionResultHtml(r){
         <tr><td>Meters / Pc (with wastage)</td><td class="mono">Meters/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.lengthPerPcWithWastageM.toFixed(4)} m</td></tr>
         ${r.totalM!==null ? `<tr><td>Total for order</td><td class="mono">Meters/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalM.toFixed(2)} m</td></tr>` : ''}
         <tr><td>Required fabric width</td><td class="mono">Cuttable width + 4cm (constant)</td><td class="mono">${r.fullWidthCm.toFixed(2)} cm</td></tr>
+        ${hasGsm ? `<tr><td>Kg / Pc (no wastage)</td><td class="mono">(Meters/Pc × Full width(m) × GSM) ÷ 1000</td><td class="mono">${r.kgPerPc.toFixed(4)} kg</td></tr>` : ''}
+        ${hasGsm ? `<tr><td>Kg / Pc (with ${r.wastage}% wastage)</td><td class="mono">Kg/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.kgPerPcWithWastage.toFixed(4)} kg</td></tr>` : ''}
+        ${hasGsm && r.totalKg!==null ? `<tr><td>Total Kg for order</td><td class="mono">Kg/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalKg.toFixed(2)} kg</td></tr>` : ''}
       </tbody>
     </table>
-    <p class="hint" style="margin-top:8px;">No GSM needed for a meter-based marker — consumption is calculated directly by length, at the required fabric width above.</p>
-    ${wastageSweepMetricTableHtml(r.lengthPerPcM)}`;
+    ${hasGsm
+      ? `<p class="hint" style="margin-top:8px;">GSM entered — Kg's consumption shown above alongside the length-based figures.</p>`
+      : `<p class="hint" style="margin-top:8px;">GSM is optional for a meter-based marker — consumption is calculated directly by length. Enter a GSM above if you also want a Kg's figure.</p>`}
+    ${hasGsm ? wastageSweepDualTableHtml(ydsPerPc, r.kgPerPc) : wastageSweepMetricTableHtml(r.lengthPerPcM)}`;
 }
 // ---- Multiple markers per material/style ----
 // CAD teams often split one style+material into several mini markers (a lay/cutting
@@ -4615,21 +4665,25 @@ function calcGroupAverageYardConsumption(group, gsm, wastagePct, orderQty){
   if(perMarker.some(x => x===null)) return null;
   const n = perMarker.length;
   const ydsPerPc = perMarker.reduce((s,x)=>s+x.ydsPerPc,0) / n;
-  const kgPerPc = perMarker.reduce((s,x)=>s+x.kgPerPc,0) / n;
   const fullWidthIn = perMarker.reduce((s,x)=>s+x.fullWidthIn,0) / n;
   const wastage = (wastagePct===null || isNaN(wastagePct)) ? 0 : wastagePct;
-  const kgPerPcWithWastage = kgPerPc * (1 + wastage/100);
-  const totalKg = (orderQty!==null && !isNaN(orderQty) && orderQty>0) ? kgPerPcWithWastage * orderQty : null;
-  return { perMarker, markerCount: n, ydsPerPc, kgPerPc, fullWidthIn, wastage, kgPerPcWithWastage, orderQty, totalKg };
+  const hasGsm = gsm!==null && gsm!==undefined && !isNaN(gsm) && gsm>0;
+  const kgPerPc = hasGsm ? perMarker.reduce((s,x)=>s+x.kgPerPc,0) / n : null;
+  const kgPerPcWithWastage = hasGsm ? kgPerPc * (1 + wastage/100) : null;
+  const totalKg = (hasGsm && orderQty!==null && !isNaN(orderQty) && orderQty>0) ? kgPerPcWithWastage * orderQty : null;
+  return {
+    perMarker, markerCount: n, ydsPerPc, fullWidthIn, wastage, orderQty, totalKg,
+    gsm: hasGsm ? gsm : null, kgPerPc, kgPerPcWithWastage,
+  };
 }
-function calcGroupAverageMetricConsumption(group, wastagePct, orderQty){
+function calcGroupAverageMetricConsumption(group, gsm, wastagePct, orderQty){
   if(group.markers.length === 1){
-    const r = calcMetricConsumption(group.markers[0], wastagePct, orderQty);
-    return r ? { ...r, markerCount: 1, perMarker: [{ fileName: group.markers[0].fileName, lengthPerPcM: r.lengthPerPcM, sizes: r.sizes, sets: r.sets }] } : null;
+    const r = calcMetricConsumption(group.markers[0], gsm, wastagePct, orderQty);
+    return r ? { ...r, markerCount: 1, perMarker: [{ fileName: group.markers[0].fileName, lengthPerPcM: r.lengthPerPcM, kgPerPc: r.kgPerPc, sizes: r.sizes, sets: r.sets }] } : null;
   }
   const perMarker = group.markers.map(m => {
-    const mr = calcMetricConsumption(m, null, null);
-    return mr ? { fileName: m.fileName, lengthPerPcM: mr.lengthPerPcM, fullWidthCm: mr.fullWidthCm, sizes: m.sizes, sets: m.sets } : null;
+    const mr = calcMetricConsumption(m, gsm, null, null);
+    return mr ? { fileName: m.fileName, lengthPerPcM: mr.lengthPerPcM, fullWidthCm: mr.fullWidthCm, kgPerPc: mr.kgPerPc, sizes: m.sizes, sets: m.sets } : null;
   });
   if(perMarker.some(x => x===null)) return null;
   const n = perMarker.length;
@@ -4638,7 +4692,14 @@ function calcGroupAverageMetricConsumption(group, wastagePct, orderQty){
   const wastage = (wastagePct===null || isNaN(wastagePct)) ? 0 : wastagePct;
   const lengthPerPcWithWastageM = lengthPerPcM * (1 + wastage/100);
   const totalM = (orderQty!==null && !isNaN(orderQty) && orderQty>0) ? lengthPerPcWithWastageM * orderQty : null;
-  return { perMarker, markerCount: n, lengthPerPcM, fullWidthCm, wastage, lengthPerPcWithWastageM, orderQty, totalM };
+  const hasGsm = gsm!==null && gsm!==undefined && !isNaN(gsm) && gsm>0;
+  const kgPerPc = hasGsm ? perMarker.reduce((s,x)=>s+x.kgPerPc,0) / n : null;
+  const kgPerPcWithWastage = hasGsm ? kgPerPc * (1 + wastage/100) : null;
+  const totalKg = (hasGsm && orderQty!==null && !isNaN(orderQty) && orderQty>0) ? kgPerPcWithWastage * orderQty : null;
+  return {
+    perMarker, markerCount: n, lengthPerPcM, fullWidthCm, wastage, lengthPerPcWithWastageM, orderQty, totalM,
+    gsm: hasGsm ? gsm : null, kgPerPc, kgPerPcWithWastage, totalKg,
+  };
 }
 function groupAuditTableHtml(perMarker, cols){
   const rows = perMarker.map(x => `<tr><td>${x.fileName}</td>${cols.map(c => `<td class="mono">${c.fmt(x)}</td>`).join('')}</tr>`).join('');
@@ -4651,45 +4712,54 @@ function groupAuditTableHtml(perMarker, cols){
 function groupYardResultHtml(group, r){
   if(r.markerCount === 1) return automaticYardResultHtml(r);
   const mtrPerPc = r.ydsPerPc * YD_TO_M;
+  const hasGsm = r.gsm!==null;
   return `
     <p class="hint" style="margin:0 0 10px;font-weight:600;color:var(--ink-soft);">Averaged across ${r.markerCount} markers for ${group.material} / ${group.styleName}</p>
     ${groupAuditTableHtml(r.perMarker, [
       {label:'Sizes / Qty', fmt:x=>escapeHtml(x.sizes||'—')+(x.sets!==null&&x.sets!==undefined?` (${x.sets} pcs)`:'')},
       {label:'Yds / Pc', fmt:x=>x.ydsPerPc.toFixed(4)},
-      {label:'Kg / Pc', fmt:x=>fmtKg(x.kgPerPc)},
+      ...(hasGsm ? [{label:'Kg / Pc', fmt:x=>fmtKg(x.kgPerPc)}] : []),
     ])}
     <div class="kpi-grid" style="margin:14px 0;">
       <div class="stat"><div class="num">${r.ydsPerPc.toFixed(4)}</div><div class="lbl">Avg Yds / Pc</div></div>
       <div class="stat"><div class="num">${mtrPerPc.toFixed(4)}</div><div class="lbl">Avg Mtr / Pc</div></div>
-      <div class="stat"><div class="num">${fmtKg(r.kgPerPc)}</div><div class="lbl">Avg Kg / Pc (no wastage)</div></div>
-      <div class="stat alert"><div class="num">${fmtKg(r.kgPerPcWithWastage)}</div><div class="lbl">Avg Kg / Pc (with ${r.wastage}% wastage)</div></div>
-      ${r.totalKg!==null ? `<div class="stat"><div class="num">${r.totalKg.toFixed(2)}</div><div class="lbl">Total Kg for ${r.orderQty} pcs</div></div>` : ''}
+      ${hasGsm ? `<div class="stat"><div class="num">${fmtKg(r.kgPerPc)}</div><div class="lbl">Avg Kg / Pc (no wastage)</div></div>` : ''}
+      ${hasGsm ? `<div class="stat alert"><div class="num">${fmtKg(r.kgPerPcWithWastage)}</div><div class="lbl">Avg Kg / Pc (with ${r.wastage}% wastage)</div></div>` : ''}
+      ${hasGsm && r.totalKg!==null ? `<div class="stat"><div class="num">${r.totalKg.toFixed(2)}</div><div class="lbl">Total Kg for ${r.orderQty} pcs</div></div>` : ''}
     </div>
     <table>
       <thead><tr><th>Step</th><th>Formula</th><th>Result</th></tr></thead>
       <tbody>
         <tr><td>Avg Mtr / Pc</td><td class="mono">Avg Yds/Pc × 0.9144</td><td class="mono">${mtrPerPc.toFixed(4)} m</td></tr>
-        <tr><td>Avg Kg / Pc (with wastage)</td><td class="mono">Avg Kg/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.kgPerPcWithWastage.toFixed(4)} kg</td></tr>
-        ${r.totalKg!==null ? `<tr><td>Total for order</td><td class="mono">Avg Kg/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalKg.toFixed(2)} kg</td></tr>` : ''}
+        ${hasGsm ? `<tr><td>Avg Kg / Pc (with ${r.wastage}% wastage)</td><td class="mono">Avg Kg/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.kgPerPcWithWastage.toFixed(4)} kg</td></tr>` : ''}
+        ${hasGsm && r.totalKg!==null ? `<tr><td>Total for order</td><td class="mono">Avg Kg/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalKg.toFixed(2)} kg</td></tr>` : ''}
         <tr><td>Avg required fabric width</td><td class="mono">Average of each marker's (cuttable width + 2in)</td><td class="mono">${r.fullWidthIn.toFixed(2)} in</td></tr>
       </tbody>
     </table>
-    ${wastageSweepDualTableHtml(r.ydsPerPc, r.kgPerPc)}`;
+    ${hasGsm
+      ? `<p class="hint" style="margin-top:8px;">GSM entered — Kg's consumption shown above alongside the length-based figures.</p>`
+      : `<p class="hint" style="margin-top:8px;">GSM is optional — enter one above if you also want a Kg's figure.</p>`}
+    ${hasGsm ? wastageSweepDualTableHtml(r.ydsPerPc, r.kgPerPc) : wastageSweepYardTableHtml(r.ydsPerPc)}`;
 }
 function groupMetricResultHtml(group, r){
   if(r.markerCount === 1) return metricConsumptionResultHtml(r);
   const ydsPerPc = r.lengthPerPcM * M_TO_YD;
+  const hasGsm = r.gsm!==null;
   return `
     <p class="hint" style="margin:0 0 10px;font-weight:600;color:var(--ink-soft);">Averaged across ${r.markerCount} markers for ${group.material} / ${group.styleName}</p>
     ${groupAuditTableHtml(r.perMarker, [
       {label:'Sizes / Qty', fmt:x=>escapeHtml(x.sizes||'—')+(x.sets!==null&&x.sets!==undefined?` (${x.sets} pcs)`:'')},
       {label:'Meters / Pc', fmt:x=>x.lengthPerPcM.toFixed(4)},
+      ...(hasGsm ? [{label:'Kg / Pc', fmt:x=>fmtKg(x.kgPerPc)}] : []),
     ])}
     <div class="kpi-grid" style="margin:14px 0;">
       <div class="stat"><div class="num">${r.lengthPerPcM.toFixed(4)}</div><div class="lbl">Avg Meters / Pc (no wastage)</div></div>
       <div class="stat"><div class="num">${ydsPerPc.toFixed(4)}</div><div class="lbl">Avg Yds / Pc (no wastage)</div></div>
       <div class="stat alert"><div class="num">${r.lengthPerPcWithWastageM.toFixed(4)}</div><div class="lbl">Avg Meters / Pc (with ${r.wastage}% wastage)</div></div>
       ${r.totalM!==null ? `<div class="stat"><div class="num">${r.totalM.toFixed(2)}</div><div class="lbl">Total Meters for ${r.orderQty} pcs</div></div>` : ''}
+      ${hasGsm ? `<div class="stat"><div class="num">${fmtKg(r.kgPerPc)}</div><div class="lbl">Avg Kg / Pc (no wastage)</div></div>` : ''}
+      ${hasGsm ? `<div class="stat alert"><div class="num">${fmtKg(r.kgPerPcWithWastage)}</div><div class="lbl">Avg Kg / Pc (with ${r.wastage}% wastage)</div></div>` : ''}
+      ${hasGsm && r.totalKg!==null ? `<div class="stat"><div class="num">${r.totalKg.toFixed(2)}</div><div class="lbl">Total Kg for ${r.orderQty} pcs</div></div>` : ''}
     </div>
     <table>
       <thead><tr><th>Step</th><th>Formula</th><th>Result</th></tr></thead>
@@ -4698,10 +4768,15 @@ function groupMetricResultHtml(group, r){
         <tr><td>Avg Meters / Pc (with wastage)</td><td class="mono">Avg Meters/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.lengthPerPcWithWastageM.toFixed(4)} m</td></tr>
         ${r.totalM!==null ? `<tr><td>Total for order</td><td class="mono">Avg Meters/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalM.toFixed(2)} m</td></tr>` : ''}
         <tr><td>Avg required fabric width</td><td class="mono">Average of each marker's (cuttable width + 4cm)</td><td class="mono">${r.fullWidthCm.toFixed(2)} cm</td></tr>
+        ${hasGsm ? `<tr><td>Avg Kg / Pc (no wastage)</td><td class="mono">Average of each marker's Kg/Pc</td><td class="mono">${r.kgPerPc.toFixed(4)} kg</td></tr>` : ''}
+        ${hasGsm ? `<tr><td>Avg Kg / Pc (with ${r.wastage}% wastage)</td><td class="mono">Avg Kg/Pc × (1 + ${r.wastage}%)</td><td class="mono">${r.kgPerPcWithWastage.toFixed(4)} kg</td></tr>` : ''}
+        ${hasGsm && r.totalKg!==null ? `<tr><td>Total Kg for order</td><td class="mono">Avg Kg/Pc (with wastage) × ${r.orderQty} pcs</td><td class="mono">${r.totalKg.toFixed(2)} kg</td></tr>` : ''}
       </tbody>
     </table>
-    <p class="hint" style="margin-top:8px;">No GSM needed for a meter-based marker.</p>
-    ${wastageSweepMetricTableHtml(r.lengthPerPcM)}`;
+    ${hasGsm
+      ? `<p class="hint" style="margin-top:8px;">GSM entered — Kg's consumption shown above alongside the length-based figures.</p>`
+      : `<p class="hint" style="margin-top:8px;">GSM is optional for a meter-based marker. Enter a GSM above if you also want a Kg's figure.</p>`}
+    ${hasGsm ? wastageSweepDualTableHtml(ydsPerPc, r.kgPerPc) : wastageSweepMetricTableHtml(r.lengthPerPcM)}`;
 }
 function updateGroupResults(groupKey){
   const group = groupMarkersByMaterial(consMarkersParsed).find(g => g.key === groupKey);
@@ -4710,12 +4785,12 @@ function updateGroupResults(groupKey){
   if(!out) return;
   const inputs = getGroupInputs(group);
   if(group.unitSystem==='metric'){
-    const r = calcGroupAverageMetricConsumption(group, inputs.wastagePct, inputs.orderQty);
+    const r = calcGroupAverageMetricConsumption(group, inputs.gsm, inputs.wastagePct, inputs.orderQty);
     out.innerHTML = r ? groupMetricResultHtml(group, r) : emptyState('chart', 'Could not calculate — check the marker data.');
     return;
   }
-  const r = inputs.gsm!==null ? calcGroupAverageYardConsumption(group, inputs.gsm, inputs.wastagePct, inputs.orderQty) : null;
-  out.innerHTML = r ? groupYardResultHtml(group, r) : emptyState('chart', 'Enter GSM above to see the consumption.');
+  const r = calcGroupAverageYardConsumption(group, inputs.gsm, inputs.wastagePct, inputs.orderQty);
+  out.innerHTML = r ? groupYardResultHtml(group, r) : emptyState('chart', 'Could not calculate — check the marker data.');
 }
 async function exportGroupConsumptionPdf(groupKey){
   const group = groupMarkersByMaterial(consMarkersParsed).find(g => g.key === groupKey);
@@ -4730,8 +4805,9 @@ async function exportGroupConsumptionPdf(groupKey){
     m.sets, m.efficiency!==null ? m.efficiency+'%' : '—',
   ]);
   if(isMetric){
-    const r = calcGroupAverageMetricConsumption(group, inputs.wastagePct, inputs.orderQty);
+    const r = calcGroupAverageMetricConsumption(group, inputs.gsm, inputs.wastagePct, inputs.orderQty);
     if(!r){ showToast('Could not calculate — check the marker data'); return; }
+    const hasGsm = r.gsm!==null;
     showToast('Preparing PDF…');
     const doc = await pdfNewDoc('Fabric Consumption Calculation', subtitle);
     if(!doc) return;
@@ -4740,12 +4816,23 @@ async function exportGroupConsumptionPdf(groupKey){
     y = pdfTable(doc, y, ['File','Sizes','Marker length','Marker width (cuttable)','Sets','Efficiency'], markerRows, [140,110,90,120,50,70]);
     y += 12;
     if(r.markerCount>1){
-      y = pdfSectionTitle(doc, y, 'Per-marker Meters / Pc (before averaging)');
-      y = pdfTable(doc, y, ['File','Sizes / Qty','Meters / Pc'], r.perMarker.map(x=>[x.fileName, (x.sizes||'—')+(x.sets!=null?` (${x.sets} pcs)`:''), x.lengthPerPcM.toFixed(4)+' m']), [180,180,120]);
+      y = pdfSectionTitle(doc, y, hasGsm ? 'Per-marker Meters / Pc & Kg / Pc (before averaging)' : 'Per-marker Meters / Pc (before averaging)');
+      y = pdfTable(doc, y,
+        hasGsm ? ['File','Sizes / Qty','Meters / Pc','Kg / Pc'] : ['File','Sizes / Qty','Meters / Pc'],
+        r.perMarker.map(x => hasGsm
+          ? [x.fileName, (x.sizes||'—')+(x.sets!=null?` (${x.sets} pcs)`:''), x.lengthPerPcM.toFixed(4)+' m', fmtKg(x.kgPerPc)+' kg']
+          : [x.fileName, (x.sizes||'—')+(x.sets!=null?` (${x.sets} pcs)`:''), x.lengthPerPcM.toFixed(4)+' m']),
+        hasGsm ? [140,180,110,110] : [180,180,120]
+      );
+      y += 12;
+    }
+    if(hasGsm){
+      y = pdfSectionTitle(doc, y, 'Inputs');
+      y = pdfTable(doc, y, ['GSM','Wastage %','Order qty'], [[r.gsm, r.wastage, r.orderQty ?? '—']], [90,90,90]);
       y += 12;
     }
     const mYdsPerPc = r.lengthPerPcM * M_TO_YD;
-    y = pdfSectionTitle(doc, y, (r.markerCount>1?'Averaged calculation':'Calculation') + ' — meter-based, no GSM required');
+    y = pdfSectionTitle(doc, y, (r.markerCount>1?'Averaged calculation':'Calculation') + (hasGsm ? ' — meter-based' : ' — meter-based, no GSM given'));
     y = pdfTable(doc, y,
       ['Step','Formula','Result'],
       [
@@ -4755,18 +4842,26 @@ async function exportGroupConsumptionPdf(groupKey){
         [`Meters / Pc (with ${r.wastage}% wastage)`, `Meters/Pc × (1 + ${r.wastage}%)`, r.lengthPerPcWithWastageM.toFixed(4)+' m'],
         ...(r.totalM!==null ? [[`Total for ${r.orderQty} pcs`, 'Meters/Pc (with wastage) × Order qty', r.totalM.toFixed(2)+' m']] : []),
         [r.markerCount>1?'Avg required fabric width':'Required fabric width', r.markerCount>1?"Average of each marker's (cuttable width + 4cm)":'Cuttable width + 4cm (constant)', r.fullWidthCm.toFixed(2)+' cm'],
+        ...(hasGsm ? [[r.markerCount>1?'Avg Kg / Pc (no wastage)':'Kg / Pc (no wastage)', r.markerCount>1?"Average of each marker's Kg/Pc":'(Meters/Pc × Full width(m) × GSM) ÷ 1000', r.kgPerPc.toFixed(4)+' kg']] : []),
+        ...(hasGsm ? [[`Kg / Pc (with ${r.wastage}% wastage)`, `Kg/Pc × (1 + ${r.wastage}%)`, r.kgPerPcWithWastage.toFixed(4)+' kg']] : []),
+        ...(hasGsm && r.totalKg!==null ? [[`Total Kg for ${r.orderQty} pcs`, 'Kg/Pc (with wastage) × Order qty', r.totalKg.toFixed(2)+' kg']] : []),
       ],
       [200,320,160]
     );
     y += 12;
-    y = pdfSectionTitle(doc, y, 'Consumption per piece at each wastage %');
-    y = pdfTable(doc, y, ['Wastage','Meters / Pc','Yds / Pc'], wastageSweepMetricPdfRows(r.lengthPerPcM), [110,140,140]);
+    if(hasGsm){
+      y = pdfSectionTitle(doc, y, "Consumption in Yds / Pc, Meters / Pc & Kg's / Pcs");
+      y = pdfTable(doc, y, ['Wastage','Yds / Pc','Mtr / Pc','Kg / Pc'], wastageSweepDualPdfRows(mYdsPerPc, r.kgPerPc), [90,120,120,120]);
+    }else{
+      y = pdfSectionTitle(doc, y, 'Consumption per piece at each wastage %');
+      y = pdfTable(doc, y, ['Wastage','Meters / Pc','Yds / Pc'], wastageSweepMetricPdfRows(r.lengthPerPcM), [110,140,140]);
+    }
     doc.save(`fabric_consumption_${slugifyGroupKey(group.key)}.pdf`);
     return;
   }
-  if(inputs.gsm===null){ showToast('Enter GSM first'); return; }
   const r = calcGroupAverageYardConsumption(group, inputs.gsm, inputs.wastagePct, inputs.orderQty);
   if(!r){ showToast('Could not calculate — check the marker data'); return; }
+  const hasGsm = r.gsm!==null;
   showToast('Preparing PDF…');
   const doc = await pdfNewDoc('Fabric Consumption Calculation', subtitle);
   if(!doc) return;
@@ -4775,31 +4870,44 @@ async function exportGroupConsumptionPdf(groupKey){
   y = pdfTable(doc, y, ['File','Sizes','Marker length','Marker width (cuttable)','Sets','Efficiency'], markerRows, [140,110,90,120,50,70]);
   y += 12;
   if(r.markerCount>1){
-    y = pdfSectionTitle(doc, y, 'Per-marker Sizes/Qty, Yds/Pc & Kg/Pc (before averaging)');
-    y = pdfTable(doc, y, ['File','Sizes / Qty','Yds / Pc','Kg / Pc'], r.perMarker.map(x=>[x.fileName, (x.sizes||'—')+(x.sets!=null?` (${x.sets} pcs)`:''), x.ydsPerPc.toFixed(4)+' yds', fmtKg(x.kgPerPc)+' kg']), [140,180,110,110]);
+    y = pdfSectionTitle(doc, y, hasGsm ? 'Per-marker Sizes/Qty, Yds/Pc & Kg/Pc (before averaging)' : 'Per-marker Sizes/Qty & Yds/Pc (before averaging)');
+    y = pdfTable(doc, y,
+      hasGsm ? ['File','Sizes / Qty','Yds / Pc','Kg / Pc'] : ['File','Sizes / Qty','Yds / Pc'],
+      r.perMarker.map(x => hasGsm
+        ? [x.fileName, (x.sizes||'—')+(x.sets!=null?` (${x.sets} pcs)`:''), x.ydsPerPc.toFixed(4)+' yds', fmtKg(x.kgPerPc)+' kg']
+        : [x.fileName, (x.sizes||'—')+(x.sets!=null?` (${x.sets} pcs)`:''), x.ydsPerPc.toFixed(4)+' yds']),
+      hasGsm ? [140,180,110,110] : [180,180,120]
+    );
     y += 12;
   }
-  y = pdfSectionTitle(doc, y, 'Inputs');
-  y = pdfTable(doc, y, ['GSM','Wastage %','Order qty'], [[inputs.gsm, r.wastage, inputs.orderQty ?? '—']], [90,90,90]);
-  y += 12;
+  if(hasGsm){
+    y = pdfSectionTitle(doc, y, 'Inputs');
+    y = pdfTable(doc, y, ['GSM','Wastage %','Order qty'], [[r.gsm, r.wastage, r.orderQty ?? '—']], [90,90,90]);
+    y += 12;
+  }
   const yMtrPerPc = r.ydsPerPc * YD_TO_M;
-  y = pdfSectionTitle(doc, y, r.markerCount>1 ? 'Averaged calculation' : 'Calculation');
+  y = pdfSectionTitle(doc, y, (r.markerCount>1 ? 'Averaged calculation' : 'Calculation') + (hasGsm ? '' : ' — no GSM given'));
   y = pdfTable(doc, y,
     ['Step','Formula','Result'],
     [
       ...(r.markerCount===1 ? [['Marker length (total)', 'Length + 2in (constant)', r.markerTotalYds.toFixed(4)+' yds']] : []),
       [r.markerCount>1?'Avg Yds / Pc':'Yds / Pc', r.markerCount>1?"Average of each marker's Yds/Pc":'Marker length ÷ Sets', r.ydsPerPc.toFixed(4)+' yds'],
       [r.markerCount>1?'Avg Mtr / Pc':'Mtr / Pc', 'Yds/Pc × 0.9144', yMtrPerPc.toFixed(4)+' m'],
-      [r.markerCount>1?'Avg Kg / Pc (no wastage)':'Kg / Pc (no wastage)', r.markerCount>1?"Average of each marker's Kg/Pc":'(Yds/Pc × 0.9144 × Full width × GSM) ÷ 39.37 ÷ 1000', r.kgPerPc.toFixed(4)+' kg'],
-      [`Kg / Pc (with ${r.wastage}% wastage)`, `Kg/Pc × (1 + ${r.wastage}%)`, r.kgPerPcWithWastage.toFixed(4)+' kg'],
-      ...(r.totalKg!==null ? [[`Total for ${r.orderQty} pcs`, 'Kg/Pc (with wastage) × Order qty', r.totalKg.toFixed(2)+' kg']] : []),
+      ...(hasGsm ? [[r.markerCount>1?'Avg Kg / Pc (no wastage)':'Kg / Pc (no wastage)', r.markerCount>1?"Average of each marker's Kg/Pc":'(Yds/Pc × 0.9144 × Full width × GSM) ÷ 39.37 ÷ 1000', r.kgPerPc.toFixed(4)+' kg']] : []),
+      ...(hasGsm ? [[`Kg / Pc (with ${r.wastage}% wastage)`, `Kg/Pc × (1 + ${r.wastage}%)`, r.kgPerPcWithWastage.toFixed(4)+' kg']] : []),
+      ...(hasGsm && r.totalKg!==null ? [[`Total for ${r.orderQty} pcs`, 'Kg/Pc (with wastage) × Order qty', r.totalKg.toFixed(2)+' kg']] : []),
       [r.markerCount>1?'Avg required fabric width':'Required fabric width', r.markerCount>1?"Average of each marker's (cuttable width + 2in)":'Cuttable width + 2in (constant)', r.fullWidthIn.toFixed(2)+' in'],
     ],
     [200,320,160]
   );
   y += 12;
-  y = pdfSectionTitle(doc, y, "Consumption in Yds / Pc, Meters / Pc & Kg's / Pcs");
-  y = pdfTable(doc, y, ['Wastage','Yds / Pc','Mtr / Pc','Kg / Pc'], wastageSweepDualPdfRows(r.ydsPerPc, r.kgPerPc), [90,120,120,120]);
+  if(hasGsm){
+    y = pdfSectionTitle(doc, y, "Consumption in Yds / Pc, Meters / Pc & Kg's / Pcs");
+    y = pdfTable(doc, y, ['Wastage','Yds / Pc','Mtr / Pc','Kg / Pc'], wastageSweepDualPdfRows(r.ydsPerPc, r.kgPerPc), [90,120,120,120]);
+  }else{
+    y = pdfSectionTitle(doc, y, 'Consumption per piece at each wastage %');
+    y = pdfTable(doc, y, ['Wastage','Yds / Pc','Mtr / Pc'], wastageSweepYardPdfRows(r.ydsPerPc), [110,140,140]);
+  }
   doc.save(`fabric_consumption_${slugifyGroupKey(group.key)}.pdf`);
 }
 function renderMarkerGroupBody(group){
@@ -4809,7 +4917,7 @@ function renderMarkerGroupBody(group){
   const infoCard = `
     <div class="panel" style="background:var(--green-soft);border-color:var(--green);">
       <div style="font-weight:600;font-family:'Space Grotesk',sans-serif;margin-bottom:10px;">
-        ${group.material} — ${group.styleName}${group.markers.length>1 ? ` (${group.markers.length} markers combined)` : ''}${isMetric ? ' — meter-based, no GSM needed' : ''}
+        ${group.material} — ${group.styleName}${group.markers.length>1 ? ` (${group.markers.length} markers combined)` : ''}${isMetric ? ' — meter-based, GSM optional' : ''}
       </div>
       ${group.markers.map(m => `
         <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid var(--green);padding:8px 0 0;margin-top:8px;">
@@ -4819,18 +4927,8 @@ function renderMarkerGroupBody(group){
     </div>`;
 
   const fieldsHtml = isMetric ? `
-    <div class="grid-cols" style="grid-template-columns:repeat(2,1fr);">
-      <div class="field">
-        <label>Wastage %</label>
-        <input id="consGroupWastage_${slug}" data-group-key="${group.key}" type="number" step="0.1" placeholder="e.g. 5" value="${inputs.wastagePct ?? ''}">
-        <div class="hint" style="margin-top:4px;">
-          <a href="#" class="group-wastage-preset" data-group-key="${group.key}" data-pct="3">Use 3%</a> · <a href="#" class="group-wastage-preset" data-group-key="${group.key}" data-pct="5">Use 5%</a>
-        </div>
-      </div>
-      <div class="field"><label>Order qty (optional)</label><input id="consGroupQty_${slug}" data-group-key="${group.key}" type="number" step="1" placeholder="e.g. 5550" value="${inputs.orderQty ?? ''}"></div>
-    </div>` : `
     <div class="grid-cols" style="grid-template-columns:repeat(3,1fr);">
-      <div class="field"><label>GSM</label><input id="consGroupGsm_${slug}" data-group-key="${group.key}" type="number" step="0.01" placeholder="e.g. 150" value="${inputs.gsm ?? ''}"></div>
+      <div class="field"><label>GSM (optional)</label><input id="consGroupGsm_${slug}" data-group-key="${group.key}" type="number" step="0.01" placeholder="e.g. 150" value="${inputs.gsm ?? ''}"></div>
       <div class="field">
         <label>Wastage %</label>
         <input id="consGroupWastage_${slug}" data-group-key="${group.key}" type="number" step="0.1" placeholder="e.g. 5" value="${inputs.wastagePct ?? ''}">
@@ -4840,15 +4938,27 @@ function renderMarkerGroupBody(group){
       </div>
       <div class="field"><label>Order qty (optional)</label><input id="consGroupQty_${slug}" data-group-key="${group.key}" type="number" step="1" placeholder="e.g. 5550" value="${inputs.orderQty ?? ''}"></div>
     </div>
-    <div class="hint" style="margin:6px 0 0;">Fabric width used = marker's cuttable width + 2in (fixed) · marker length used = as read + 2in (fixed) — neither is editable.</div>`;
+    <div class="hint" style="margin:6px 0 0;">Length is calculated from the marker directly — GSM is only needed if you also want a Kg's figure. Fabric width used = marker's cuttable width + 4cm (fixed) · marker length used = as read + 5cm (fixed) — neither is editable.</div>` : `
+    <div class="grid-cols" style="grid-template-columns:repeat(3,1fr);">
+      <div class="field"><label>GSM (optional)</label><input id="consGroupGsm_${slug}" data-group-key="${group.key}" type="number" step="0.01" placeholder="e.g. 150" value="${inputs.gsm ?? ''}"></div>
+      <div class="field">
+        <label>Wastage %</label>
+        <input id="consGroupWastage_${slug}" data-group-key="${group.key}" type="number" step="0.1" placeholder="e.g. 5" value="${inputs.wastagePct ?? ''}">
+        <div class="hint" style="margin-top:4px;">
+          <a href="#" class="group-wastage-preset" data-group-key="${group.key}" data-pct="3">Use 3%</a> · <a href="#" class="group-wastage-preset" data-group-key="${group.key}" data-pct="5">Use 5%</a>
+        </div>
+      </div>
+      <div class="field"><label>Order qty (optional)</label><input id="consGroupQty_${slug}" data-group-key="${group.key}" type="number" step="1" placeholder="e.g. 5550" value="${inputs.orderQty ?? ''}"></div>
+    </div>
+    <div class="hint" style="margin:6px 0 0;">Length is calculated from the marker directly — GSM is only needed if you also want a Kg's figure. Fabric width used = marker's cuttable width + 2in (fixed) · marker length used = as read + 2in (fixed) — neither is editable.</div>`;
 
   let resultsHtml;
   if(isMetric){
-    const r = calcGroupAverageMetricConsumption(group, inputs.wastagePct, inputs.orderQty);
+    const r = calcGroupAverageMetricConsumption(group, inputs.gsm, inputs.wastagePct, inputs.orderQty);
     resultsHtml = r ? groupMetricResultHtml(group, r) : emptyState('chart', 'Could not calculate — check the marker data.');
   }else{
-    const r = inputs.gsm!==null ? calcGroupAverageYardConsumption(group, inputs.gsm, inputs.wastagePct, inputs.orderQty) : null;
-    resultsHtml = r ? groupYardResultHtml(group, r) : emptyState('chart', 'Enter GSM above to see the consumption.');
+    const r = calcGroupAverageYardConsumption(group, inputs.gsm, inputs.wastagePct, inputs.orderQty);
+    resultsHtml = r ? groupYardResultHtml(group, r) : emptyState('chart', 'Could not calculate — check the marker data.');
   }
 
   return `
@@ -5065,7 +5175,7 @@ function resolvePendingMarker(id, finalSets, finalSizes){
   consPendingMarkers = consPendingMarkers.filter(x => x.id !== id);
   const { setsFromText, setsFromFileName, needsConfirmation, needsSetsEntry, ...base } = m;
   consMarkersParsed.push({ ...base, sizes: finalSizes || base.sizes, sets: finalSets, setsSource: 'user-confirmed' });
-  showToast('Marker added — enter GSM to calculate');
+  showToast('Marker added');
   rerenderAutomaticBody();
 }
 
@@ -5160,7 +5270,7 @@ function attachTabEvents(){
     }else if(pendingCount>0){
       showToast(`${pendingCount} marker${pendingCount>1?'s need':' needs'} your confirmation — see the details below`);
     }else if(addedCount>0){
-      showToast(addedCount===1 ? 'Marker read — enter GSM to calculate' : `${addedCount} markers read`
+      showToast(addedCount===1 ? 'Marker read' : `${addedCount} markers read`
         + (failedCount>0 || unreadableCount>0 ? ` (${failedCount+unreadableCount} skipped)` : ''));
     }else if(unreadableCount>0){
       showToast(`Couldn't read ${unreadableCount>1?'these markers':'this marker'} — see the details below`);
