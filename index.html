@@ -2138,9 +2138,19 @@ function groupedUserOptionsHtml(users, selectedId){
 
 // Applies the Dashboard's Buyer/Person/Style/Season/Date filters to an order.
 // Date range checks the order's PCD — the natural "when" for an order-level filter.
+// Person matches an order if that person is assigned to at least one of its tasks --
+// an order has no single "owner" of its own, only per-task assignees, so this is the
+// only definition of "this order belongs to the Person filter" that makes sense. This
+// was previously missing here (despite being named in this very comment) even though
+// dashboardFilteredTasks() below already applies it to tasks -- so filtering the
+// Dashboard by Person left every order-level KPI (Orders at risk, Active orders),
+// the Buyer overview panel, and the order-based charts (Orders by health, Buyer risk
+// matrix) still showing figures for EVERY order regardless of the selected person,
+// contradicting the Filter panel's own "Narrow everything below" description.
 function orderMatchesDashboardFilters(order){
   const f = dashboardFilters;
   if(f.buyerId!=='all' && order.buyerId!==f.buyerId) return false;
+  if(f.personId!=='all' && !order.tasks.some(t => t.assignedTo===f.personId)) return false;
   if(f.style && !order.styleNo.toLowerCase().includes(f.style.toLowerCase())) return false;
   if(f.season && !(order.season||'').toLowerCase().includes(f.season.toLowerCase())) return false;
   if(f.dateFrom && order.pcd < f.dateFrom) return false;
