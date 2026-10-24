@@ -3250,7 +3250,7 @@ function renderBomPanel(order){
    their OWN usage multiplier (not a blanket 3%) -> cost; then raw materials, finance,
    additional costs, CM&P (CPM*SAM/Efficiency), and the overhead-% buildup to the
    Final Offer Price. Nothing here changes that math — see computeCosting() below. */
-let costingView = { buyerId:null, mode:'list', sheetId:null, templateDraft:null, sheetDraft:null, tpFile:null, tpBusy:false, tpParsed:null };
+let costingView = { buyerId:null, mode:'list', sheetId:null, templateDraft:null, sheetDraft:null, tpFile:null, tpBusy:false, tpParsed:null, tpHeader:null };
 
 function haddadCostingPreset(){
   return {
@@ -3398,9 +3398,10 @@ function money(n){ return isFinite(n) ? ('$'+n.toFixed(4)) : '—'; }
 // Tech Pack import, AI-driven: you upload the tech pack PDF, this extracts its text
 // in the browser — reusing extractPdfText()/loadPdfJsLib() above (already used for
 // reading marker PDFs) rather than loading a second copy of pdf.js — and sends just
-// that text to /api/parse-techpack, which asks AI to read the Fabric BOM / Trim BOM /
-// Packaging BOM tables and return item names + specs as structured JSON. Usage% and
-// price are never guessed — those stay yours to set, exactly as agreed.
+// that text to /api/parse-techpack, which asks AI to read the header (Style/Description/
+// Size range/Season) plus the Fabric BOM / Trim BOM / Packaging BOM tables and return
+// everything as structured JSON. Usage% and price are never guessed — those stay yours
+// to set, exactly as agreed.
 async function extractTechPackWithAI(file){
   const text = await extractPdfText(file);
   if(!text) throw new Error("Couldn't read any text from this PDF");
@@ -3411,11 +3412,13 @@ async function extractTechPackWithAI(file){
   });
   const data = await res.json().catch(()=>({}));
   if(!res.ok || !data.ok) throw new Error(data.error || 'Tech pack extraction failed');
-  const out = [];
-  (data.fabricItems||[]).forEach(it => out.push({name: formatTpItem(it), dest:'fabricRows'}));
-  (data.trimItems||[]).forEach(it => out.push({name: formatTpItem(it), dest:'importedAccRows'}));
-  (data.packagingItems||[]).forEach(it => out.push({name: formatTpItem(it), dest:'importedAccRows'}));
-  return out;
+  const items = [];
+  (data.fabricItems||[]).forEach(it => items.push({name: formatTpItem(it), dest:'fabricRows'}));
+  (data.trimItems||[]).forEach(it => items.push({name: formatTpItem(it), dest:'importedAccRows'}));
+  (data.packagingItems||[]).forEach(it => items.push({name: formatTpItem(it), dest:'importedAccRows'}));
+  const h = data.header || {};
+  const header = { style: h.style||'', description: h.description||'', sizeRange: h.sizeRange||'', season: h.season||'' };
+  return { items, header };
 }
 function formatTpItem(it){
   if(typeof it === 'string') return it;
@@ -3561,7 +3564,18 @@ function costingTechPackImportBlock(){
       <div class="row-actions" style="margin-top:8px;"><button class="btn small" data-ccost-extract-tp="1" disabled>Extract with AI</button></div>
     </div>`;
   }
+  const h = costingView.tpHeader || {};
+  const hasHeader = h.style || h.description || h.sizeRange || h.season;
   return `<div class="panel" style="background:var(--canvas-bg);box-shadow:none;margin-top:10px;">
+    ${hasHeader ? `<h2 style="font-size:13px;">Style details found on the tech pack — review before applying</h2>
+    <div class="grid-cols">
+      <div class="field"><label>Style</label><input data-ccost-tp-header="style" value="${(h.style||'').replace(/"/g,'&quot;')}"></div>
+      <div class="field"><label>Description</label><input data-ccost-tp-header="description" value="${(h.description||'').replace(/"/g,'&quot;')}"></div>
+      <div class="field"><label>Size range</label><input data-ccost-tp-header="sizeRange" value="${(h.sizeRange||'').replace(/"/g,'&quot;')}"></div>
+      <div class="field"><label>Season</label><input data-ccost-tp-header="season" value="${(h.season||'').replace(/"/g,'&quot;')}"></div>
+    </div>
+    <p class="hint">Only fills in the Style/Description/Size range fields that are still empty above — won't overwrite anything you already typed.</p>
+    <div class="divider"></div>` : ''}
     <h2 style="font-size:13px;">Parsed items — choose where each goes</h2>
     <div class="xgrid"><table>
       <thead><tr><th>Item name</th><th>Add to</th></tr></thead>
@@ -6879,7 +6893,9 @@ function attachTabEvents(){
     costingView.tpBusy = true;
     renderTabContent();
     try{
-      costingView.tpParsed = await extractTechPackWithAI(costingView.tpFile);
+      const result = await extractTechPackWithAI(costingView.tpFile);
+      costingView.tpParsed = result.items;
+      costingView.tpHeader = result.header;
       if(!costingView.tpParsed.length) showToast('No items found — try a different page range or add items manually');
     }catch(err){
       console.error('Tech pack extraction failed:', err);
@@ -6887,6 +6903,12 @@ function attachTabEvents(){
     }
     costingView.tpBusy = false;
     renderTabContent();
+  });
+  document.querySelectorAll('[data-ccost-tp-header]').forEach(inp => {
+    inp.addEventListener('change', () => {
+      if(!costingView.tpHeader) costingView.tpHeader = {};
+      costingView.tpHeader[inp.dataset.ccostTpHeader] = inp.value;
+    });
   });
   document.querySelectorAll('[data-ccost-tp-name]').forEach(inp => {
     inp.addEventListener('change', () => {
@@ -6909,12 +6931,21 @@ function attachTabEvents(){
       if(p.dest==='fabricRows'){ row.markerDriven = false; row.fixedUsage = 1; delete row.usage; }
       costingView.sheetDraft[p.dest].push(row);
     });
-    costingView.tpParsed = null; costingView.tpFile = null;
+    // Fill in style-header fields the tech pack found — but never clobber something
+    // the user already typed in by hand.
+    const h = costingView.tpHeader;
+    if(h){
+      const s = costingView.sheetDraft;
+      if(!s.style && h.style) s.style = h.style;
+      if(!s.description && h.description) s.description = h.description;
+      if(!s.sizeRange && h.sizeRange) s.sizeRange = h.sizeRange;
+    }
+    costingView.tpParsed = null; costingView.tpFile = null; costingView.tpHeader = null;
     renderTabContent();
     showToast('Items added — set usage and price for each before saving');
   });
   const cancelTpBtn = document.querySelector('[data-ccost-cancel-tp]');
-  if(cancelTpBtn) cancelTpBtn.addEventListener('click', () => { costingView.tpParsed = null; costingView.tpFile = null; renderTabContent(); });
+  if(cancelTpBtn) cancelTpBtn.addEventListener('click', () => { costingView.tpParsed = null; costingView.tpFile = null; costingView.tpHeader = null; renderTabContent(); });
 
   // Save / cancel sheet
   const saveSheetBtn = document.querySelector('[data-ccost-save-sheet]');
@@ -6922,11 +6953,11 @@ function attachTabEvents(){
     const draft = costingView.sheetDraft;
     const existingIdx = DATA.costingSheets.findIndex(s => s.id === draft.id);
     if(existingIdx >= 0) DATA.costingSheets[existingIdx] = draft; else DATA.costingSheets.push(draft);
-    costingView.mode = 'list'; costingView.sheetDraft = null; costingView.tpParsed = null; costingView.tpFile = null;
+    costingView.mode = 'list'; costingView.sheetDraft = null; costingView.tpParsed = null; costingView.tpFile = null; costingView.tpHeader = null;
     renderTabContent(); saveData(); showToast('Costing saved');
   });
   const cancelSheetBtn = document.querySelector('[data-ccost-cancel-sheet]');
-  if(cancelSheetBtn) cancelSheetBtn.addEventListener('click', () => { costingView.mode='list'; costingView.sheetDraft=null; costingView.tpParsed=null; costingView.tpFile=null; renderTabContent(); });
+  if(cancelSheetBtn) cancelSheetBtn.addEventListener('click', () => { costingView.mode='list'; costingView.sheetDraft=null; costingView.tpParsed=null; costingView.tpFile=null; costingView.tpHeader=null; renderTabContent(); });
 }
 
 // Shown instead of the app when loadData() couldn't confirm what's actually saved

@@ -22,17 +22,25 @@ export default async function handler(req, res) {
     return;
   }
 
-  const prompt = `You are reading the text extracted from a garment tech pack (an apparel spec document), typically from its "Summary" page(s). It normally lists a "Fabric BOM", a "Trim BOM", and a "Packaging BOM" (sometimes called "Labels & packaging"), each a table of items.
+  const prompt = `You are reading the text extracted from a garment tech pack (an apparel spec document), typically from its "Summary" page(s). It normally has a header section identifying the style (Style/Dev code, Name, Description, Season, Year, Size range / Size-Sample), followed by a "Fabric BOM", a "Trim BOM", and a "Packaging BOM" (sometimes called "Labels & packaging"), each a table of items.
 
-Extract every real item you can find from those three tables and respond with ONLY a single JSON object -- no other text, no markdown code fences, no explanation:
+Extract everything you can find and respond with ONLY a single JSON object -- no other text, no markdown code fences, no explanation:
 
 {
+  "header": {"style": string or null, "description": string or null, "sizeRange": string or null, "season": string or null},
   "fabricItems": [{"name": string, "spec": string or null}],
   "trimItems": [{"name": string, "spec": string or null}],
   "packagingItems": [{"name": string, "spec": string or null}]
 }
 
-Field meanings:
+Header field meanings:
+- style: the style / dev reference code printed near the top of the document (e.g. "LCG-PL 7865", "LCB-PL 7044"). Use null if none is visible.
+- description: the garment's name/description as printed (e.g. "CORE POLO" and/or "MADE FOR OUTLETS" combined into one short line if both are present, otherwise whichever one is present). Use null if neither is visible.
+- sizeRange: the size / sample range as printed (e.g. "1A-7A", "TODDLER CHILD LACOSTE (1A-7A)"). If multiple size groups are listed, use the one that looks like the primary/first size range rather than concatenating all of them. Use null if none is visible.
+- season: season and/or year if printed together (e.g. "Fall 2026"). Use null if neither is visible.
+- Only fill a header field from text that is clearly a label/value pair or an obvious document header -- never guess or infer one from context.
+
+BOM field meanings:
 - name: the item's own name exactly as printed (e.g. "LACOSTE MAIN LOOP LABEL", "LACOSTE 1X1 FLAT KNIT COLLAR + CUFF", "T0586 LT WT INTERFACING"). Keep buyer/style reference codes that are part of the item's identity if present, but drop ones that are clearly just a loose cross-reference column value sitting apart from the name.
 - spec: a short extra descriptor if one is clearly attached to that same item (fiber content, construction, color/finish, vendor) -- e.g. "60% COTTON / 40% POLYESTER, 175 g/m2" or "GRITTI GROUP, IMINACRE". Use null if nothing extra is attached.
 - fabricItems: rows from the Fabric BOM table only (the actual shell/body fabrics and any knit components grouped with it, e.g. a collar/cuff fabric).
@@ -78,8 +86,15 @@ ${text.slice(0, 60000)}
       return;
     }
     const parsed = JSON.parse(jsonMatch[0]);
+    const h = parsed.header || {};
     res.status(200).json({
       ok: true,
+      header: {
+        style: h.style || null,
+        description: h.description || null,
+        sizeRange: h.sizeRange || null,
+        season: h.season || null,
+      },
       fabricItems: Array.isArray(parsed.fabricItems) ? parsed.fabricItems : [],
       trimItems: Array.isArray(parsed.trimItems) ? parsed.trimItems : [],
       packagingItems: Array.isArray(parsed.packagingItems) ? parsed.packagingItems : [],
