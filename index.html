@@ -266,6 +266,7 @@ const DEPARTMENTS = ['Merchandising','Purchase','Store','Shipping','PPC'];
 const TAB_DEFS = [
   ['dashboard','Dashboard'],
   ['orders','Orders'],
+  ['costing','Costing'],
   ['performance','Performance'],
   ['team','Buyers & Team'],
   ['templates','Task Templates'],
@@ -899,7 +900,9 @@ function defaultData(){
     templateSets: [
       {id: uid('tplset'), name:'Standard TNA (75 Days)', tasks: DEFAULT_TEMPLATES.map(t => ({id: uid('tpl'), ...t}))}
     ],
-    orders: []
+    orders: [],
+    costingTemplates: [],
+    costingSheets: []
   };
 }
 
@@ -908,6 +911,8 @@ function migrateData(d){
   if(!d.buyers) d.buyers = [];
   if(!d.users) d.users = [];
   if(!d.orders) d.orders = [];
+  if(!d.costingTemplates) d.costingTemplates = [];
+  if(!d.costingSheets) d.costingSheets = [];
   if(!d.templateSets){
     const tasks = (d.templates || DEFAULT_TEMPLATES).map(t => ({id: t.id || uid('tpl'), name:t.name, dept:t.dept, offset:t.offset}));
     d.templateSets = [{id: uid('tplset'), name:'Standard TNA (75 Days)', tasks}];
@@ -1918,6 +1923,7 @@ function renderTabContent(){
     }
     if(currentTab==='dashboard'){ el.innerHTML = renderDashboard(); initDashboardCharts(); animateKpiNumbers(); }
     else if(currentTab==='orders') el.innerHTML = renderOrders();
+    else if(currentTab==='costing') el.innerHTML = renderCosting();
     else if(currentTab==='performance'){ el.innerHTML = renderPerformance(); initPerformanceCharts(); }
     else if(currentTab==='team') el.innerHTML = renderTeam();
     else if(currentTab==='templates') el.innerHTML = renderTemplates();
@@ -3235,6 +3241,433 @@ function renderBomPanel(order){
     <h2 style="font-size:13px;">${preview ? 'Preview before adding' : 'Bulk add from Excel'}</h2>
     ${!preview ? `<p class="desc">Select and copy your BOM rows straight from Excel — including the header row — and paste them below. This reads columns like <strong>Item, Ordered Qty (or Gmt Order qty), Uom, Supplier, Expected I/H date</strong> automatically, in whatever order your sheet has them, and sums rows for the same item (e.g. size/color variants) into one line.</p>` : ''}
     ${bulkImportHtml}
+  </div>`;
+}
+
+/* ---- Costing ----
+   Buyer-wise costing, formula-for-formula the same as your Haddad/Lacoste Excel sheet:
+   Marker -> fabric consumption (+3% allowance) -> fabric cost; accessories each carry
+   their OWN usage multiplier (not a blanket 3%) -> cost; then raw materials, finance,
+   additional costs, CM&P (CPM*SAM/Efficiency), and the overhead-% buildup to the
+   Final Offer Price. Nothing here changes that math — see computeCosting() below. */
+let costingView = { buyerId:null, mode:'list', sheetId:null, templateDraft:null, sheetDraft:null, tpFile:null, tpBusy:false, tpParsed:null };
+
+function haddadCostingPreset(){
+  return {
+    name: 'Haddad / Lacoste costing format',
+    fabricRows: [
+      { id: uid('cfab'), name:'Main body fabric', unit:'KGS', markerDriven:true, allowancePct:3, fixedUsage:1 },
+      { id: uid('cfab'), name:'Collar + Cuff (flat knit)', unit:'SET', markerDriven:false, allowancePct:0, fixedUsage:1 },
+    ],
+    fabricImportLogisticsPct: 0,
+    localAccRows: [
+      { id: uid('cacc'), name:'Thread', unit:'Mts', usage:262.5 },
+      { id: uid('cacc'), name:'Hangtag Loop', unit:'Pcs', usage:1.03 },
+      { id: uid('cacc'), name:'Ctn Barcode stickers', unit:'Pcs', usage:0.166667 },
+      { id: uid('cacc'), name:'Printed Packing tape + Brand/Plain stickers', unit:'Pcs', usage:1.03 },
+      { id: uid('cacc'), name:'Cartons', unit:'Pcs', usage:1.03 },
+      { id: uid('cacc'), name:'Scotch Tape', unit:'Mts', usage:1.03 },
+    ],
+    importedAccRows: [
+      { id: uid('cacc'), name:'Main Loop Label', unit:'Pcs', usage:1.05 },
+      { id: uid('cacc'), name:'Country of Origin Label', unit:'Pcs', usage:1.05 },
+      { id: uid('cacc'), name:'Universal Care Label', unit:'Pcs', usage:1.05 },
+      { id: uid('cacc'), name:'Cotton Cord', unit:'Pcs', usage:1.05 },
+      { id: uid('cacc'), name:'Price Hangtag', unit:'Pcs', usage:1.05 },
+      { id: uid('cacc'), name:'Tissue Paper', unit:'Pcs', usage:1.05 },
+      { id: uid('cacc'), name:'Card Board', unit:'Pcs', usage:1.05 },
+      { id: uid('cacc'), name:'Branded Polybag', unit:'Pcs', usage:1.05 },
+      { id: uid('cacc'), name:'Size Loop Label', unit:'Pcs', usage:1.05 },
+      { id: uid('cacc'), name:'Main Hangtag', unit:'Pcs', usage:1.05 },
+      { id: uid('cacc'), name:'Embroidered Logo / Patch', unit:'Pcs', usage:1.05 },
+      { id: uid('cacc'), name:'Buttons', unit:'Pcs', usage:2.1 },
+      { id: uid('cacc'), name:'Tape (Herringbone + Neck)', unit:'Mts', usage:0.6 },
+      { id: uid('cacc'), name:'Interfacing', unit:'Pcs', usage:0.6 },
+    ],
+    accImportLogisticsPct: 20,
+    financePct: 0,
+    additionalCostRows: [
+      { id: uid('cadd'), name:'Print', unit:'PCS', usage:0 },
+      { id: uid('cadd'), name:'Embroidered Logo', unit:'PCS', usage:1.03 },
+      { id: uid('cadd'), name:'Garment Wash', unit:'PCS', usage:0 },
+      { id: uid('cadd'), name:'Costco Charges', unit:'PCS', usage:0 },
+      { id: uid('cadd'), name:'Couriers', unit:'PCS', usage:0 },
+      { id: uid('cadd'), name:'Lab Testing', unit:'PCS', usage:1.03 },
+    ],
+    cpm:0.05, sam:13.44, efficiency:70,
+    exportLogisticsPct:2, commissionPct:7.5, marketingPct:1.5, factoryMarkupPct:8.4,
+  };
+}
+
+function blankCostingTemplate(){
+  return {
+    name:'New costing format',
+    fabricRows: [{ id: uid('cfab'), name:'', unit:'KGS', markerDriven:true, allowancePct:3, fixedUsage:1 }],
+    fabricImportLogisticsPct: 0,
+    localAccRows: [], importedAccRows: [],
+    accImportLogisticsPct: 0, financePct: 0,
+    additionalCostRows: [],
+    cpm:0, sam:0, efficiency:100,
+    exportLogisticsPct:0, commissionPct:0, marketingPct:0, factoryMarkupPct:0,
+  };
+}
+
+// Deep-clones a template's row structure into a fresh sheet (style-level) record —
+// a sheet always starts as a copy of its buyer's saved format, never a live reference,
+// so editing one style's prices/usage never touches the template or other styles.
+function sheetFromTemplate(tpl, buyerId){
+  const clone = JSON.parse(JSON.stringify(tpl));
+  return {
+    id: uid('csheet'),
+    buyerId,
+    templateId: tpl.id || null,
+    style:'', description:'', sizeRange:'', qty:'', date: today(),
+    marker: { widthIn:0, lengthIn:0, gsm:0, pcsInMarker:1 },
+    fabricRows: clone.fabricRows.map(r => ({...r, price:null})),
+    fabricImportLogisticsPct: clone.fabricImportLogisticsPct,
+    localAccRows: clone.localAccRows.map(r => ({...r, price:null})),
+    importedAccRows: clone.importedAccRows.map(r => ({...r, price:null})),
+    accImportLogisticsPct: clone.accImportLogisticsPct,
+    financePct: clone.financePct,
+    additionalCostRows: clone.additionalCostRows.map(r => ({...r, price:null})),
+    cpm: clone.cpm, sam: clone.sam, efficiency: clone.efficiency,
+    exportLogisticsPct: clone.exportLogisticsPct, commissionPct: clone.commissionPct,
+    marketingPct: clone.marketingPct, factoryMarkupPct: clone.factoryMarkupPct,
+  };
+}
+
+function markerPerPcConsumption(m){
+  // Width/Length entered in inches, matching your sheet's own cell formula
+  // (x2.54/100 to get cm, +0.05 cm trim allowance baked in).
+  const w = (parseFloat(m.widthIn)||0)*2.54/100 + 0.05;
+  const l = (parseFloat(m.lengthIn)||0)*2.54/100 + 0.05;
+  const markerWt = w*l*(parseFloat(m.gsm)||0);
+  const pcs = parseFloat(m.pcsInMarker)||0;
+  return pcs ? markerWt/pcs : 0;
+}
+
+// The one calculation engine behind every costing sheet — verified line-for-line
+// against CBD HADDAD - LACOSTE 170826.xlsx (style LCB-PL 7044) before this was wired
+// into the UI, reproducing that sheet's own Final Offer Price exactly.
+function computeCosting(sheet){
+  const perPc = markerPerPcConsumption(sheet.marker);
+  let totalFabrics = 0;
+  const fabricCalc = sheet.fabricRows.map(r => {
+    const consumption = r.markerDriven ? perPc*(1+(parseFloat(r.allowancePct)||0)/100) : (parseFloat(r.fixedUsage)||0);
+    const price = parseFloat(r.price)||0;
+    const cost = consumption*price;
+    totalFabrics += cost;
+    return Object.assign({}, r, {consumption, cost});
+  });
+  const importLogisticsFabric = totalFabrics*((parseFloat(sheet.fabricImportLogisticsPct)||0)/100);
+
+  function calcRows(rows){
+    let total = 0;
+    const calc = rows.map(r => {
+      const usage = parseFloat(r.usage)||0;
+      const price = parseFloat(r.price)||0;
+      const cost = usage*price;
+      total += cost;
+      return Object.assign({}, r, {cost});
+    });
+    return {calc, total};
+  }
+  const local = calcRows(sheet.localAccRows);
+  const imported = calcRows(sheet.importedAccRows);
+  const importLogisticsAcc = imported.total*((parseFloat(sheet.accImportLogisticsPct)||0)/100);
+  const totalAccessories = imported.total + local.total + importLogisticsAcc;
+  const totalRawMaterials = totalAccessories + totalFabrics + importLogisticsFabric;
+  const finance = totalRawMaterials*((parseFloat(sheet.financePct)||0)/100);
+  const additional = calcRows(sheet.additionalCostRows);
+  const totalAdditionalCost = additional.total;
+  const eff = parseFloat(sheet.efficiency)||0;
+  const cmpCost = eff ? ((parseFloat(sheet.cpm)||0)*(parseFloat(sheet.sam)||0))/(eff/100) : 0;
+  const totalCostOfProduction = totalRawMaterials + finance + totalAdditionalCost + cmpCost;
+  const overheadPctSum = ((parseFloat(sheet.exportLogisticsPct)||0)+(parseFloat(sheet.commissionPct)||0)+(parseFloat(sheet.marketingPct)||0)+(parseFloat(sheet.factoryMarkupPct)||0))/100;
+  const finalOfferPrice = overheadPctSum<1 ? totalCostOfProduction/(1-overheadPctSum) : null;
+  return { perPc, fabricCalc, totalFabrics, importLogisticsFabric,
+    localCalc: local.calc, totalLocalAcc: local.total,
+    importedCalc: imported.calc, totalImportedAcc: imported.total,
+    importLogisticsAcc, totalAccessories, totalRawMaterials, finance,
+    additionalCalc: additional.calc, totalAdditionalCost,
+    cmpCost, totalCostOfProduction, overheadPctSum, finalOfferPrice };
+}
+
+function money(n){ return isFinite(n) ? ('$'+n.toFixed(4)) : '—'; }
+
+// Tech Pack import, AI-driven: you upload the tech pack PDF, this extracts its text
+// in the browser — reusing extractPdfText()/loadPdfJsLib() above (already used for
+// reading marker PDFs) rather than loading a second copy of pdf.js — and sends just
+// that text to /api/parse-techpack, which asks AI to read the Fabric BOM / Trim BOM /
+// Packaging BOM tables and return item names + specs as structured JSON. Usage% and
+// price are never guessed — those stay yours to set, exactly as agreed.
+async function extractTechPackWithAI(file){
+  const text = await extractPdfText(file);
+  if(!text) throw new Error("Couldn't read any text from this PDF");
+  const res = await fetch('/api/parse-techpack', {
+    method:'POST',
+    headers: backendHeaders({'Content-Type':'application/json'}),
+    body: JSON.stringify({ text })
+  });
+  const data = await res.json().catch(()=>({}));
+  if(!res.ok || !data.ok) throw new Error(data.error || 'Tech pack extraction failed');
+  const out = [];
+  (data.fabricItems||[]).forEach(it => out.push({name: formatTpItem(it), dest:'fabricRows'}));
+  (data.trimItems||[]).forEach(it => out.push({name: formatTpItem(it), dest:'importedAccRows'}));
+  (data.packagingItems||[]).forEach(it => out.push({name: formatTpItem(it), dest:'importedAccRows'}));
+  return out;
+}
+function formatTpItem(it){
+  if(typeof it === 'string') return it;
+  return it.spec ? `${it.name} — ${it.spec}` : (it.name || '');
+}
+
+function costingBuyerTemplate(buyerId){ return DATA.costingTemplates.find(t=>t.buyerId===buyerId); }
+
+function renderCosting(){
+  if(!isManagerOrAdmin()) return '';
+  const buyers = scopedBuyers();
+  if(buyers.length===0) return emptyState('spool', 'Add a buyer first under Buyers & Team — costing is organized buyer-wise.');
+  if(!costingView.buyerId || !buyers.some(b=>b.id===costingView.buyerId)) costingView.buyerId = buyers[0].id;
+  const buyerId = costingView.buyerId;
+  const buyer = buyers.find(b=>b.id===buyerId);
+
+  const header = `<div class="flex-between" style="margin-bottom:12px;">
+    <div class="field" style="max-width:280px;">
+      <label>Buyer</label>
+      <select id="costingBuyerSelect">${buyers.map(b=>`<option value="${b.id}" ${b.id===buyerId?'selected':''}>${b.name}</option>`).join('')}</select>
+    </div>
+    <div class="row-actions">
+      <button class="btn ghost small" data-costing-edit-template="${buyerId}">⚙ Edit costing format</button>
+      <button class="btn small" data-costing-new-sheet="${buyerId}">+ New costing</button>
+    </div>
+  </div>`;
+
+  if(costingView.mode==='template' && costingView.templateDraft) return header + renderCostingTemplateEditor();
+  if(costingView.mode==='sheet' && costingView.sheetDraft) return header + renderCostingSheetEditor();
+
+  const sheets = DATA.costingSheets.filter(s=>s.buyerId===buyerId);
+  const tpl = costingBuyerTemplate(buyerId);
+  const rows = sheets.map(s => {
+    const r = computeCosting(s);
+    return `<tr>
+      <td>${s.style||'—'}</td><td>${s.description||'—'}</td><td>${s.sizeRange||'—'}</td><td>${s.qty||'—'}</td>
+      <td>${fmtDate(s.date)}</td><td><strong>${money(r.finalOfferPrice)}</strong></td>
+      <td><div class="row-actions">
+        <button class="btn ghost small" data-costing-open-sheet="${s.id}">Open</button>
+        <button class="btn ghost small" data-costing-delete-sheet="${s.id}">Delete</button>
+      </div></td>
+    </tr>`;
+  }).join('');
+
+  return header + `
+    ${!tpl ? `<div class="lock-note" style="margin-bottom:12px;">No costing format saved yet for <strong>${buyer.name}</strong>. Click <strong>Edit costing format</strong> to set it up — or start from the Haddad/Lacoste format if that's the one you're using.</div>` : ''}
+    <div class="panel" style="background:#fff;box-shadow:none;">
+      <div class="xgrid"><table>
+        <thead><tr><th>Style</th><th>Description</th><th>Size range</th><th>Qty</th><th>Date</th><th>Final offer price</th><th></th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:16px;">No costing sheets yet for ${buyer.name} — click "+ New costing" above.</td></tr>`}</tbody>
+      </table></div>
+    </div>`;
+}
+
+function costingRowsEditor(sectionKey, rows, title, usageLabel, withPrice){
+  return `<h2 style="font-size:13px;margin-top:14px;">${title}</h2>
+  <div class="xgrid"><table>
+    <thead><tr><th>Item</th><th>Unit</th><th>${usageLabel}</th>${withPrice?'<th>Price (manual)</th><th>Cost</th>':''}<th></th></tr></thead>
+    <tbody>${rows.map((r,i)=>`<tr>
+      <td><input data-ccost-field="name" data-ccost-section="${sectionKey}" data-ccost-idx="${i}" value="${(r.name||'').replace(/"/g,'&quot;')}"></td>
+      <td><input data-ccost-field="unit" data-ccost-section="${sectionKey}" data-ccost-idx="${i}" value="${(r.unit||'').replace(/"/g,'&quot;')}" style="width:70px;"></td>
+      <td><input type="number" step="any" data-ccost-field="usage" data-ccost-section="${sectionKey}" data-ccost-idx="${i}" value="${r.usage??''}" style="width:90px;"></td>
+      ${withPrice?`<td><input type="number" step="any" data-ccost-field="price" data-ccost-section="${sectionKey}" data-ccost-idx="${i}" value="${r.price??''}" style="width:90px;"></td><td class="readonly"><input value="${money(r.cost||0)}" disabled style="width:90px;"></td>`:''}
+      <td><button class="btn ghost small" data-ccost-remove-row="${sectionKey}" data-ccost-idx="${i}">✕</button></td>
+    </tr>`).join('') || `<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:10px;">No rows yet</td></tr>`}</tbody>
+  </table></div>
+  <button class="btn ghost small" data-ccost-add-row="${sectionKey}" style="margin-top:6px;">+ Add row</button>`;
+}
+
+function renderCostingTemplateEditor(){
+  const t = costingView.templateDraft;
+  return `<div class="panel" style="background:#fff;box-shadow:none;">
+    <div class="flex-between">
+      <h2 style="font-size:14px;">Costing format — ${scopedBuyers().find(b=>b.id===costingView.buyerId)?.name||''}</h2>
+      <button class="btn ghost small" data-ccost-load-haddad-preset="1">Load Haddad / Lacoste format</button>
+    </div>
+    <div class="field"><label>Format name</label><input id="ccostTplName" value="${(t.name||'').replace(/"/g,'&quot;')}"></div>
+    <div class="divider"></div>
+    <p class="desc">The first fabric row is always driven by the marker (consumption = per-piece marker consumption × its allowance%, typically 3%). Any further "Fabrics" rows (e.g. a knit collar/cuff) use a fixed usage instead, exactly like your sheet.</p>
+    <h2 style="font-size:13px;">Fabrics</h2>
+    <div class="xgrid"><table>
+      <thead><tr><th>Item</th><th>Unit</th><th>Marker-driven?</th><th>Allowance % (if marker-driven)</th><th>Fixed usage (if not)</th><th></th></tr></thead>
+      <tbody>${t.fabricRows.map((r,i)=>`<tr>
+        <td><input data-ctpl-field="name" data-ctpl-section="fabricRows" data-ctpl-idx="${i}" value="${(r.name||'').replace(/"/g,'&quot;')}"></td>
+        <td><input data-ctpl-field="unit" data-ctpl-section="fabricRows" data-ctpl-idx="${i}" value="${(r.unit||'').replace(/"/g,'&quot;')}" style="width:70px;"></td>
+        <td><input type="checkbox" data-ctpl-field="markerDriven" data-ctpl-section="fabricRows" data-ctpl-idx="${i}" ${r.markerDriven?'checked':''}></td>
+        <td><input type="number" step="any" data-ctpl-field="allowancePct" data-ctpl-section="fabricRows" data-ctpl-idx="${i}" value="${r.allowancePct??0}" style="width:80px;"></td>
+        <td><input type="number" step="any" data-ctpl-field="fixedUsage" data-ctpl-section="fabricRows" data-ctpl-idx="${i}" value="${r.fixedUsage??0}" style="width:80px;"></td>
+        <td><button class="btn ghost small" data-ctpl-remove-row="fabricRows" data-ctpl-idx="${i}">✕</button></td>
+      </tr>`).join('')}</tbody>
+    </table></div>
+    <button class="btn ghost small" data-ctpl-add-row="fabricRows" style="margin-top:6px;">+ Add fabric row</button>
+    <div class="field" style="max-width:260px;margin-top:10px;"><label>Fabric import logistics %</label><input type="number" step="any" id="ccostTpl_fabricImportLogisticsPct" value="${t.fabricImportLogisticsPct??0}"></div>
+
+    <div class="divider"></div>
+    ${costingRowsEditor('tpl_localAccRows', t.localAccRows, 'Local accessories', 'Default usage', false)}
+    ${costingRowsEditor('tpl_importedAccRows', t.importedAccRows, 'Imported accessories', 'Default usage', false)}
+    <div class="grid-cols" style="margin-top:10px;">
+      <div class="field"><label>Imported-accessories import logistics %</label><input type="number" step="any" id="ccostTpl_accImportLogisticsPct" value="${t.accImportLogisticsPct??0}"></div>
+      <div class="field"><label>Finance %</label><input type="number" step="any" id="ccostTpl_financePct" value="${t.financePct??0}"></div>
+    </div>
+
+    <div class="divider"></div>
+    ${costingRowsEditor('tpl_additionalCostRows', t.additionalCostRows, 'Additional costs (print, embroidery, wash, testing…)', 'Default usage', false)}
+
+    <div class="divider"></div>
+    <h2 style="font-size:13px;">Making & overheads</h2>
+    <div class="grid-cols">
+      <div class="field"><label>CPM</label><input type="number" step="any" id="ccostTpl_cpm" value="${t.cpm??0}"></div>
+      <div class="field"><label>SAM</label><input type="number" step="any" id="ccostTpl_sam" value="${t.sam??0}"></div>
+      <div class="field"><label>Efficiency %</label><input type="number" step="any" id="ccostTpl_efficiency" value="${t.efficiency??100}"></div>
+    </div>
+    <div class="grid-cols" style="margin-top:8px;">
+      <div class="field"><label>Export logistics %</label><input type="number" step="any" id="ccostTpl_exportLogisticsPct" value="${t.exportLogisticsPct??0}"></div>
+      <div class="field"><label>Commission %</label><input type="number" step="any" id="ccostTpl_commissionPct" value="${t.commissionPct??0}"></div>
+      <div class="field"><label>Marketing %</label><input type="number" step="any" id="ccostTpl_marketingPct" value="${t.marketingPct??0}"></div>
+      <div class="field"><label>Factory markup %</label><input type="number" step="any" id="ccostTpl_factoryMarkupPct" value="${t.factoryMarkupPct??0}"></div>
+    </div>
+
+    <div class="row-actions" style="margin-top:16px;">
+      <button class="btn" data-ccost-save-template="1">Save format</button>
+      <button class="btn ghost" data-ccost-cancel-template="1">Cancel</button>
+    </div>
+  </div>`;
+}
+
+function costingTechPackImportBlock(){
+  const parsed = costingView.tpParsed;
+  if(costingView.tpBusy){
+    return `<div class="panel" style="background:var(--canvas-bg);box-shadow:none;margin-top:10px;">
+      <h2 style="font-size:13px;">Import from Tech Pack</h2>
+      <p class="desc">Reading the tech pack and extracting the Fabric / Trim / Packaging BOM with AI — this can take up to a minute for a large file…</p>
+    </div>`;
+  }
+  if(!parsed){
+    return `<div class="panel" style="background:var(--canvas-bg);box-shadow:none;margin-top:10px;">
+      <h2 style="font-size:13px;">Import from Tech Pack</h2>
+      <p class="desc">Upload the tech pack PDF — the system reads it with AI and pulls out the Fabric BOM / Trim BOM / Packaging BOM item names and specs automatically. Usage% stays whatever your costing format set, and price is always entered by you.</p>
+      <label class="btn ghost small" style="cursor:pointer;">⬆ Upload Tech Pack (PDF)
+        <input type="file" id="ccostTpFile" accept=".pdf" style="display:none;">
+      </label>
+      <span id="ccostTpFileName" class="hint" style="margin-left:8px;"></span>
+      <div class="row-actions" style="margin-top:8px;"><button class="btn small" data-ccost-extract-tp="1" disabled>Extract with AI</button></div>
+    </div>`;
+  }
+  return `<div class="panel" style="background:var(--canvas-bg);box-shadow:none;margin-top:10px;">
+    <h2 style="font-size:13px;">Parsed items — choose where each goes</h2>
+    <div class="xgrid"><table>
+      <thead><tr><th>Item name</th><th>Add to</th></tr></thead>
+      <tbody>${parsed.map((p,i)=>`<tr>
+        <td><input data-ccost-tp-name="${i}" value="${p.name.replace(/"/g,'&quot;')}"></td>
+        <td><select data-ccost-tp-dest="${i}">
+          <option value="skip" ${p.dest==='skip'?'selected':''}>Skip</option>
+          <option value="fabricRows" ${p.dest==='fabricRows'?'selected':''}>Fabric</option>
+          <option value="localAccRows" ${p.dest==='localAccRows'?'selected':''}>Local accessory</option>
+          <option value="importedAccRows" ${p.dest==='importedAccRows'?'selected':''}>Imported accessory</option>
+        </select></td>
+      </tr>`).join('')}</tbody>
+    </table></div>
+    <div class="row-actions" style="margin-top:8px;">
+      <button class="btn small" data-ccost-apply-tp="1">Add selected items</button>
+      <button class="btn ghost small" data-ccost-cancel-tp="1">Cancel</button>
+    </div>
+  </div>`;
+}
+
+function renderCostingSheetEditor(){
+  const s = costingView.sheetDraft;
+  const r = computeCosting(s);
+  return `<div class="panel" style="background:#fff;box-shadow:none;">
+    <div class="grid-cols">
+      <div class="field"><label>Style</label><input id="ccostSheet_style" value="${(s.style||'').replace(/"/g,'&quot;')}"></div>
+      <div class="field"><label>Description</label><input id="ccostSheet_description" value="${(s.description||'').replace(/"/g,'&quot;')}"></div>
+      <div class="field"><label>Size range</label><input id="ccostSheet_sizeRange" value="${(s.sizeRange||'').replace(/"/g,'&quot;')}"></div>
+      <div class="field"><label>Quantity</label><input id="ccostSheet_qty" value="${(s.qty||'').toString().replace(/"/g,'&quot;')}"></div>
+      <div class="field"><label>Date</label><input type="date" id="ccostSheet_date" value="${s.date||''}"></div>
+    </div>
+
+    <div class="divider"></div>
+    <h2 style="font-size:13px;">Marker details</h2>
+    <p class="desc">Same as your sheet: Width/Length in inches, GSM, number of pieces in the marker → per-piece consumption is calculated automatically.</p>
+    <div class="grid-cols">
+      <div class="field"><label>Width (in)</label><input type="number" step="any" id="ccostSheet_marker_widthIn" value="${s.marker.widthIn||0}"></div>
+      <div class="field"><label>Length (in)</label><input type="number" step="any" id="ccostSheet_marker_lengthIn" value="${s.marker.lengthIn||0}"></div>
+      <div class="field"><label>GSM</label><input type="number" step="any" id="ccostSheet_marker_gsm" value="${s.marker.gsm||0}"></div>
+      <div class="field"><label>No. of pcs in marker</label><input type="number" step="any" id="ccostSheet_marker_pcsInMarker" value="${s.marker.pcsInMarker||0}"></div>
+    </div>
+    <div class="hint">Per-piece marker consumption: <strong>${r.perPc.toFixed(5)}</strong> kg</div>
+
+    <div class="divider"></div>
+    <h2 style="font-size:13px;">Fabrics</h2>
+    <div class="xgrid"><table>
+      <thead><tr><th>Item</th><th>Unit</th><th>Marker-driven</th><th>Allowance% / Fixed usage</th><th>Consumption</th><th>Price (manual)</th><th>Cost</th></tr></thead>
+      <tbody>${s.fabricRows.map((row,i)=>{ const c=r.fabricCalc[i]; return `<tr>
+        <td><input data-cfab-field="name" data-cfab-idx="${i}" value="${(row.name||'').replace(/"/g,'&quot;')}"></td>
+        <td><input data-cfab-field="unit" data-cfab-idx="${i}" value="${(row.unit||'').replace(/"/g,'&quot;')}" style="width:60px;"></td>
+        <td><input type="checkbox" data-cfab-field="markerDriven" data-cfab-idx="${i}" ${row.markerDriven?'checked':''}></td>
+        <td>${row.markerDriven
+          ? `<input type="number" step="any" data-cfab-field="allowancePct" data-cfab-idx="${i}" value="${row.allowancePct??0}" style="width:70px;">%`
+          : `<input type="number" step="any" data-cfab-field="fixedUsage" data-cfab-idx="${i}" value="${row.fixedUsage??0}" style="width:70px;">`}</td>
+        <td class="readonly"><input value="${c.consumption.toFixed(5)}" disabled style="width:85px;"></td>
+        <td><input type="number" step="any" data-cfab-field="price" data-cfab-idx="${i}" value="${row.price??''}" style="width:80px;"></td>
+        <td class="readonly"><input value="${money(c.cost)}" disabled style="width:85px;"></td>
+      </tr>`; }).join('')}</tbody>
+    </table></div>
+    <button class="btn ghost small" data-cfab-add-row="1" style="margin-top:6px;">+ Add fabric row</button>
+    <div class="hint">Total fabrics: <strong>${money(r.totalFabrics)}</strong> &nbsp;·&nbsp; + import logistics: <strong>${money(r.importLogisticsFabric)}</strong></div>
+
+    <div class="divider"></div>
+    ${costingRowsEditor('localAccRows', s.localAccRows, 'Local accessories', 'Usage', true)}
+    <div class="hint">Total local accessories: <strong>${money(r.totalLocalAcc)}</strong></div>
+
+    <div class="divider"></div>
+    ${costingRowsEditor('importedAccRows', s.importedAccRows, 'Imported accessories', 'Usage', true)}
+    <div class="hint">Total imported accessories: <strong>${money(r.totalImportedAcc)}</strong> &nbsp;·&nbsp; + import logistics: <strong>${money(r.importLogisticsAcc)}</strong></div>
+
+    ${costingTechPackImportBlock()}
+
+    <div class="divider"></div>
+    ${costingRowsEditor('additionalCostRows', s.additionalCostRows, 'Additional costs', 'Usage', true)}
+
+    <div class="divider"></div>
+    <h2 style="font-size:13px;">Making & overheads</h2>
+    <div class="grid-cols">
+      <div class="field"><label>CPM</label><input type="number" step="any" id="ccostSheet_cpm" value="${s.cpm||0}"></div>
+      <div class="field"><label>SAM</label><input type="number" step="any" id="ccostSheet_sam" value="${s.sam||0}"></div>
+      <div class="field"><label>Efficiency %</label><input type="number" step="any" id="ccostSheet_efficiency" value="${s.efficiency||0}"></div>
+      <div class="field"><label>Finance %</label><input type="number" step="any" id="ccostSheet_financePct" value="${s.financePct||0}"></div>
+    </div>
+    <div class="grid-cols" style="margin-top:8px;">
+      <div class="field"><label>Export logistics %</label><input type="number" step="any" id="ccostSheet_exportLogisticsPct" value="${s.exportLogisticsPct||0}"></div>
+      <div class="field"><label>Commission %</label><input type="number" step="any" id="ccostSheet_commissionPct" value="${s.commissionPct||0}"></div>
+      <div class="field"><label>Marketing %</label><input type="number" step="any" id="ccostSheet_marketingPct" value="${s.marketingPct||0}"></div>
+      <div class="field"><label>Factory markup %</label><input type="number" step="any" id="ccostSheet_factoryMarkupPct" value="${s.factoryMarkupPct||0}"></div>
+    </div>
+
+    <div class="divider"></div>
+    <div class="panel" style="background:var(--canvas-bg);box-shadow:none;">
+      <div class="grid-cols">
+        <div>Total raw materials <strong>${money(r.totalRawMaterials)}</strong></div>
+        <div>Additional cost <strong>${money(r.totalAdditionalCost)}</strong></div>
+        <div>CM&P <strong>${money(r.cmpCost)}</strong></div>
+        <div>Total cost of production <strong>${money(r.totalCostOfProduction)}</strong></div>
+      </div>
+      <div class="divider"></div>
+      <div style="font-size:18px;">Final offer price: <strong>${money(r.finalOfferPrice)}</strong></div>
+    </div>
+
+    <div class="row-actions" style="margin-top:16px;">
+      <button class="btn" data-ccost-save-sheet="1">Save costing</button>
+      <button class="btn ghost" data-ccost-cancel-sheet="1">Cancel</button>
+    </div>
   </div>`;
 }
 
@@ -6260,6 +6693,240 @@ function attachTabEvents(){
       renderTabContent(); saveData();
     });
   });
+
+  /* ---- Costing tab wiring ---- */
+  const costingBuyerSelect = document.getElementById('costingBuyerSelect');
+  if(costingBuyerSelect) costingBuyerSelect.addEventListener('change', e => {
+    costingView.buyerId = e.target.value; costingView.mode = 'list';
+    renderTabContent();
+  });
+
+  document.querySelectorAll('[data-costing-edit-template]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const buyerId = btn.dataset.costingEditTemplate;
+      const existing = costingBuyerTemplate(buyerId);
+      costingView.templateDraft = existing ? JSON.parse(JSON.stringify(existing)) : blankCostingTemplate();
+      costingView.mode = 'template';
+      renderTabContent();
+    });
+  });
+
+  document.querySelectorAll('[data-costing-new-sheet]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const buyerId = btn.dataset.costingNewSheet;
+      const tpl = costingBuyerTemplate(buyerId);
+      costingView.sheetDraft = sheetFromTemplate(tpl || blankCostingTemplate(), buyerId);
+      costingView.mode = 'sheet';
+      costingView.tpParsed = null; costingView.tpFile = null; costingView.tpBusy = false;
+      renderTabContent();
+    });
+  });
+
+  document.querySelectorAll('[data-costing-open-sheet]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const sheet = DATA.costingSheets.find(s => s.id === btn.dataset.costingOpenSheet);
+      if(!sheet) return;
+      costingView.sheetDraft = JSON.parse(JSON.stringify(sheet));
+      costingView.mode = 'sheet';
+      costingView.tpParsed = null; costingView.tpFile = null; costingView.tpBusy = false;
+      renderTabContent();
+    });
+  });
+
+  document.querySelectorAll('[data-costing-delete-sheet]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if(!confirm('Delete this costing sheet?')) return;
+      DATA.costingSheets = DATA.costingSheets.filter(s => s.id !== btn.dataset.costingDeleteSheet);
+      renderTabContent(); saveData();
+    });
+  });
+
+  // Template editor — top-level fields (id-based, simple 1:1 bindings)
+  const ccostTplName = document.getElementById('ccostTplName');
+  if(ccostTplName) ccostTplName.addEventListener('change', () => { costingView.templateDraft.name = ccostTplName.value; });
+  [['ccostTpl_fabricImportLogisticsPct','fabricImportLogisticsPct'],
+   ['ccostTpl_accImportLogisticsPct','accImportLogisticsPct'],
+   ['ccostTpl_financePct','financePct'],
+   ['ccostTpl_cpm','cpm'], ['ccostTpl_sam','sam'], ['ccostTpl_efficiency','efficiency'],
+   ['ccostTpl_exportLogisticsPct','exportLogisticsPct'], ['ccostTpl_commissionPct','commissionPct'],
+   ['ccostTpl_marketingPct','marketingPct'], ['ccostTpl_factoryMarkupPct','factoryMarkupPct']
+  ].forEach(([id,field]) => {
+    const el = document.getElementById(id);
+    if(el) el.addEventListener('change', () => { costingView.templateDraft[field] = el.value; renderTabContent(); });
+  });
+
+  // Template's fabric rows (data-ctpl-*)
+  document.querySelectorAll('[data-ctpl-field]').forEach(inp => {
+    inp.addEventListener('change', () => {
+      const section = inp.dataset.ctplSection, idx = parseInt(inp.dataset.ctplIdx,10), field = inp.dataset.ctplField;
+      const row = costingView.templateDraft[section][idx];
+      if(!row) return;
+      row[field] = inp.type==='checkbox' ? inp.checked : inp.value;
+      renderTabContent();
+    });
+  });
+  document.querySelectorAll('[data-ctpl-add-row]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      costingView.templateDraft[btn.dataset.ctplAddRow].push({id:uid('cfab'), name:'', unit:'', markerDriven:false, allowancePct:0, fixedUsage:0});
+      renderTabContent();
+    });
+  });
+  document.querySelectorAll('[data-ctpl-remove-row]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      costingView.templateDraft[btn.dataset.ctplRemoveRow].splice(parseInt(btn.dataset.ctplIdx,10), 1);
+      renderTabContent();
+    });
+  });
+
+  // Haddad preset / save / cancel (template)
+  const loadPresetBtn = document.querySelector('[data-ccost-load-haddad-preset]');
+  if(loadPresetBtn) loadPresetBtn.addEventListener('click', () => { costingView.templateDraft = haddadCostingPreset(); renderTabContent(); });
+  const saveTplBtn = document.querySelector('[data-ccost-save-template]');
+  if(saveTplBtn) saveTplBtn.addEventListener('click', () => {
+    const buyerId = costingView.buyerId;
+    const existing = costingBuyerTemplate(buyerId);
+    const draft = costingView.templateDraft;
+    if(existing){ Object.assign(existing, draft); }
+    else { draft.id = uid('ctpl'); draft.buyerId = buyerId; DATA.costingTemplates.push(draft); }
+    costingView.mode = 'list'; costingView.templateDraft = null;
+    renderTabContent(); saveData(); showToast('Costing format saved');
+  });
+  const cancelTplBtn = document.querySelector('[data-ccost-cancel-template]');
+  if(cancelTplBtn) cancelTplBtn.addEventListener('click', () => { costingView.mode='list'; costingView.templateDraft=null; renderTabContent(); });
+
+  // Sheet editor — top-level fields
+  [['ccostSheet_style','style'], ['ccostSheet_description','description'], ['ccostSheet_sizeRange','sizeRange'],
+   ['ccostSheet_qty','qty'], ['ccostSheet_date','date'],
+   ['ccostSheet_cpm','cpm'], ['ccostSheet_sam','sam'], ['ccostSheet_efficiency','efficiency'],
+   ['ccostSheet_financePct','financePct'], ['ccostSheet_exportLogisticsPct','exportLogisticsPct'],
+   ['ccostSheet_commissionPct','commissionPct'], ['ccostSheet_marketingPct','marketingPct'],
+   ['ccostSheet_factoryMarkupPct','factoryMarkupPct']
+  ].forEach(([id,field]) => {
+    const el = document.getElementById(id);
+    if(el) el.addEventListener('change', () => { costingView.sheetDraft[field] = el.value; renderTabContent(); });
+  });
+  [['ccostSheet_marker_widthIn','widthIn'], ['ccostSheet_marker_lengthIn','lengthIn'],
+   ['ccostSheet_marker_gsm','gsm'], ['ccostSheet_marker_pcsInMarker','pcsInMarker']
+  ].forEach(([id,field]) => {
+    const el = document.getElementById(id);
+    if(el) el.addEventListener('change', () => { costingView.sheetDraft.marker[field] = el.value; renderTabContent(); });
+  });
+
+  // Sheet's fabric rows (data-cfab-*)
+  document.querySelectorAll('[data-cfab-field]').forEach(inp => {
+    inp.addEventListener('change', () => {
+      const idx = parseInt(inp.dataset.cfabIdx,10), field = inp.dataset.cfabField;
+      const row = costingView.sheetDraft.fabricRows[idx];
+      if(!row) return;
+      row[field] = inp.type==='checkbox' ? inp.checked : inp.value;
+      renderTabContent();
+    });
+  });
+  const addFabBtn = document.querySelector('[data-cfab-add-row]');
+  if(addFabBtn) addFabBtn.addEventListener('click', () => {
+    costingView.sheetDraft.fabricRows.push({id:uid('cfab'), name:'', unit:'', markerDriven:false, allowancePct:0, fixedUsage:1, price:null});
+    renderTabContent();
+  });
+
+  // Generic accessory/additional-cost rows — shared by template (tpl_ prefixed sections,
+  // no price) and sheet (plain section names, with price) via the same costingRowsEditor().
+  document.querySelectorAll('[data-ccost-field]').forEach(inp => {
+    inp.addEventListener('change', () => {
+      const section = inp.dataset.ccostSection, idx = parseInt(inp.dataset.ccostIdx,10), field = inp.dataset.ccostField;
+      const isTpl = section.startsWith('tpl_');
+      const arr = isTpl ? (costingView.templateDraft && costingView.templateDraft[section.slice(4)]) : (costingView.sheetDraft && costingView.sheetDraft[section]);
+      if(!arr || !arr[idx]) return;
+      arr[idx][field] = inp.value;
+      renderTabContent();
+    });
+  });
+  document.querySelectorAll('[data-ccost-add-row]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const section = btn.dataset.ccostAddRow;
+      const isTpl = section.startsWith('tpl_');
+      const arr = isTpl ? costingView.templateDraft[section.slice(4)] : costingView.sheetDraft[section];
+      if(!arr) return;
+      const prefix = section.indexOf('additionalCostRows')>=0 ? 'cadd' : 'cacc';
+      const row = {id: uid(prefix), name:'', unit:'', usage:0};
+      if(!isTpl) row.price = null;
+      arr.push(row);
+      renderTabContent();
+    });
+  });
+  document.querySelectorAll('[data-ccost-remove-row]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const section = btn.dataset.ccostRemoveRow, idx = parseInt(btn.dataset.ccostIdx,10);
+      const isTpl = section.startsWith('tpl_');
+      const arr = isTpl ? costingView.templateDraft[section.slice(4)] : costingView.sheetDraft[section];
+      if(!arr) return;
+      arr.splice(idx,1);
+      renderTabContent();
+    });
+  });
+
+  // Tech Pack AI import — select a file, then extract
+  const tpFileInput = document.getElementById('ccostTpFile');
+  if(tpFileInput) tpFileInput.addEventListener('change', () => {
+    costingView.tpFile = tpFileInput.files[0] || null;
+    const nameEl = document.getElementById('ccostTpFileName');
+    if(nameEl) nameEl.textContent = costingView.tpFile ? costingView.tpFile.name : '';
+    const extractBtn = document.querySelector('[data-ccost-extract-tp]');
+    if(extractBtn) extractBtn.disabled = !costingView.tpFile;
+  });
+  const extractTpBtn = document.querySelector('[data-ccost-extract-tp]');
+  if(extractTpBtn) extractTpBtn.addEventListener('click', async () => {
+    if(!costingView.tpFile) return;
+    costingView.tpBusy = true;
+    renderTabContent();
+    try{
+      costingView.tpParsed = await extractTechPackWithAI(costingView.tpFile);
+      if(!costingView.tpParsed.length) showToast('No items found — try a different page range or add items manually');
+    }catch(err){
+      console.error('Tech pack extraction failed:', err);
+      showToast('Tech pack extraction failed: ' + err.message);
+    }
+    costingView.tpBusy = false;
+    renderTabContent();
+  });
+  document.querySelectorAll('[data-ccost-tp-name]').forEach(inp => {
+    inp.addEventListener('change', () => {
+      const idx = parseInt(inp.dataset.ccostTpName,10);
+      if(costingView.tpParsed && costingView.tpParsed[idx]) costingView.tpParsed[idx].name = inp.value;
+    });
+  });
+  document.querySelectorAll('[data-ccost-tp-dest]').forEach(sel => {
+    sel.addEventListener('change', () => {
+      const idx = parseInt(sel.dataset.ccostTpDest,10);
+      if(costingView.tpParsed && costingView.tpParsed[idx]) costingView.tpParsed[idx].dest = sel.value;
+    });
+  });
+  const applyTpBtn = document.querySelector('[data-ccost-apply-tp]');
+  if(applyTpBtn) applyTpBtn.addEventListener('click', () => {
+    (costingView.tpParsed || []).forEach(p => {
+      if(p.dest==='skip') return;
+      const prefix = p.dest==='fabricRows' ? 'cfab' : 'cacc';
+      const row = {id: uid(prefix), name: p.name, unit:'Pcs', usage: p.dest==='importedAccRows' ? 1.05 : 1, price: null};
+      if(p.dest==='fabricRows'){ row.markerDriven = false; row.fixedUsage = 1; delete row.usage; }
+      costingView.sheetDraft[p.dest].push(row);
+    });
+    costingView.tpParsed = null; costingView.tpFile = null;
+    renderTabContent();
+    showToast('Items added — set usage and price for each before saving');
+  });
+  const cancelTpBtn = document.querySelector('[data-ccost-cancel-tp]');
+  if(cancelTpBtn) cancelTpBtn.addEventListener('click', () => { costingView.tpParsed = null; costingView.tpFile = null; renderTabContent(); });
+
+  // Save / cancel sheet
+  const saveSheetBtn = document.querySelector('[data-ccost-save-sheet]');
+  if(saveSheetBtn) saveSheetBtn.addEventListener('click', () => {
+    const draft = costingView.sheetDraft;
+    const existingIdx = DATA.costingSheets.findIndex(s => s.id === draft.id);
+    if(existingIdx >= 0) DATA.costingSheets[existingIdx] = draft; else DATA.costingSheets.push(draft);
+    costingView.mode = 'list'; costingView.sheetDraft = null; costingView.tpParsed = null; costingView.tpFile = null;
+    renderTabContent(); saveData(); showToast('Costing saved');
+  });
+  const cancelSheetBtn = document.querySelector('[data-ccost-cancel-sheet]');
+  if(cancelSheetBtn) cancelSheetBtn.addEventListener('click', () => { costingView.mode='list'; costingView.sheetDraft=null; costingView.tpParsed=null; costingView.tpFile=null; renderTabContent(); });
 }
 
 // Shown instead of the app when loadData() couldn't confirm what's actually saved
